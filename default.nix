@@ -96,4 +96,6 @@ in
   });
 
   bench = import ./bench;
+
+  scaffold = import ./scaffold;
 }

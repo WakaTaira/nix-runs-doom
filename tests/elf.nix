@@ -1,4 +1,5 @@
-# Tests for the ELF loader's symbol table, executable segments and pc lookup.
+# Tests for the ELF loader's symbol table, symbol lookup by name, executable segments
+# and pc lookup.
 # Uses the committed examples/fizzbuzz-c/fizzbuzz.hex fixture.
 let
   E = import ../lib/elf.nix;
@@ -57,4 +58,6 @@ in
   (t "elf: lookup below range" (E.lookup table 0) null)
   (t "elf: lookup past end" (E.lookup table 516) null)
   (t "elf: lookup in empty table" (E.lookup [ ] 5) null)
+  (t "elf: symbolAddr finds a NOTYPE symbol" (E.symbolAddr hex "_start") loaded.entry)
+  (t "elf: symbolAddr of a missing name" (E.symbolAddr hex "no_such_symbol") null)
 ]

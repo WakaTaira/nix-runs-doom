@@ -54,17 +54,31 @@ mkdir -p /tmp/spike && for v in rv rvx nix; do for k in 1 2; do for r in 1 2 3; 
 SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report
 ```
 
+Doom scaffold (clang-built doomgeneric on the emulator through host calls; the WAD is passed as hex text, the ELF is built once into `./result-doom`; run with `-f .`, because a flake evaluation sees neither):
+
+```sh
+od -An -v -tx1 /path/to/doom1.wad | tr -d ' \n' > ~/doom1.wad.hex
+nix build .#doom-scaffold -o result-doom
+DOOM_WAD_HEX=~/doom1.wad.hex nix eval --raw -f . scaffold.title
+DOOM_WAD_HEX=~/doom1.wad.hex nix eval --json -f . scaffold.boot.report
+DOOM_WAD_HEX=~/doom1.wad.hex nix eval --json -f . scaffold.demo.report
+```
+
 Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizzbuzz.hex examples/fizzbuzz-c/`.
 
 ## Layout
 
 - `lib/bits.nix` — 32-bit arithmetic. Values are always unsigned (0..2^32-1). Shifts use a power-of-two table with multiply/divide.
 - `lib/mem.nix` — persistent trie over word addresses, 4 levels of 12+6+6+6 bits (sparse 1 MiB-granular root, then 64-ary nodes). Sparse; unwritten words read as 0. An update copies the 4 nodes on the path. Chosen over the previous 5x6-bit layout with `bench/memlayout.nix`: 12-18% faster at the memory interface (4 KB and 6 MiB workloads); the whole-emulator benchmark, which stores once per 8 instructions, shows no difference beyond noise.
-- `lib/cpu.nix` — RV32IM. The words of the decode-cache region (`mkState { code = { base; size; }; }`; `runProgram` declares the whole image, code and data) are decoded once into a lazy list of threaded ops (`state -> state`). Inside the region, straight-line code and direct branches/jumps go to the linked successor op without a fetch; once a store touches the region, fetch goes through the checked path, which re-reads memory and re-decodes changed words. Outside the region every instruction is decoded from the memory trie. `run` folds in chunks and forces state every 64 steps. ECALL supports only a7=64 write and a7=93 exit.
+- `lib/cpu.nix` — RV32IM. The words of the decode-cache region (`mkState { code = { base; size; }; }`; `runProgram` declares the whole image, code and data) are decoded once into a lazy list of threaded ops (`state -> state`). Inside the region, straight-line code and direct branches/jumps go to the linked successor op without a fetch; once a store touches the region, fetch goes through the checked path, which re-reads memory and re-decodes changed words. Outside the region every instruction is decoded from the memory trie. `run` folds in chunks and forces state every 64 steps. ECALL supports a7=64 write and a7=93 exit; a7 >= 1000 is a host call, delegated to `state.host.call` (`mkState { host = { call; ... }; }`, see `lib/hostcall.nix`).
 - `lib/dsl.nix` — the guest eDSL: instructions, pseudo-instructions (`li`, `la`, `call`, ...), labels, data (`string`, `space`, `align`), and structured control flow (`when`, `ifElse`, `while`). Two-pass assembler `assemble` and loader `toMemory`.
 - `lib/asm.nix` — raw instruction encoders used by the eDSL (encodings verified against llvm-mc).
 - `lib/ascii.nix` — chr/ord tables.
 - `lib/elf.nix` — parses a hex-encoded ELF32 and places its PT_LOAD segments (for external guests such as Doom).
+- `lib/hostcall.nix` — the host-call table (libc, compiler runtime and doomgeneric's `DG_*`; the single source of truth for the generated guest headers and ecall stubs) and the emulator-side `dispatch`.
+- `lib/libc.nix` — the host-call libc in Nix: pure functions over a libc world (`{ mem; brk; files; out; ... }`), independent of CPU state; WAD reads decode only the requested range of the hex text.
+- `toolchain/doom.nix` — build-only derivation behind `nix build .#doom-scaffold`: cross-compiles unpatched doomgeneric for RV32IM with clang + lld against headers and stubs generated from `lib/hostcall.nix`; outputs `doom.elf`, `doom.hex` and `doom.dis`.
+- `scaffold/` — doomgeneric on the emulator: `boot.nix` (loads the ELF, builds argv on the stack, runs with `runUntil` of `lib/cpu.nix` until a frame count), `platform.nix` (the `DG_*` host calls: frame records and a virtual clock), `render.nix` (ANSI still image), `profile.nix` (pc samples summed by function), `default.nix` (`scaffold.boot.report`, `scaffold.title`, `scaffold.demo.report`).
 - `tests/unit.nix`, `tests/mext.nix`, `tests/dsl.nix` — RV32I, M-extension and eDSL tests; every CPU test runs both with and without a code region and the two must agree (`tests/paths.nix`).
 - `tests/fastpath.nix` — regression and self-modifying-code tests for the code-region path.
 - `tests/xdoom.nix` — both-path tests for the `fixmul` (custom-0) instruction, and the equivalence and verdict tests of the three spike variants.

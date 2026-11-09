@@ -32,7 +32,6 @@ let
   inherit (builtins)
     bitAnd
     concatLists
-    concatStringsSep
     div
     elemAt
     filter
@@ -42,7 +41,6 @@ let
     length
     map
     stringLength
-    substring
     ;
 
   stackTop = 134217728; # 0x08000000
@@ -50,59 +48,17 @@ let
   alignDown16 = x: x - bitAnd x 15;
   align16 = x: alignDown16 (x + 15);
 
-  img = E.mkImage hex;
   elf = E.load hex;
 
-  # --- Symbols by name (any type; lib/elf.nix `symbols` lists functions only) ---
+  # --- Symbols by name (any type) ---
 
-  hexDigit = i: substring i 1 "0123456789abcdef";
-  hexOf =
-    s: concatStringsSep "" (map (b: hexDigit (div b 16) + hexDigit (bitAnd b 15)) (A.bytesOf s));
-
-  sections =
-    let
-      shoff = img.u32 32;
-      shentsize = img.u16 46;
-    in
-    genList (
-      i:
-      let
-        base = shoff + i * shentsize;
-      in
-      {
-        type = img.u32 (base + 4);
-        offset = img.u32 (base + 16);
-        size = img.u32 (base + 20);
-        link = img.u32 (base + 24);
-      }
-    ) (img.u16 48);
-
-  symtab =
-    let
-      tabs = filter (sh: sh.type == 2) sections;
-    in
-    if tabs == [ ] then throw "scaffold/boot.nix: the ELF has no symbol table" else head tabs;
-  strtab = elemAt sections symtab.link;
-  symCount = div symtab.size 16;
-
-  # Address of the symbol `name`: its NUL-terminated name is compared as hex text.
+  findSymbol = E.symbolAddr hex;
   symbolAddr =
     name:
     let
-      want = hexOf name + "00";
-      n = stringLength want;
-      at = i: symtab.offset + 16 * i;
-      matches = i: substring (2 * (strtab.offset + img.u32 (at i))) n hex == want;
-      go =
-        i:
-        if i >= symCount then
-          throw "scaffold/boot.nix: symbol ${name} not found"
-        else if matches i then
-          img.u32 (at i + 4)
-        else
-          go (i + 1);
+      a = findSymbol name;
     in
-    go 0;
+    if a == null then throw "scaffold/boot.nix: symbol ${name} not found" else a;
 
   # --- Code region ---
 

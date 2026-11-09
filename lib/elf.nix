@@ -22,6 +22,7 @@ let
     ;
 
   hexDigit = i: substring i 1 "0123456789abcdef";
+  byteHex = n: hexDigit (div n 16) + hexDigit (bitAnd n 15);
   byteTable = listToAttrs (
     genList (n: {
       name = hexDigit (div n 16) + hexDigit (bitAnd n 15);
@@ -175,6 +176,38 @@ let
         inherit (s) addr size;
       }) sorted;
 
+  # Value (address) of the .symtab symbol `name` of any type, or null when absent.
+  # Apply to the hex once and reuse the partial application, which shares the section
+  # lookup. Names are compared as hex text (the NUL-terminated name), so no symbol name
+  # is decoded.
+  symbolAddr =
+    hex:
+    let
+      img = mkImage hex;
+      shs = sectionHeaders img;
+      symtabs = filter (sh: sh.type == 2) shs;
+      symtab = builtins.head symtabs;
+      strtab = elemAt shs symtab.link;
+      count = div symtab.size 16;
+      entryAt = i: symtab.offset + 16 * i;
+      hexOf = s: builtins.concatStringsSep "" (map byteHex (Ascii.bytesOf s));
+    in
+    name:
+    let
+      want = hexOf name + "00";
+      n = stringLength want;
+      matches = i: substring (2 * (strtab.offset + img.u32 (entryAt i))) n hex == want;
+      go =
+        i:
+        if i >= count then
+          null
+        else if matches i then
+          img.u32 (entryAt i + 4)
+        else
+          go (i + 1);
+    in
+    if symtabs == [ ] then null else go 0;
+
   # Executable PT_LOAD segments (p_flags has the X bit) as [ { base; size; } ], size = p_memsz.
   execSegments =
     hex:
@@ -236,6 +269,7 @@ in
     load
     mkImage
     symbols
+    symbolAddr
     execSegments
     lookup
     ;
