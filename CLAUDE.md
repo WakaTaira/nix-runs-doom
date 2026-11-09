@@ -37,6 +37,7 @@ Transitional exception: `toolchain/doom.nix` embeds a small C string (`mainC`: c
 | FizzBuzz run stats | `nix eval --json -f . fizzbuzz.stats` |
 | Transitional C FizzBuzz | `nix eval --raw -f . fizzbuzzC.stdout` |
 | Spike report (needs measured stats, see below) | `SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report` |
+| cc gate report (needs measured stats of `nix` and `cc`, see below) | `SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport` |
 | Format | `nix fmt` |
 
 All of these also work as `.#<attr>` through the flake (flakes only see git-tracked files, so `git add -N` new files first).
@@ -54,6 +55,13 @@ Execution-strategy spike (M0; compares clang-compiled RV32IM, the same with the 
 ```sh
 mkdir -p /tmp/spike && for v in rv rvx nix; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report
+```
+
+Gate of the Nix C compiler (`cc/`; compares the compiled C with the hand-written Nix variant and prints `CC GATE: pass` when cc/nix <= 1.25):
+
+```sh
+mkdir -p /tmp/spike && for v in nix cc; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport
 ```
 
 Doom scaffold (clang-built doomgeneric on the emulator through host calls; the WAD is passed as hex text, the ELF is built once into `./result-doom`; run with `-f .`, because a flake evaluation sees neither):
@@ -82,11 +90,13 @@ Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizz
 - `toolchain/doom.nix` — build-only derivation behind `nix build .#doom-scaffold`: cross-compiles unpatched doomgeneric for RV32IM with clang + lld against headers and stubs generated from `lib/hostcall.nix`; outputs `doom.elf`, `doom.hex` and `doom.dis`.
 - `scaffold/` — doomgeneric on the emulator: `boot.nix` (loads the ELF, builds argv on the stack, runs with `runUntil` of `lib/cpu.nix` until a frame count), `platform.nix` (the `DG_*` host calls: frame records and a virtual clock), `render.nix` (ANSI still image), `profile.nix` (pc samples summed by function), `default.nix` (`scaffold.boot.report`, `scaffold.title`, `scaffold.demo.report`).
 - `tests/unit.nix`, `tests/mext.nix`, `tests/dsl.nix` — RV32I, M-extension and eDSL tests; every CPU test runs both with and without a code region and the two must agree (`tests/paths.nix`).
+- `cc/` — the C compiler written in Nix (C source -> Nix source): `lex.nix` (lexer), `parse.nix` (parser), `check.nix` (type checker), `emit.nix` (Nix code generator), `runtime.nix` (runtime helpers used by the generated code), `default.nix` (`compile` / `load`), `examples/spike.nix` (the M0 reference C as a string).
+- `tests/cc.nix` — tests of the Nix C compiler.
 - `tests/fastpath.nix` — regression and self-modifying-code tests for the code-region path.
 - `tests/xdoom.nix` — both-path tests for the `fixmul` (custom-0) instruction, and the equivalence and verdict tests of the three spike variants.
 - `examples/fizzbuzz/` — FizzBuzz in the eDSL.
 - `examples/fizzbuzz-c/`, `toolchain/guest.nix` — transitional clang-built C version and its hex fixture.
-- `bench/spike/` — the M0 execution-strategy spike: `data.nix` (shared memory image and checks), `rv.nix` / `rvx.nix` (clang output transcribed to the eDSL, without / with `fixmul`), `nix.nix` (the C translated to Nix), `default.nix` (`bench.spike.*` workloads and the report with its verdict).
+- `bench/spike/` — the M0 execution-strategy spike: `data.nix` (shared memory image and checks), `rv.nix` / `rvx.nix` (clang output transcribed to the eDSL, without / with `fixmul`), `nix.nix` (the C translated to Nix), `default.nix` (`bench.spike.*` workloads and the report with its verdict). Variant `cc` is the same C compiled by `cc/`; `bench.spike.ccReport` compares it with `nix` and prints the `CC GATE:` line.
 - `fixmul` (`lib/cpu.nix`, encoder in `lib/asm.nix`) — custom-0 instruction for Doom's fixed-point multiply: `(a * b) >> 16` on signed 32-bit operands via a 64-bit product.
 - `bench/` — `workload.nix`, `report.nix` (Doom performance budget), `format.nix` (shared number/string formatting), `default.nix` (`bench.run` / `bench.report`).
 

@@ -4,6 +4,7 @@
 #   rv   option 1: clang-compiled RV32IM code run on the emulator
 #   rvx  option 1 with the custom instruction `fixmul`
 #   nix  option 3: the C translated into Nix functions
+#   cc   the same C compiled to Nix by the Nix C compiler (cc/); `ccReport` compares it with nix
 #
 # Measurement: every variant runs the full load (columns=160, spans=200,
 # muls=10000) for 1 and for 2 frames, three times each. Nix records its own CPU
@@ -13,8 +14,15 @@
 #
 #   mkdir -p /tmp/spike && for v in rv rvx nix; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 #   SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report
+#
+# The cc gate (cc/nix <= 1.25) needs only the nix and cc variants:
+#
+#   mkdir -p /tmp/spike && for v in nix cc; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+#   SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport
 let
   D = import ./data.nix;
+  cc = import ../../cc;
+  spikeSrc = cc.examples.spike.src;
   inherit (builtins)
     concatStringsSep
     foldl'
@@ -30,6 +38,10 @@ let
     rv = import ./rv.nix { };
     rvx = import ./rvx.nix;
     nix = import ./nix.nix;
+    # The same C compiled by the Nix C compiler (cc/).
+    cc = {
+      run = mem: (cc.load spikeSrc).unit mem D.PARAMS;
+    };
   };
 
   full = {
@@ -55,22 +67,24 @@ let
   verdict = rvxOverNix: if rvxOverNix >= 2.0 then "VERDICT: option 3" else "VERDICT: option 1";
 
   # `costs` holds the cost of one frame in seconds per variant: { rv; rvx; nix; }.
+  row =
+    costs: name:
+    let
+      c = costs.${name};
+    in
+    "  ${name}: ${fixed 0 (c * 1000000)} us/frame, ${fixed 3 (c * 1000000 / pixels)} us/pixel";
+
   mkReport =
     { costs }:
     let
-      row =
-        name:
-        let
-          c = costs.${name};
-        in
-        "  ${name}: ${fixed 0 (c * 1000000)} us/frame, ${fixed 3 (c * 1000000 / pixels)} us/pixel";
+      row' = row costs;
       ratio = a: b: fixed 2 (costs.${a} / costs.${b});
     in
     concatStringsSep "\n" [
       "== Cost per frame =="
-      (row "rv")
-      (row "rvx")
-      (row "nix")
+      (row' "rv")
+      (row' "rvx")
+      (row' "nix")
       ""
       "== Ratios =="
       "  rv/nix  : ${ratio "rv" "nix"}"
@@ -98,13 +112,36 @@ let
     );
 
   measuredCost = v: minTime v 2 - minTime v 1;
+
+  # The cc variant passes when it is at most 1.25 times as slow as the hand-written Nix.
+  ccGate = ratio: if ratio <= 1.25 then "CC GATE: pass" else "CC GATE: fail";
+
+  # `costs` holds { nix; cc; } in seconds per frame.
+  mkCcReport =
+    { costs }:
+    concatStringsSep "\n" [
+      "== Cost per frame =="
+      (row costs "nix")
+      (row costs "cc")
+      ""
+      "  cc/nix : ${fixed 2 (costs.cc / costs.nix)}"
+      ""
+      (ccGate (costs.cc / costs.nix))
+      ""
+    ];
 in
 {
   rv = entry variants.rv;
   rvx = entry variants.rvx;
   nix = entry variants.nix;
+  cc = entry variants.cc;
 
-  inherit verdict mkReport;
+  inherit
+    verdict
+    mkReport
+    ccGate
+    mkCcReport
+    ;
 
   report =
     if statsDir == "" then
@@ -115,6 +152,17 @@ in
           rv = measuredCost "rv";
           rvx = measuredCost "rvx";
           nix = measuredCost "nix";
+        };
+      };
+
+  ccReport =
+    if statsDir == "" then
+      throw "set SPIKE_STATS_DIR to the directory of <variant>-n<k>-<r>.json stats files (see bench/spike/default.nix)"
+    else
+      mkCcReport {
+        costs = {
+          nix = measuredCost "nix";
+          cc = measuredCost "cc";
         };
       };
 }

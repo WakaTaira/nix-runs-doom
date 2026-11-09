@@ -139,6 +139,16 @@ let
         got = Spike.verdict 1.99;
         expected = "VERDICT: option 1";
       }
+      {
+        name = "xdoom: cc gate at exactly 1.25 passes";
+        got = Spike.ccGate 1.25;
+        expected = "CC GATE: pass";
+      }
+      {
+        name = "xdoom: cc gate at 1.26 fails";
+        got = Spike.ccGate 1.26;
+        expected = "CC GATE: fail";
+      }
     ];
 in
 P.bothPaths (run: concatMap (g: g run) groups) ++ spikeCases
