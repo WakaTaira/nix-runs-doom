@@ -17,14 +17,15 @@ let
   shlInt = x: n: B.toSigned (B.shl (B.u32 x) n);
   sraInt = x: n: B.toSigned (B.sra (B.u32 x) n);
 
-  # The same for `long long`, whose values are plain Nix integers (n < 63).
+  # The same for `long long`, whose values are plain Nix integers (n < 63 for <<, n < 64
+  # for >>). 2^63 is not a Nix integer, so >> 63 yields the sign directly.
   shlLL = x: n: x * B.pow2 n;
   sraLL =
     x: n:
     let
       p = B.pow2 n;
     in
-    div (x - bitAnd x (p - 1)) p;
+    if n == 63 then (if x < 0 then -1 else 0) else div (x - bitAnd x (p - 1)) p;
 
   # Conversion to signed char: the low 8 bits, sign-extended.
   toS8 =

@@ -6,7 +6,8 @@
 # `types` holds the type helpers shared with the emitter, and `collect` the tree walker.
 #
 # Types are those of cc/parse.nix. Sizes and ranges follow clang's ilp32 ABI (char 1; int,
-# long and pointers 4; long long 8). Plain char is signed.
+# long and pointers 4; long long 8). Plain char is unsigned, as in clang's RISC-V ABI
+# (the scaffold's), but stays a type of its own.
 #
 # Typed syntax tree
 # -----------------
@@ -114,13 +115,14 @@ let
     lo = -128;
     hi = 127;
   };
+  u8 = {
+    lo = 0;
+    hi = 255;
+  };
   ranges = {
-    char = s8;
+    char = u8;
     schar = s8;
-    uchar = {
-      lo = 0;
-      hi = 255;
-    };
+    uchar = u8;
     int = s32;
     long = s32;
     uint = u32;
@@ -148,8 +150,10 @@ let
     ];
   # int and long: signed 32-bit.
   isS32 = t: t.tag == "int" || t.tag == "long";
-  # char and signed char.
-  isS8 = t: t.tag == "char" || t.tag == "schar";
+  # signed char.
+  isS8 = t: t.tag == "schar";
+  # char and unsigned char.
+  isU8 = t: t.tag == "char" || t.tag == "uchar";
   sizeOf =
     t:
     if
@@ -220,7 +224,7 @@ let
       B.u32 v
     else if isS32 t then
       B.toSigned (B.u32 v)
-    else if t.tag == "uchar" then
+    else if isU8 t then
       b
     else if b >= 128 then
       b - 256
@@ -250,6 +254,7 @@ let
       isU32
       isS32
       isS8
+      isU8
       sizeOf
       fits
       ;
@@ -732,8 +737,9 @@ let
           acc
         else
           let
-            init = if d.init == null then null else assignConv d.init d.type (rv acc.env d.init);
+            # The scope of a name starts after its declarator, so the initializer sees it.
             r = declare acc.env d d.name d.type;
+            init = if d.init == null then null else assignConv d.init d.type (rv r.env d.init);
           in
           {
             inherit (r) env;
@@ -932,7 +938,7 @@ let
       };
     in
     if undefinedCalls != [ ] then
-      fail (head undefinedCalls) "function '${(head undefinedCalls).name}' is declared but not defined"
+      unsupported (head undefinedCalls) "call to function '${(head undefinedCalls).name}' that is declared but not defined"
     else
       builtins.deepSeq result result;
 in

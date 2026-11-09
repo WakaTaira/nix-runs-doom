@@ -114,7 +114,13 @@ let
     int sraVar(int x, int n) { return x >> n; }
     long long sraLL(long long x) { return x >> 40; }
     int shl(int x) { return x << 3; }
+    int sign63(long long x) { return x >> 63; }
+    int sign63Var(long long x, int n) { return x >> n; }
   '';
+
+  llongMinSrc = "int f(void) { long long x = ~9223372036854775807; return x < 0; }";
+
+  scopeSrc = "int g(int a, int b) { int x = a; { int x = x + b; a = x; } return a; }";
 
   unsignedSrc = ''
     unsigned add(unsigned a, unsigned b) { return a + b; }
@@ -129,6 +135,8 @@ let
     int store(unsigned char *p, int v) { *p = v; return *p; }
     int signedRead(unsigned char *p) { *p = 200; signed char *q = (signed char *)p; return *q; }
     int plainChar(char *p) { *p = 255; return *p; }
+    int plainRead(unsigned char *p) { *p = 200; char *q = (char *)p; return *q; }
+    int plainNarrow(int v) { char c = v; return c; }
   '';
 
   ptrSrc = ''
@@ -347,6 +355,42 @@ in
   ]) (-3))
   (t "cc run: long long >> floors" (ret shiftSrc "sraLL" [ (-1099511627777) ]) (-2))
   (t "cc run: int << multiplies" (ret shiftSrc "shl" [ (-5) ]) (-40))
+  (t "cc run: long long >> 63 yields the sign"
+    (map (x: ret shiftSrc "sign63" [ x ]) [
+      (-5)
+      5
+    ])
+    [
+      (-1)
+      0
+    ]
+  )
+  (t "cc run: variable long long >> 63 yields the sign"
+    (map
+      (
+        x:
+        ret shiftSrc "sign63Var" [
+          x
+          63
+        ]
+      )
+      [
+        (-5)
+        5
+      ]
+    )
+    [
+      (-1)
+      0
+    ]
+  )
+
+  # Constants and scopes
+  (t "cc run: constant folded to LLONG_MIN" (ret llongMinSrc "f" [ ]) 1)
+  (t "cc run: initializer sees the declared name, not the outer one" (ret scopeSrc "g" [
+    7
+    100
+  ]) 100)
 
   # Unsigned and signed arithmetic
   (t "cc run: unsigned + wraps" (ret unsignedSrc "add" [
@@ -396,7 +440,18 @@ in
     256
   ) 52)
   (t "cc run: signed char read sign-extends" (ret charSrc "signedRead" [ 256 ]) (-56))
-  (t "cc run: plain char is signed" (ret charSrc "plainChar" [ 256 ]) (-1))
+  (t "cc run: plain char is unsigned" (ret charSrc "plainChar" [ 256 ]) 255)
+  (t "cc run: plain char read zero-extends" (ret charSrc "plainRead" [ 256 ]) 200)
+  (t "cc run: plain char assignment truncates to unsigned"
+    (map (v: ret charSrc "plainNarrow" [ v ]) [
+      300
+      (-1)
+    ])
+    [
+      44
+      255
+    ]
+  )
 
   # Pointers
   (t "cc run: int * + 3 adds 12" (ret ptrSrc "step" [ 4096 ]) 4108)
@@ -549,6 +604,10 @@ in
   )
   (t "cc compile: undeclared identifier throws" (compileThrows "int f(void) { return y; }") true)
   (t "cc compile: undeclared function throws" (compileThrows "int f(void) { return g(); }") true)
+  (t "cc compile: call to a declared but undefined function throws"
+    (compileThrows "int g(void); int f(void) { return g(); }")
+    true
+  )
   (t "cc compile: assignment to a non-lvalue throws" (compileThrows "void f(int x) { x + 1 = 2; }")
     true
   )

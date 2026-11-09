@@ -27,6 +27,8 @@ Transitional exception: `examples/fizzbuzz-c` embeds C in a Nix string and build
 
 Transitional exception: `toolchain/doom.nix` embeds a small C string (`mainC`: call `doomgeneric_Create`, then call `doomgeneric_Tick` forever) in place of doomgeneric's platform `main`. The Doom scaffold (`scaffold/`, `toolchain/doom.nix`) is a temporary mirror for cross-checking a future C compiler written in Nix, and is removed once that compiler can run Doom.
 
+The Nix C compiler keeps its C inputs and test cases as Nix strings (`cc/examples/`, `tests/cc.nix`). They are input data for the compiler, not guest code written in C, so they are not an exception to the rule above.
+
 ## Commands
 
 | Purpose | Command |
@@ -40,7 +42,7 @@ Transitional exception: `toolchain/doom.nix` embeds a small C string (`mainC`: c
 | cc gate report (needs measured stats of `nix` and `cc`, see below) | `SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport` |
 | Format | `nix fmt` |
 
-All of these also work as `.#<attr>` through the flake (flakes only see git-tracked files, so `git add -N` new files first).
+The flake exposes only `lib`, `tests`, `fizzbuzz` and `fizzbuzzC`, so the commands on those also work as `.#<attr>` (flakes only see git-tracked files, so `git add -N` new files first). `bench.*`, `scaffold.*` and `cc.*` are used with `-f .` only.
 
 Performance budget (two evaluations; the first lets Nix record its own CPU time):
 
@@ -93,7 +95,7 @@ Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizz
 - `cc/` — the C compiler written in Nix (C source -> Nix source): `lex.nix` (lexer), `parse.nix` (parser), `check.nix` (type checker), `emit.nix` (Nix code generator), `runtime.nix` (runtime helpers used by the generated code), `default.nix` (`compile` / `load`), `examples/spike.nix` (the M0 reference C as a string).
 - `tests/cc.nix` — tests of the Nix C compiler.
 - `tests/fastpath.nix` — regression and self-modifying-code tests for the code-region path.
-- `tests/xdoom.nix` — both-path tests for the `fixmul` (custom-0) instruction, and the equivalence and verdict tests of the three spike variants.
+- `tests/xdoom.nix` — both-path tests for the `fixmul` (custom-0) instruction, the equivalence tests of the four spike variants (`rv`, `rvx`, `nix`, `cc`), and the boundary tests of the spike verdict and the cc gate.
 - `examples/fizzbuzz/` — FizzBuzz in the eDSL.
 - `examples/fizzbuzz-c/`, `toolchain/guest.nix` — transitional clang-built C version and its hex fixture.
 - `bench/spike/` — the M0 execution-strategy spike: `data.nix` (shared memory image and checks), `rv.nix` / `rvx.nix` (clang output transcribed to the eDSL, without / with `fixmul`), `nix.nix` (the C translated to Nix), `default.nix` (`bench.spike.*` workloads and the report with its verdict). Variant `cc` is the same C compiled by `cc/`; `bench.spike.ccReport` compares it with `nix` and prints the `CC GATE:` line.

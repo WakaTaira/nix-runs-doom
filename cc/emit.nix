@@ -20,9 +20,9 @@
 #   - Conditions are Nix booleans; a comparison is 0 or 1 only where its value is used.
 #   - Values wrap modulo 2^32 only where C wraps them (unsigned and pointer arithmetic,
 #     conversions); signed arithmetic does not wrap.
-# Value representation: char, signed char, int, long and long long are signed Nix
-# integers; unsigned types and pointers are non-negative. Memory words are stored in
-# the unsigned form.
+# Value representation: signed char, int, long and long long are signed Nix integers;
+# plain char (unsigned, see cc/check.nix), the unsigned types and pointers are
+# non-negative. Memory words are stored in the unsigned form.
 #
 # Generated names are `<C name>_<n>` (parameters `<C name>_0`) with n unique within a
 # function, and `<C name>_fn` for functions, so they collide neither with each other nor
@@ -56,7 +56,15 @@ let
   atom = cv 0;
   isAtom = c: c.prec == 0;
   low = cv 10;
-  num = n: cv (if n < 0 then 2 else 0) (toString n);
+  # LLONG_MIN has no Nix literal (9223372036854775808 does not parse), so it is written
+  # as a subtraction.
+  llongMin = -9223372036854775807 - 1;
+  num =
+    n:
+    if n == llongMin then
+      sub (cv 2 "-9223372036854775807") (num 1)
+    else
+      cv (if n < 0 then 2 else 0) (toString n);
   wrap = max: c: if c.prec <= max then c.code else "(${c.code})";
   app = f: args: cv 1 (concatStringsSep " " ([ f ] ++ map (wrap 0) args));
   # Left-associative and non-associative infix operators of strength p.
@@ -209,7 +217,7 @@ let
       app "B.toSigned" [ (if T.isU32 from then c else app "B.u32" [ c ]) ]
     else if T.isU32 to then
       app "B.u32" [ c ]
-    else if to.tag == "uchar" then
+    else if T.isU8 to then
       app "bitAnd" [
         c
         (num 255)
@@ -229,7 +237,7 @@ let
         a
       ];
     in
-    if t.tag == "uchar" then
+    if T.isU8 t then
       byte
     else if T.isS8 t then
       app "R.toS8" [ byte ]
@@ -362,11 +370,19 @@ let
       throw "cc: internal error: unexpected expression '${k}'";
 
   # Shift amount of e when it is a constant the shift can be inlined for, otherwise null.
+  # 2^63 is not a Nix integer: `long long << 63` is left to R.shlLL, and `>> 63` has its
+  # own case in arith.
   constShift =
     e:
     let
       r = e.rhs;
-      limit = if e.type.tag == "llong" then 63 else 32;
+      limit =
+        if e.type.tag != "llong" then
+          32
+        else if e.op == ">>" then
+          64
+        else
+          63;
     in
     if r.kind == "lit" && r.value >= 0 && r.value < limit then r.value else null;
 
@@ -469,6 +485,9 @@ let
           (num p)
         ]
       )
+    else if k == 63 then
+      # Only long long reaches here: the result is the sign.
+      ok (low "if ${(infixN 6 "<" a (num 0)).code} then -1 else 0")
     else
       # Floor division by 2^k (Nix div truncates toward zero).
       shareInline s [ a ] (
@@ -749,13 +768,16 @@ let
     else
       throw "cc: internal error: unexpected statement '${k}'";
 
-  # An uninitialized variable reads as 0.
+  # An uninitialized variable reads as 0, also inside its own initializer.
   declVar =
     s: d:
     let
       s1 = s // {
         names = s.names // {
           ${d.var.key} = d.var.name;
+        };
+        vars = s.vars // {
+          ${d.var.key} = "0";
         };
       };
       v = expr s1 d.init;

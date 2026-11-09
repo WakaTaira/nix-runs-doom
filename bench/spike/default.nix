@@ -66,7 +66,7 @@ let
   # is at least twice as slow; otherwise option 1 (compile to RISC-V) stays.
   verdict = rvxOverNix: if rvxOverNix >= 2.0 then "VERDICT: option 3" else "VERDICT: option 1";
 
-  # `costs` holds the cost of one frame in seconds per variant: { rv; rvx; nix; }.
+  # Report line of variant name; `costs` holds the cost of one frame in seconds per variant.
   row =
     costs: name:
     let
@@ -74,6 +74,7 @@ let
     in
     "  ${name}: ${fixed 0 (c * 1000000)} us/frame, ${fixed 3 (c * 1000000 / pixels)} us/pixel";
 
+  # `costs` holds the cost of one frame in seconds per variant: { rv; rvx; nix; }.
   mkReport =
     { costs }:
     let
