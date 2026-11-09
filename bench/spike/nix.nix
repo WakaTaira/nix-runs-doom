@@ -3,7 +3,6 @@
 # optimization. The translation rules are fixed:
 #   - a C function becomes a Nix function taking the memory trie and its arguments
 #     and returning the new memory ({ mem; ret; } when it also returns a value);
-#     functions that do not touch memory just return their value;
 #   - locals that do not live across a loop iteration become `let` bindings;
 #   - every loop (for, do/while) becomes a call of the single helper `loop`;
 #   - memory goes through lib/mem.nix, 32-bit arithmetic through lib/bits.nix, and
@@ -67,11 +66,14 @@ let
   # fixed_t FixedMul(fixed_t a, fixed_t b) { return ((long long)a * b) >> 16; }
   # The 64-bit shift floors; the conversion back to int keeps the low 32 bits.
   FixedMul =
-    a: b:
+    mem: a: b:
     let
       p = a * b;
     in
-    B.toSigned (B.u32 (div (p - bitAnd p 65535) 65536));
+    {
+      inherit mem;
+      ret = B.toSigned (B.u32 (div (p - bitAnd p 65535) 65536));
+    };
 
   # do { *dest = cmap[src[(frac >> 16) & 127]]; dest += 320; frac += step; } while (--count);
   R_DrawColumn =
@@ -205,9 +207,13 @@ let
             loop (w: w.i < paramAt w.mem params 3)
               (
                 w:
+                let
+                  r = FixedMul w.mem (w.i * 7919) (74565 + w.i);
+                in
                 w
                 // {
-                  s = B.add w.s (FixedMul (w.i * 7919) (74565 + w.i));
+                  inherit (r) mem;
+                  s = B.add w.s r.ret;
                   i = w.i + 1;
                 }
               )
