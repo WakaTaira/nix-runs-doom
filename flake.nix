@@ -3,8 +3,15 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+  # Upstream Doom source (an external input, like a ROM). Used only by the
+  # doom-scaffold build; the emulator never reads it.
+  inputs.doomgeneric = {
+    url = "github:ozkl/doomgeneric";
+    flake = false;
+  };
+
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, doomgeneric, ... }:
     let
       systems = [
         "x86_64-linux"
@@ -32,6 +39,10 @@
         fizzbuzz-c = import ./examples/fizzbuzz-c {
           buildGuest = import ./toolchain/guest.nix { inherit pkgs; };
         };
+
+        # The clang-built doomgeneric scaffold; evaluation reads its doom.hex from
+        # `nix build .#doom-scaffold -o result-doom`.
+        doom-scaffold = import ./toolchain/doom.nix { inherit pkgs doomgeneric; };
       });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);

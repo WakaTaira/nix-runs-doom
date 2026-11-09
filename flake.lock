@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "doomgeneric": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791724345,
+        "narHash": "sha256-A25lWVT5YBFXmMB1EP91ntLvOW9UkeN9vUwopKpJHY4=",
+        "owner": "ozkl",
+        "repo": "doomgeneric",
+        "rev": "e257a09527062bfb986b6e5e0780839b6cbd5b71",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ozkl",
+        "repo": "doomgeneric",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1794042290,
@@ -18,6 +34,7 @@
     },
     "root": {
       "inputs": {
+        "doomgeneric": "doomgeneric",
         "nixpkgs": "nixpkgs"
       }
     }
