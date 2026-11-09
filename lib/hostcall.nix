@@ -250,7 +250,8 @@ let
   # table entry name to its standard C prototype (types matter to the compiler:
   # size_t is unsigned and double is not an integer, which the abstract table types
   # cannot express). Every prototype must name a table entry, and `...` must agree
-  # with the entry's variadic flag.
+  # with the entry's variadic flag; the parameter and return types must map onto the
+  # entry's args and ret.
   headers = {
     "string.h" = {
       prelude = "#include <stddef.h>";
@@ -499,6 +500,56 @@ let
         )
       );
 
+  # Abstract table type of a C type text: pointers (and va_list, a pointer under ilp32) are "ptr", 64-bit types (and
+  # double) "i64", void "void", everything else "int".
+  abstractType =
+    t:
+    if match ".*(\\*|va_list).*" t != null then
+      "ptr"
+    else if match ".*(double|long long).*" t != null then
+      "i64"
+    else if match " *void *" t != null then
+      "void"
+    else
+      "int";
+
+  # Split the text between the parentheses of a prototype into the abstract types of
+  # its fixed parameters; `...` is dropped and `void` alone means no parameters.
+  protoArgs =
+    text:
+    let
+      inner = elemAt (match "[^(]*\\((.*)\\)[^)]*" text) 0;
+      parts = filter (p: match " *" p == null && match " *\\.\\.\\. *" p == null) (
+        filter builtins.isString (builtins.split "," inner)
+      );
+    in
+    if match " *void *" inner != null then [ ] else map abstractType parts;
+
+  # Abstract return type: the text before the function name.
+  protoRet =
+    name: text:
+    let
+      m = match "(.*[^A-Za-z0-9_])${name} *\\(.*" text;
+    in
+    abstractType (if m == null then text else elemAt m 0);
+
+  # Throws unless the C prototype `text` of entry `e` agrees with the table's args and
+  # ret (for a variadic entry, the table's args are the fixed parameters); returns
+  # true otherwise.
+  checkProto =
+    file: name: text: e:
+    let
+      got = protoArgs text;
+      ret = protoRet name text;
+      show = ts: "(${concatStringsSep ", " ts})";
+    in
+    if got != e.args then
+      throw "lib/hostcall.nix: ${file}: arguments of ${name} are ${show got} but the table has ${show e.args}"
+    else if ret != e.ret then
+      throw "lib/hostcall.nix: ${file}: return type of ${name} is ${ret} but the table has ${e.ret}"
+    else
+      true;
+
   # Text of one generated header, after checking its prototypes against the table.
   headerText =
     file:
@@ -515,7 +566,7 @@ let
         else if variadicProto != isVariadic byName.${name} then
           throw "lib/hostcall.nix: ${file}: variadic mismatch for ${name}"
         else
-          "${h.protos.${name}};";
+          builtins.seq (checkProto file name h.protos.${name} byName.${name}) "${h.protos.${name}};";
     in
     ''
       /* Generated from lib/hostcall.nix. */
@@ -531,6 +582,7 @@ in
   # number for the emulator-side dispatch.
   table = checked;
   inherit
+    checkProto
     stdHandles
     byName
     byNum

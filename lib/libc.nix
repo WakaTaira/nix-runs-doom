@@ -30,10 +30,12 @@ let
   inherit (builtins)
     all
     attrNames
+    attrValues
     bitAnd
     concatLists
     concatStringsSep
     div
+    elem
     elemAt
     foldl'
     genList
@@ -612,14 +614,24 @@ let
       # End of input before the first conversion returns EOF.
       inputFail = m: cnt: done m (if cnt == 0 then neg1 else cnt);
 
+      # Optional sign, optional 0x prefix, hex digits; a negative value wraps modulo
+      # 2^32 like strtoul. Null without digits.
       scanHex =
-        j:
+        j0:
         let
+          c = if j0 < ns then elemAt sb j0 else 0;
+          j = if c == 45 || c == 43 then j0 + 1 else j0;
           prefixed = j + 1 < ns && elemAt sb j == 48 && (elemAt sb (j + 1) == 120 || elemAt sb (j + 1) == 88);
           withPrefix = parseDigits 16 sb (j + 2);
           r = if prefixed && withPrefix.count > 0 then withPrefix else parseDigits 16 sb j;
         in
-        if r.count == 0 then null else r;
+        if r.count == 0 then
+          null
+        else
+          {
+            value = if c == 45 then B.u32 (0 - r.value) else r.value;
+            inherit (r) next;
+          };
 
       scanWord =
         j:
@@ -687,6 +699,8 @@ let
   # --- Files and output ---
 
   isStd = h: h == H.stdHandles.stdout || h == H.stdHandles.stderr;
+  # Any predefined handle, stdin included.
+  isStdHandle = h: elem h (attrValues H.stdHandles);
 
   fileOf = world: h: world.files.${toString h} or null;
 
@@ -1016,7 +1030,7 @@ let
       in
       if f != null && f.kind != "closed" then
         result (setFile world h { kind = "closed"; }) 0
-      else if h >= 1 && h <= 3 then
+      else if isStdHandle h then
         result world 0
       else
         result world neg1;

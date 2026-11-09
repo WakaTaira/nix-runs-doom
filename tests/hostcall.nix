@@ -170,6 +170,45 @@ let
       text = getStr r.world.mem 16384;
     };
 
+  # --- sscanf %x ---
+
+  # "%x" applied to the text; the converted value and the conversion count.
+  scanHexOf =
+    text:
+    let
+      m = putStrs M.empty [
+        {
+          addr = 1024;
+          str = text;
+        }
+        {
+          addr = 2048;
+          str = "%x";
+        }
+      ];
+      m' = putWords m 4096 [ 8192 ];
+      r = L.vsscanf (world m') [
+        1024
+        2048
+        4096
+      ];
+    in
+    {
+      ret = r.ret;
+      value = M.loadWord r.world.mem 8192;
+    };
+
+  # --- header prototype check ---
+
+  protoOk =
+    c:
+    (builtins.tryEval (
+      H.checkProto "f.h" "f" c {
+        args = [ "ptr" ];
+        ret = "int";
+      }
+    )).success;
+
   # --- malloc / realloc ---
 
   heap =
@@ -580,5 +619,52 @@ in
       handle = 0;
       errno = 2;
     };
+  }
+  {
+    name = "libc: sscanf %x accepts signs and a 0x prefix";
+    got = map scanHexOf [
+      "-1"
+      "+ff"
+      "-0x10"
+      "-"
+      "0x1f"
+    ];
+    expected = [
+      {
+        ret = 1;
+        value = 4294967295;
+      }
+      {
+        ret = 1;
+        value = 255;
+      }
+      {
+        ret = 1;
+        value = 4294967280;
+      }
+      {
+        ret = 0;
+        value = 0;
+      }
+      {
+        ret = 1;
+        value = 31;
+      }
+    ];
+  }
+  {
+    name = "hostcall: header prototype check compares types with the table";
+    got = [
+      (protoOk "int f(const char *s)")
+      (protoOk "int f(int s)")
+      (protoOk "void f(const char *s)")
+      (protoOk "int f(const char *s, int n)")
+    ];
+    expected = [
+      true
+      false
+      false
+      false
+    ];
   }
 ]

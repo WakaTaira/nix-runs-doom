@@ -25,6 +25,8 @@ Not just the emulator: the guest programs are Nix too.
 
 Transitional exception: `examples/fizzbuzz-c` embeds C in a Nix string and builds it with clang via `toolchain/guest.nix`. It exists only to compare against the eDSL version and will be removed.
 
+Transitional exception: `toolchain/doom.nix` embeds a small C string (`mainC`: call `doomgeneric_Create`, then call `doomgeneric_Tick` forever) in place of doomgeneric's platform `main`. The Doom scaffold (`scaffold/`, `toolchain/doom.nix`) is a temporary mirror for cross-checking a future C compiler written in Nix, and is removed once that compiler can run Doom.
+
 ## Commands
 
 | Purpose | Command |
