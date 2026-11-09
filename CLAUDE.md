@@ -52,7 +52,7 @@ Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizz
 
 - `lib/bits.nix` — 32-bit arithmetic. Values are always unsigned (0..2^32-1). Shifts use a power-of-two table with multiply/divide.
 - `lib/mem.nix` — persistent 64-ary trie over word addresses (5 levels x 6 bits). Sparse; unwritten words read as 0. An update copies the 5 nodes on the path.
-- `lib/cpu.nix` — RV32IM. `step` (one instruction) and `run` (loop that runs `foldl'` in chunks). ECALL supports only a7=64 write and a7=93 exit.
+- `lib/cpu.nix` — RV32IM. Instructions in the read-only code region (`mkState { code = { base; size; }; }`) are decoded once into a lazy list of threaded ops (`state -> state`) and fetched with `elemAt`; outside it, or after a store touches it, fetch falls back to the memory trie and re-decodes changed words. `run` folds in chunks and forces state every 64 steps. ECALL supports only a7=64 write and a7=93 exit.
 - `lib/dsl.nix` — the guest eDSL: instructions, pseudo-instructions (`li`, `la`, `call`, ...), labels, data (`string`, `space`, `align`), and structured control flow (`when`, `ifElse`, `while`). Two-pass assembler `assemble` and loader `toMemory`.
 - `lib/asm.nix` — raw instruction encoders used by the eDSL (encodings verified against llvm-mc).
 - `lib/ascii.nix` — chr/ord tables.
@@ -72,7 +72,7 @@ Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizz
 - `builtins.readFile` cannot read binaries containing NUL; binaries are converted with `od -An -v -tx1 | tr -d ' \n'` (or `xxd -p`) and parsed in Nix.
 - Output to a TTY: `builtins.trace` streams during evaluation and keeps ANSI color when stderr is a real terminal (it strips escapes when piped). `nix eval --raw` always keeps them. nixboy streams frames with `trace`.
 - A clock is not observable inside an evaluation; benchmarks read `cpuTime` from `NIX_SHOW_STATS_PATH`.
-- State updates are forced with `seq` (`commit`, `storeWordAt`). Left lazy, thunks chain and memory blows up.
+- State is forced every 64 steps (`strict` in `lib/cpu.nix`), and memory-trie paths on every store (`storeWordAt`). Fully lazy state builds thunk chains that blow up memory; forcing every step costs about 2.4x in speed.
 - `tail` and list updates copy in O(n), so the hot path never updates lists. Registers and memory are updated with attribute-set `//`.
 - Nix `div` truncates toward zero; arithmetic right shift corrects this to floor.
 

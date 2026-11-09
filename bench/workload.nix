@@ -25,6 +25,11 @@ let
     mem = builtins.foldl' (m: i: mem.storeWord m (i * 4) (builtins.elemAt memloopCode i)) mem.empty (
       builtins.genList (i: i) (builtins.length memloopCode)
     );
+    # The loop runs from the pre-decoded code region (the fast path used by loaded programs).
+    code = {
+      base = 0;
+      size = 4 * builtins.length memloopCode;
+    };
   };
 
   final =

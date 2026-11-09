@@ -10,6 +10,7 @@ let
   M = import ./lib/mem.nix;
 
   # Run an assembled eDSL program and return the halted state.
+  # The whole program image (code and data) is declared as the code region.
   runProgram =
     {
       program,
@@ -19,8 +20,29 @@ let
       C.mkState {
         mem = D.toMemory M.empty program;
         pc = program.entry;
+        code = {
+          inherit (program) base size;
+        };
       }
     );
+
+  # Code region of an ELF image: the file contents of the PT_LOAD segment that
+  # contains the entry point, widened to start at a word boundary.
+  elfCodeRegion =
+    img:
+    let
+      inText = ph: img.entry >= ph.vaddr && img.entry < ph.vaddr + ph.filesz;
+      texts = builtins.filter inText img.segments;
+      ph = builtins.head texts;
+      pad = builtins.bitAnd ph.vaddr 3;
+    in
+    if texts == [ ] then
+      null
+    else
+      {
+        base = ph.vaddr - pad;
+        size = ph.filesz + pad;
+      };
 
   # Load a hex-encoded ELF, run it, and return the halted state.
   runElfHex =
@@ -35,6 +57,7 @@ let
         inherit (img) mem;
         pc = img.entry;
         inherit sp;
+        code = elfCodeRegion img;
       };
     in
     C.run { inherit maxSteps; } s0;

@@ -15,44 +15,51 @@ let
     ;
 
   keyList = genList toString 64;
-  key = i: elemAt keyList i;
 
-  # Split a word address into the keys for the 5 levels.
-  k0 = w: key (bitAnd (div w 16777216) 63);
-  k1 = w: key (bitAnd (div w 262144) 63);
-  k2 = w: key (bitAnd (div w 4096) 63);
-  k3 = w: key (bitAnd (div w 64) 63);
-  k4 = w: key (bitAnd w 63);
+  # A word address w is split into 5 keys of 6 bits each, from the top:
+  # (w / 2^24) & 63, (w / 2^18) & 63, (w / 2^12) & 63, (w / 2^6) & 63 and w & 63.
+  # The lower four keys are read in pairs from pairList (index: 12 address bits,
+  # value: the keys of its upper and lower 6 bits), which keeps the arithmetic per
+  # access small. The computations are written out inline to avoid function calls.
+  pairList = genList (i: {
+    hi = elemAt keyList (div i 64);
+    lo = elemAt keyList (bitAnd i 63);
+  }) 4096;
 
   empty = { };
 
   loadWordAt =
-    m: w: ((((m.${k0 w} or { }).${k1 w} or { }).${k2 w} or { }).${k3 w} or { }).${k4 w} or 0;
+    m: w:
+    let
+      p12 = elemAt pairList (bitAnd (div w 4096) 4095);
+      p34 = elemAt pairList (bitAnd w 4095);
+    in
+    ((((m.${elemAt keyList (bitAnd (div w 16777216) 63)} or { }).${p12.hi} or { }).${p12.lo} or { })
+      .${p34.hi} or { }
+    ).${p34.lo} or 0;
 
   # Rebuild the path from leaf to root. Each level is forced with seq to avoid thunk build-up.
   storeWordAt =
     m: w: v:
     let
-      a0 = k0 w;
-      a1 = k1 w;
-      a2 = k2 w;
-      a3 = k3 w;
-      a4 = k4 w;
+      p12 = elemAt pairList (bitAnd (div w 4096) 4095);
+      p34 = elemAt pairList (bitAnd w 4095);
+      a0 = elemAt keyList (bitAnd (div w 16777216) 63);
       n0 = m.${a0} or { };
-      n1 = n0.${a1} or { };
-      n2 = n1.${a2} or { };
-      n3 = n2.${a3} or { };
+      n1 = n0.${p12.hi} or { };
+      n2 = n1.${p12.lo} or { };
+      n3 = n2.${p34.hi} or { };
       n3' = n3 // {
-        ${a4} = v;
+        ${p34.lo} = v;
       };
       n2' = n2 // {
-        ${a3} = n3';
+        ${p34.hi} = n3';
       };
       n1' = n1 // {
-        ${a2} = n2';
+        ${p12.lo} = n2';
       };
       n0' = n0 // {
-        ${a1} = n1';
+        ${p12.hi} = n1';
       };
     in
     seq v (seq n3' (seq n2' (seq n1' (seq n0' (m // { ${a0} = n0'; })))));
