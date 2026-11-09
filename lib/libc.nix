@@ -1,0 +1,1104 @@
+# libc and compiler-runtime bodies for the host calls of lib/hostcall.nix.
+#
+# Every function is pure and independent of CPU registers and CPU state, so that the
+# same code serves the emulator's ecall dispatch and a future C-to-Nix compiler:
+#
+#   libc.<name> = world: args: { world = world'; ret = ...; }
+#
+# `args` lists the arguments in table order as unsigned 32-bit values; an "i64"
+# argument is one { lo; hi; } element. `ret` is a u32 ({ lo; hi; } for "i64") and 0
+# for "void".
+#
+# The libc state is the attrset `world` = { mem; brk; files; out; errnoAddr; wad; }:
+#   mem        memory trie of lib/mem.nix
+#   brk        next malloc position (u32)
+#   files      handles by toString handle: { kind = "wad"; pos; }, { kind = "null"; }
+#              (a write-only dummy) or { kind = "closed"; } once fclose'd. Closed
+#              entries stay so that handle values keep counting up from 16.
+#   out        text written to stdout and stderr
+#   errnoAddr  address of the guest's errno (0: errno is not written)
+#   wad        { hex; size; } or null; hex is the WAD as continuous hex text (two
+#              characters per byte, no separators), size its length in bytes
+#
+# Unsupported functions (floating point, system, exit, the variadic entries that are
+# never called through ecall) throw when called.
+let
+  M = import ./mem.nix;
+  B = import ./bits.nix;
+  A = import ./ascii.nix;
+  H = import ./hostcall.nix;
+  inherit (builtins)
+    all
+    attrNames
+    bitAnd
+    concatLists
+    concatStringsSep
+    div
+    elemAt
+    foldl'
+    genList
+    length
+    listToAttrs
+    match
+    substring
+    stringLength
+    toString
+    ;
+
+  inherit (B) mask32 sign32 two32;
+
+  range = genList (i: i);
+  min = a: b: if a < b then a else b;
+  max = a: b: if a > b then a else b;
+
+  # C's -1 (EOF, failure) as a u32.
+  neg1 = mask32;
+
+  errno = {
+    ENOENT = 2;
+    EINVAL = 22;
+  };
+
+  result = world: ret: { inherit world ret; };
+
+  # --- Memory helpers ---
+
+  # Length of the NUL-terminated string at a; aligned words are tested whole.
+  strlenAt =
+    mem: a:
+    let
+      go =
+        p:
+        if bitAnd p 3 != 0 then
+          (if M.loadByte mem p == 0 then p else go (p + 1))
+        else
+          let
+            w = M.loadWordAt mem (div p 4);
+          in
+          if bitAnd w 255 == 0 then
+            p
+          else if bitAnd w 65280 == 0 then
+            p + 1
+          else if bitAnd w 16711680 == 0 then
+            p + 2
+          else if w < 16777216 then
+            p + 3
+          else
+            go (p + 4);
+    in
+    go a - a;
+
+  readBytes =
+    mem: a: n:
+    genList (i: M.loadByte mem (a + i)) n;
+
+  # Bytes of the NUL-terminated string at a (without the NUL).
+  cBytes = mem: a: readBytes mem a (strlenAt mem a);
+
+  # Bytes of the string at a, stopping at a NUL or after `limit` bytes.
+  cBytesMax =
+    mem: a: limit:
+    let
+      go = i: if i >= limit || M.loadByte mem (a + i) == 0 then i else go (i + 1);
+    in
+    readBytes mem a (go 0);
+
+  # Bytes to text; NUL becomes "" and bytes >= 128 become "?" (see lib/ascii.nix).
+  bytesToString = bs: concatStringsSep "" (map A.chr bs);
+
+  cString = mem: a: bytesToString (cBytes mem a);
+
+  # Store n bytes at dst. byteAt k is byte k; wordAt k is the little-endian word made
+  # of bytes k .. k + 3. The word-aligned middle part is written a word at a time.
+  fill =
+    mem: dst: n: byteAt: wordAt:
+    let
+      head = min n (bitAnd (4 - bitAnd dst 3) 3);
+      nw = div (n - head) 4;
+      t0 = head + 4 * nw;
+      w0 = div (dst + head) 4;
+      m1 = foldl' (m: k: M.storeByte m (dst + k) (byteAt k)) mem (range head);
+      m2 = foldl' (m: j: M.storeWordAt m (w0 + j) (wordAt (head + 4 * j))) m1 (range nw);
+    in
+    foldl' (m: k: M.storeByte m (dst + t0 + k) (byteAt (t0 + k))) m2 (range (n - t0));
+
+  storeBytes =
+    mem: dst: bs:
+    let
+      b = elemAt bs;
+    in
+    fill mem dst (length bs) b (k: b k + 256 * b (k + 1) + 65536 * b (k + 2) + 16777216 * b (k + 3));
+
+  # Copy n bytes from src to dst. All reads see the memory before the copy, so
+  # overlapping ranges behave as memmove.
+  copyMem =
+    mem: dst: src: n:
+    fill mem dst n (k: M.loadByte mem (src + k)) (k: M.loadWord mem (src + k));
+
+  setMem =
+    mem: dst: c: n:
+    let
+      b = bitAnd c 255;
+    in
+    fill mem dst n (_: b) (_: b * 16843009);
+
+  # --- ctype ---
+
+  isSpaceB = c: c == 32 || (c >= 9 && c <= 13);
+  isDigitB = c: c >= 48 && c <= 57;
+  toLowerB = c: if c >= 65 && c <= 90 then c + 32 else c;
+  toUpperB = c: if c >= 97 && c <= 122 then c - 32 else c;
+  boolRet = b: if b then 1 else 0;
+
+  # Value of a hex digit, or null.
+  hexValB =
+    c:
+    if isDigitB c then
+      c - 48
+    else if c >= 97 && c <= 102 then
+      c - 87
+    else if c >= 65 && c <= 70 then
+      c - 55
+    else
+      null;
+
+  # --- Strings ---
+
+  # Compare two strings for at most n bytes after mapping each byte with f.
+  cmpStr =
+    f: mem: a: b: n:
+    let
+      go =
+        i:
+        if i >= n then
+          0
+        else
+          let
+            x = f (M.loadByte mem (a + i));
+            y = f (M.loadByte mem (b + i));
+          in
+          if x != y then
+            B.u32 (x - y)
+          else if x == 0 then
+            0
+          else
+            go (i + 1);
+    in
+    go 0;
+
+  # strcmp has no length limit; two32 exceeds any string in a 32-bit address space.
+  unlimited = two32;
+
+  strchrAt =
+    mem: s: c:
+    let
+      go =
+        p:
+        let
+          x = M.loadByte mem p;
+        in
+        if x == c then
+          p
+        else if x == 0 then
+          0
+        else
+          go (p + 1);
+    in
+    go s;
+
+  strrchrAt =
+    mem: s: c:
+    let
+      bs = cBytes mem s;
+      l = length bs;
+    in
+    if c == 0 then s + l else foldl' (acc: i: if elemAt bs i == c then s + i else acc) 0 (range l);
+
+  strstrAt =
+    mem: h: nd:
+    let
+      hb = cBytes mem h;
+      nb = cBytes mem nd;
+      lh = length hb;
+      ln = length nb;
+      matchAt = i: all (k: elemAt hb (i + k) == elemAt nb k) (range ln);
+      go =
+        i:
+        if i + ln > lh then
+          0
+        else if matchAt i then
+          h + i
+        else
+          go (i + 1);
+    in
+    go 0;
+
+  # Parse digits of `base` starting at index j of the byte list bs; the value wraps
+  # modulo 2^32. Returns { value; next; count; }.
+  parseDigits =
+    base: bs: j:
+    let
+      n = length bs;
+      go =
+        k: acc:
+        let
+          d = if k < n then hexValB (elemAt bs k) else null;
+        in
+        if d != null && d < base then
+          go (k + 1) (bitAnd (acc * base + d) mask32)
+        else
+          {
+            value = acc;
+            next = k;
+            count = k - j;
+          };
+    in
+    go j 0;
+
+  # Optional sign followed by decimal digits at index j; null without digits.
+  parseSigned =
+    bs: j:
+    let
+      c = if j < length bs then elemAt bs j else 0;
+      signed = c == 45 || c == 43;
+      r = parseDigits 10 bs (if signed then j + 1 else j);
+    in
+    if r.count == 0 then
+      null
+    else
+      {
+        value = if c == 45 then B.u32 (0 - r.value) else r.value;
+        inherit (r) next;
+      };
+
+  skipSpaces = bs: j: if j < length bs && isSpaceB (elemAt bs j) then skipSpaces bs (j + 1) else j;
+
+  atoiAt =
+    mem: s:
+    let
+      bs = cBytes mem s;
+      r = parseSigned bs (skipSpaces bs 0);
+    in
+    if r == null then 0 else r.value;
+
+  # --- 64-bit integers as { lo; hi; } ---
+
+  toS64 = v: (if v.hi >= sign32 then v.hi - two32 else v.hi) * two32 + v.lo;
+
+  fromS64 =
+    x:
+    let
+      lo = bitAnd x mask32;
+    in
+    {
+      inherit lo;
+      hi = bitAnd (div (x - lo) two32) mask32;
+    };
+
+  neg64 = v: {
+    lo = B.u32 (0 - v.lo);
+    hi = B.u32 (0 - v.hi - (if v.lo != 0 then 1 else 0));
+  };
+
+  geq64 = a: b: a.hi > b.hi || (a.hi == b.hi && a.lo >= b.lo);
+
+  sub64 =
+    a: b:
+    let
+      lo = a.lo - b.lo;
+    in
+    {
+      lo = B.u32 lo;
+      hi = B.u32 (a.hi - b.hi - (if lo < 0 then 1 else 0));
+    };
+
+  bitOf64 =
+    v: i: if i >= 32 then bitAnd (div v.hi (B.pow2 (i - 32))) 1 else bitAnd (div v.lo (B.pow2 i)) 1;
+
+  setBit64 =
+    v: i: if i >= 32 then v // { hi = v.hi + B.pow2 (i - 32); } else v // { lo = v.lo + B.pow2 i; };
+
+  # Unsigned 64-bit division { q; r; }. Values below 2^63 use Nix integers directly;
+  # otherwise restoring binary long division.
+  udivmod64 =
+    n: d:
+    if d.hi == 0 && d.lo == 0 then
+      throw "libc: 64-bit division by zero"
+    else if n.hi < sign32 && d.hi < sign32 then
+      let
+        a = toS64 n;
+        b = toS64 d;
+        q = div a b;
+      in
+      {
+        q = fromS64 q;
+        r = fromS64 (a - q * b);
+      }
+    else if d.hi >= sign32 then
+      # d >= 2^63: the quotient is 0 or 1.
+      (
+        if geq64 n d then
+          {
+            q = fromS64 1;
+            r = sub64 n d;
+          }
+        else
+          {
+            q = fromS64 0;
+            r = n;
+          }
+      )
+    else
+      # d < 2^63 keeps the shifted remainder below 2^64.
+      foldl'
+        (
+          acc: i:
+          let
+            r = {
+              hi = B.u32 (acc.r.hi * 2 + div acc.r.lo sign32);
+              lo = B.u32 (acc.r.lo * 2 + bitOf64 n i);
+            };
+            ok = geq64 r d;
+          in
+          {
+            r = if ok then sub64 r d else r;
+            q = if ok then setBit64 acc.q i else acc.q;
+          }
+        )
+        {
+          q = fromS64 0;
+          r = fromS64 0;
+        }
+        (genList (i: 63 - i) 64);
+
+  # C signed division and remainder (truncating toward zero).
+  sdiv64 =
+    x: y:
+    let
+      b = toS64 y;
+    in
+    if b == 0 then throw "libc: 64-bit division by zero" else div (toS64 x) b;
+
+  # Quotient q and remainder r of a 64-bit value by a small divisor d.
+  divSmall =
+    v: d:
+    let
+      qh = div v.hi d;
+      x = (v.hi - qh * d) * two32 + v.lo;
+      ql = div x d;
+    in
+    {
+      q = {
+        hi = qh;
+        lo = ql;
+      };
+      r = x - ql * d;
+    };
+
+  # Decimal text of an unsigned 64-bit value.
+  dec64 =
+    v:
+    if v.hi < sign32 then
+      toString (toS64 v)
+    else
+      let
+        d = divSmall v 10;
+      in
+      dec64 d.q + toString d.r;
+
+  hexU32 =
+    digits: n:
+    if n < 16 then
+      substring n 1 digits
+    else
+      hexU32 digits (div n 16) + substring (bitAnd n 15) 1 digits;
+
+  repeatStr = n: s: concatStringsSep "" (genList (_: s) (max 0 n));
+
+  padZeros = n: s: repeatStr (n - stringLength s) "0" + s;
+
+  hex64 =
+    digits: v:
+    if v.hi == 0 then hexU32 digits v.lo else hexU32 digits v.hi + padZeros 8 (hexU32 digits v.lo);
+
+  lowerDigits = "0123456789abcdef";
+  upperDigits = "0123456789ABCDEF";
+
+  # --- Formatted output ---
+
+  # Next variadic argument from the va_list ap: 4 bytes, or 8 bytes aligned to 8 when
+  # `wide` (long long). Returns { v = { lo; hi; }; ap; }.
+  nextArg =
+    mem: ap: wide:
+    if wide then
+      let
+        a = bitAnd (ap + 7) (mask32 - 7);
+      in
+      {
+        v = {
+          lo = M.loadWord mem a;
+          hi = M.loadWord mem (a + 4);
+        };
+        ap = a + 8;
+      }
+    else
+      {
+        v = {
+          lo = M.loadWord mem ap;
+          hi = 0;
+        };
+        ap = ap + 4;
+      };
+
+  # Parse a conversion specification; i is the index just after '%'. Flags '-' and
+  # '0', a decimal width, a precision and the 'l' / 'll' modifiers are recognized.
+  # Anything else ends up in `conv` and is rejected by `convert`.
+  parseSpec =
+    fb: i:
+    let
+      n = length fb;
+      at = j: if j < n then elemAt fb j else 0;
+      flagsEnd = j: if at j == 45 || at j == 48 then flagsEnd (j + 1) else j;
+      fEnd = flagsEnd i;
+      hasFlag = c: foldl' (acc: k: acc || at (i + k) == c) false (range (fEnd - i));
+      w = parseDigits 10 fb fEnd;
+      hasPrec = at w.next == 46;
+      p = parseDigits 10 fb (w.next + 1);
+      afterPrec = if hasPrec then p.next else w.next;
+      lenCount =
+        if at afterPrec != 108 then
+          0
+        else if at (afterPrec + 1) == 108 then
+          2
+        else
+          1;
+      convAt = afterPrec + lenCount;
+    in
+    {
+      minus = hasFlag 45;
+      zero = hasFlag 48;
+      width = w.value;
+      prec = if hasPrec then p.value else null;
+      wide = lenCount == 2;
+      conv = at convAt;
+      next = convAt + 1;
+    };
+
+  # Pad an integer's text (prefix is the sign or "0x") to the spec's width/precision.
+  fmtInt =
+    s: prefix: digits:
+    let
+      body =
+        if s.prec == null then
+          digits
+        else if s.prec == 0 && digits == "0" then
+          ""
+        else
+          padZeros s.prec digits;
+      k = s.width - stringLength prefix - stringLength body;
+    in
+    A.bytesOf (
+      if k <= 0 then
+        prefix + body
+      else if s.minus then
+        prefix + body + repeatStr k " "
+      else if s.zero && s.prec == null then
+        prefix + repeatStr k "0" + body
+      else
+        repeatStr k " " + prefix + body
+    );
+
+  padBytes =
+    s: bs:
+    let
+      k = s.width - length bs;
+      spaces = genList (_: 32) (max 0 k);
+    in
+    if k <= 0 then
+      bs
+    else if s.minus then
+      bs ++ spaces
+    else
+      spaces ++ bs;
+
+  take = n: bs: genList (elemAt bs) (min n (length bs));
+
+  # Bytes of one conversion and the advanced va_list: { bytes; ap; }.
+  convert =
+    mem: s: ap:
+    let
+      c = s.conv;
+      arg = nextArg mem ap s.wide;
+      v = arg.v;
+      signedV = if s.wide then v else v // { hi = if v.lo >= sign32 then mask32 else 0; };
+      neg = signedV.hi >= sign32;
+      out = bytes: {
+        inherit bytes;
+        inherit (arg) ap;
+      };
+    in
+    if c == 100 || c == 105 then
+      out (fmtInt s (if neg then "-" else "") (dec64 (if neg then neg64 signedV else signedV)))
+    else if c == 117 then
+      out (fmtInt s "" (dec64 v))
+    else if c == 120 then
+      out (fmtInt s "" (hex64 lowerDigits v))
+    else if c == 88 then
+      out (fmtInt s "" (hex64 upperDigits v))
+    else if c == 112 then
+      out (fmtInt s "0x" (hex64 lowerDigits v))
+    else if c == 99 then
+      out (padBytes s [ (bitAnd v.lo 255) ])
+    else if c == 115 then
+      out (
+        padBytes s (
+          if v.lo == 0 then
+            take (if s.prec == null then 6 else s.prec) (A.bytesOf "(null)")
+          else if s.prec == null then
+            cBytes mem v.lo
+          else
+            cBytesMax mem v.lo s.prec
+        )
+      )
+    else if c == 37 then
+      {
+        bytes = [ 37 ];
+        inherit ap;
+      }
+    else if c == 0 then
+      throw "libc: incomplete format directive"
+    else
+      throw "libc: unsupported format directive %${A.chr c}";
+
+  # Bytes printed by the format string at fmt with the va_list ap0.
+  formatBytes =
+    mem: fmt: ap0:
+    let
+      fb = cBytes mem fmt;
+      n = length fb;
+      nextPct = i: if i >= n || elemAt fb i == 37 then i else nextPct (i + 1);
+      go =
+        i: ap:
+        if i >= n then
+          [ ]
+        else if elemAt fb i != 37 then
+          let
+            j = nextPct i;
+          in
+          [ (genList (k: elemAt fb (i + k)) (j - i)) ] ++ go j ap
+        else
+          let
+            s = parseSpec fb (i + 1);
+            r = convert mem s ap;
+          in
+          [ r.bytes ] ++ go s.next r.ap;
+    in
+    concatLists (go 0 ap0);
+
+  # --- Formatted input ---
+
+  # vsscanf over the string at s; %d, %x and %s with no width or flags.
+  scan =
+    mem: s: fmt: ap0:
+    let
+      sb = cBytes mem s;
+      ns = length sb;
+      fb = cBytes mem fmt;
+      nf = length fb;
+      done = m: cnt: {
+        mem = m;
+        ret = cnt;
+      };
+      # End of input before the first conversion returns EOF.
+      inputFail = m: cnt: done m (if cnt == 0 then neg1 else cnt);
+
+      scanHex =
+        j:
+        let
+          prefixed = j + 1 < ns && elemAt sb j == 48 && (elemAt sb (j + 1) == 120 || elemAt sb (j + 1) == 88);
+          withPrefix = parseDigits 16 sb (j + 2);
+          r = if prefixed && withPrefix.count > 0 then withPrefix else parseDigits 16 sb j;
+        in
+        if r.count == 0 then null else r;
+
+      scanWord =
+        j:
+        let
+          end = k: if k < ns && !(isSpaceB (elemAt sb k)) then end (k + 1) else k;
+        in
+        {
+          next = end j;
+        };
+
+      go =
+        i: j: ap: m: cnt:
+        if i >= nf then
+          done m cnt
+        else
+          let
+            c = elemAt fb i;
+            conv = if i + 1 < nf then elemAt fb (i + 1) else 0;
+          in
+          if isSpaceB c then
+            go (i + 1) (skipSpaces sb j) ap m cnt
+          else if c != 37 || conv == 37 then
+            let
+              j' = if c == 37 then skipSpaces sb j else j;
+            in
+            if j' >= ns then
+              inputFail m cnt
+            else if elemAt sb j' == c then
+              go (i + (if c == 37 then 2 else 1)) (j' + 1) ap m cnt
+            else
+              done m cnt
+          else if conv != 100 && conv != 120 && conv != 115 then
+            throw (
+              if conv == 0 then
+                "libc: incomplete scanf directive"
+              else
+                "libc: unsupported scanf directive %${A.chr conv}"
+            )
+          else
+            let
+              j1 = skipSpaces sb j;
+              ptr = M.loadWord m ap;
+              r =
+                if conv == 100 then
+                  parseSigned sb j1
+                else if conv == 120 then
+                  scanHex j1
+                else
+                  scanWord j1;
+              m' =
+                if conv == 115 then
+                  storeBytes m ptr (genList (k: elemAt sb (j1 + k)) (r.next - j1) ++ [ 0 ])
+                else
+                  M.storeWord m ptr r.value;
+            in
+            if j1 >= ns then
+              inputFail m cnt
+            else if r == null then
+              done m cnt
+            else
+              go (i + 2) r.next (ap + 4) m' (cnt + 1);
+    in
+    go 0 0 ap0 mem 0;
+
+  # --- Files and output ---
+
+  isStd = h: h == H.stdHandles.stdout || h == H.stdHandles.stderr;
+
+  fileOf = world: h: world.files.${toString h} or null;
+
+  setFile =
+    world: h: f:
+    world
+    // {
+      files = world.files // {
+        ${toString h} = f;
+      };
+    };
+
+  setErrno =
+    world: e:
+    if world.errnoAddr == 0 then world else world // { mem = M.storeWord world.mem world.errnoAddr e; };
+
+  appendOut = world: bs: world // { out = world.out + bytesToString bs; };
+
+  # Write bytes to handle h: { world; ok; }. stdout/stderr go to `out`; dummy handles
+  # discard the bytes.
+  writeTo =
+    world: h: bs:
+    let
+      f = fileOf world h;
+    in
+    if isStd h then
+      {
+        world = appendOut world bs;
+        ok = true;
+      }
+    else
+      {
+        inherit world;
+        ok = f != null && f.kind == "null";
+      };
+
+  hexDigitAt = i: substring i 1 lowerDigits;
+  byteTable = listToAttrs (
+    concatLists (
+      genList (
+        n:
+        let
+          lo = hexDigitAt (div n 16) + hexDigitAt (bitAnd n 15);
+          up = substring (div n 16) 1 upperDigits + substring (bitAnd n 15) 1 upperDigits;
+        in
+        [
+          {
+            name = lo;
+            value = n;
+          }
+          {
+            name = up;
+            value = n;
+          }
+        ]
+      ) 256
+    )
+  );
+
+  # Byte k and little-endian word at byte k of a hex chunk.
+  hexByte = chunk: k: byteTable.${substring (2 * k) 2 chunk};
+  hexWord =
+    chunk: k:
+    let
+      s = substring (2 * k) 8 chunk;
+      b = i: byteTable.${substring (2 * i) 2 s};
+    in
+    b 0 + 256 * b 1 + 65536 * b 2 + 16777216 * b 3;
+
+  # fread from the WAD: the requested range is cut out of the hex text with a single
+  # substring and decoded from that chunk.
+  wadRead =
+    world: h: f: buf: size: count:
+    let
+      total = size * count;
+      nb = min total (max 0 (world.wad.size - f.pos));
+      chunk = substring (2 * f.pos) (2 * nb) world.wad.hex;
+      w = setFile world h (f // { pos = f.pos + nb; });
+    in
+    result (w // { mem = fill world.mem buf nb (hexByte chunk) (hexWord chunk); }) (
+      if size == 0 then 0 else div nb size
+    );
+
+  hasSuffix =
+    suffix: s:
+    let
+      ls = stringLength s;
+      lx = stringLength suffix;
+    in
+    ls >= lx && substring (ls - lx) lx s == suffix;
+
+  fopenAt =
+    world: path: mode:
+    let
+      p = cString world.mem path;
+      md = cString world.mem mode;
+      h = 16 + length (attrNames world.files);
+      isRead = match "r[^+]*" md != null;
+      isWrite = match "[wa].*|r.*[+].*" md != null;
+      fail = e: result (setErrno world e) 0;
+    in
+    if isRead then
+      (
+        if hasSuffix "doom1.wad" p && world.wad != null then
+          result (setFile world h {
+            kind = "wad";
+            pos = 0;
+          }) h
+        else
+          fail errno.ENOENT
+      )
+    else if isWrite then
+      result (setFile world h { kind = "null"; }) h
+    else
+      fail errno.EINVAL;
+
+  fseekAt =
+    world: h: off: whence:
+    let
+      f = fileOf world h;
+      base =
+        if whence == 0 then
+          0
+        else if whence == 1 then
+          f.pos
+        else
+          world.wad.size;
+      pos = base + B.toSigned off;
+    in
+    if f == null then
+      result world neg1
+    else if f.kind == "null" then
+      result world 0
+    else if f.kind != "wad" then
+      result world neg1
+    else if whence > 2 || pos < 0 then
+      result (setErrno world errno.EINVAL) neg1
+    else
+      result (setFile world h (f // { inherit pos; })) 0;
+
+  # --- Heap ---
+
+  align16 = x: bitAnd (x + 15) (mask32 - 15);
+
+  # Bump allocation: a 16-byte aligned block preceded by one word holding its size.
+  # Returns NULL when the block would leave the 32-bit address space.
+  mallocAt =
+    world: n:
+    let
+      p = align16 (world.brk + 4);
+    in
+    if p + n > mask32 then
+      result world 0
+    else
+      result (
+        world
+        // {
+          mem = M.storeWord world.mem (p - 4) n;
+          brk = p + n;
+        }
+      ) p;
+
+  reallocAt =
+    world: p: n:
+    let
+      old = M.loadWord world.mem (p - 4);
+      r = mallocAt world n;
+      w = r.world;
+    in
+    if p == 0 then
+      mallocAt world n
+    else if r.ret == 0 then
+      r
+    else
+      result (w // { mem = copyMem w.mem r.ret p (min old n); }) r.ret;
+
+  unsupported =
+    name: _: _:
+    throw "libc: ${name} is not supported";
+
+  unsupportedNames = [
+    "atof"
+    "system"
+    "fabs"
+    "__addsf3"
+    "__mulsf3"
+    "__divsf3"
+    "__fixsfsi"
+    "__floatsisf"
+    "__extendsfdf2"
+    "__truncdfsf2"
+    "__ltdf2"
+  ];
+
+  # The variadic entries are never called through ecall; their stubs call the
+  # v-prefixed entries.
+  variadic =
+    name: _: _:
+    throw "libc: ${name} is variadic; the guest calls v${name}";
+
+  arg = elemAt;
+
+  functions = {
+    # string.h / strings.h
+    memset =
+      world: a: result (world // { mem = setMem world.mem (arg a 0) (arg a 1) (arg a 2); }) (arg a 0);
+    memcpy =
+      world: a: result (world // { mem = copyMem world.mem (arg a 0) (arg a 1) (arg a 2); }) (arg a 0);
+    memmove =
+      world: a: result (world // { mem = copyMem world.mem (arg a 0) (arg a 1) (arg a 2); }) (arg a 0);
+    strlen = world: a: result world (strlenAt world.mem (arg a 0));
+    strcmp = world: a: result world (cmpStr (c: c) world.mem (arg a 0) (arg a 1) unlimited);
+    strncmp = world: a: result world (cmpStr (c: c) world.mem (arg a 0) (arg a 1) (arg a 2));
+    strcasecmp = world: a: result world (cmpStr toLowerB world.mem (arg a 0) (arg a 1) unlimited);
+    strncasecmp = world: a: result world (cmpStr toLowerB world.mem (arg a 0) (arg a 1) (arg a 2));
+    strcpy =
+      world: a:
+      let
+        n = strlenAt world.mem (arg a 1) + 1;
+      in
+      result (world // { mem = copyMem world.mem (arg a 0) (arg a 1) n; }) (arg a 0);
+    strncpy =
+      world: a:
+      let
+        dst = arg a 0;
+        n = arg a 2;
+        k = min n (strlenAt world.mem (arg a 1));
+        copied = copyMem world.mem dst (arg a 1) k;
+      in
+      result (world // { mem = setMem copied (dst + k) 0 (n - k); }) dst;
+    strdup =
+      world: a:
+      let
+        n = strlenAt world.mem (arg a 0) + 1;
+        r = mallocAt world n;
+      in
+      if r.ret == 0 then
+        r
+      else
+        result (r.world // { mem = copyMem r.world.mem r.ret (arg a 0) n; }) r.ret;
+    strchr = world: a: result world (strchrAt world.mem (arg a 0) (bitAnd (arg a 1) 255));
+    strrchr = world: a: result world (strrchrAt world.mem (arg a 0) (bitAnd (arg a 1) 255));
+    strstr = world: a: result world (strstrAt world.mem (arg a 0) (arg a 1));
+
+    # ctype.h; arguments outside 0..255 (EOF) are returned unchanged or classified false.
+    toupper = world: a: result world (toUpperB (arg a 0));
+    tolower = world: a: result world (toLowerB (arg a 0));
+    isspace = world: a: result world (boolRet (isSpaceB (arg a 0)));
+    isprint =
+      world: a:
+      result world (
+        boolRet (
+          let
+            c = arg a 0;
+          in
+          c >= 32 && c <= 126
+        )
+      );
+
+    # stdlib.h
+    atoi = world: a: result world (atoiAt world.mem (arg a 0));
+    abs =
+      world: a:
+      let
+        x = B.toSigned (arg a 0);
+      in
+      result world (B.u32 (if x < 0 then 0 - x else x));
+    malloc = world: a: mallocAt world (arg a 0);
+    # The heap only grows and is never reused, and nothing else writes above brk, so
+    # a fresh block is still unwritten and reads as 0: no zero fill is needed.
+    calloc =
+      world: a:
+      let
+        count = arg a 0;
+        size = arg a 1;
+      in
+      if size != 0 && count > div mask32 size then result world 0 else mallocAt world (count * size);
+    realloc = world: a: reallocAt world (arg a 0) (arg a 1);
+    free = world: _: result world 0;
+    exit = _: _: throw "libc: exit is not supported (the dispatcher handles exit)";
+    getenv = world: _: result world 0;
+
+    # stdio.h
+    vprintf =
+      world: a:
+      let
+        bs = formatBytes world.mem (arg a 0) (arg a 1);
+      in
+      result (appendOut world bs) (length bs);
+    vfprintf =
+      world: a:
+      let
+        bs = formatBytes world.mem (arg a 1) (arg a 2);
+        r = writeTo world (arg a 0) bs;
+      in
+      result r.world (if r.ok then length bs else neg1);
+    # Writes at most n - 1 bytes plus a NUL and returns the untruncated length.
+    vsnprintf =
+      world: a:
+      let
+        buf = arg a 0;
+        n = arg a 1;
+        bs = formatBytes world.mem (arg a 2) (arg a 3);
+      in
+      result (
+        if n == 0 then world else world // { mem = storeBytes world.mem buf (take (n - 1) bs ++ [ 0 ]); }
+      ) (length bs);
+    vsscanf =
+      world: a:
+      let
+        r = scan world.mem (arg a 0) (arg a 1) (arg a 2);
+      in
+      result (world // { inherit (r) mem; }) r.ret;
+    puts = world: a: result (appendOut world (cBytes world.mem (arg a 0) ++ [ 10 ])) 0;
+    putchar =
+      world: a:
+      let
+        c = bitAnd (arg a 0) 255;
+      in
+      result (appendOut world [ c ]) c;
+    fopen = world: a: fopenAt world (arg a 0) (arg a 1);
+    fclose =
+      world: a:
+      let
+        h = arg a 0;
+        f = fileOf world h;
+      in
+      if f != null && f.kind != "closed" then
+        result (setFile world h { kind = "closed"; }) 0
+      else if h >= 1 && h <= 3 then
+        result world 0
+      else
+        result world neg1;
+    fread =
+      world: a:
+      let
+        h = arg a 3;
+        f = fileOf world h;
+      in
+      if f != null && f.kind == "wad" then
+        wadRead world h f (arg a 0) (arg a 1) (arg a 2)
+      else
+        result world 0;
+    fwrite =
+      world: a:
+      let
+        count = arg a 2;
+        r = writeTo world (arg a 3) (readBytes world.mem (arg a 0) (arg a 1 * count));
+      in
+      result r.world (if r.ok then count else 0);
+    fseek = world: a: fseekAt world (arg a 0) (arg a 1) (arg a 2);
+    ftell =
+      world: a:
+      let
+        f = fileOf world (arg a 0);
+      in
+      result world (
+        if f == null then
+          neg1
+        else if f.kind == "wad" then
+          f.pos
+        else if f.kind == "null" then
+          0
+        else
+          neg1
+      );
+    fflush = world: _: result world 0;
+    remove = world: _: result world neg1;
+    rename = world: _: result world neg1;
+
+    # sys/stat.h / unistd.h
+    mkdir = world: _: result world neg1;
+    isatty = world: _: result world 0;
+    usleep = world: _: result world 0;
+
+    # Compiler runtime: 64-bit integer division
+    __divdi3 = world: a: result world (fromS64 (sdiv64 (arg a 0) (arg a 1)));
+    __moddi3 =
+      world: a:
+      let
+        x = toS64 (arg a 0);
+      in
+      result world (fromS64 (x - sdiv64 (arg a 0) (arg a 1) * toS64 (arg a 1)));
+    __udivdi3 = world: a: result world (udivmod64 (arg a 0) (arg a 1)).q;
+    __umoddi3 = world: a: result world (udivmod64 (arg a 0) (arg a 1)).r;
+
+    printf = variadic "printf";
+    fprintf = variadic "fprintf";
+    snprintf = variadic "snprintf";
+    sscanf = variadic "sscanf";
+  }
+  // listToAttrs (
+    map (name: {
+      inherit name;
+      value = unsupported name;
+    }) unsupportedNames
+  );
+in
+functions
+// {
+  # Initial world: an empty heap at heapBase, no open files and no output.
+  mkWorld =
+    {
+      mem,
+      heapBase,
+      errnoAddr ? 0,
+      wad ? null,
+    }:
+    {
+      inherit mem errnoAddr wad;
+      brk = heapBase;
+      files = { };
+      out = "";
+    };
+}
