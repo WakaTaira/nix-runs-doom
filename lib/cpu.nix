@@ -54,12 +54,12 @@ let
 
   # --- Operation tables (selected once per decoded instruction) ---
 
-  # ALU operation shared by OP and OP-IMM. isSubSra corresponds to funct7[5].
+  # ALU operation of OP / OP-IMM for funct3 = 1..7: SLL, SLT, SLTU, XOR, SRL / SRA, OR, AND.
+  # funct3 = 0 (ADD / SUB / ADDI) is decoded inline by decOp / decOpImm. isSra
+  # (funct7 = 32) selects SRA over SRL and is ignored for every other funct3.
   aluFn =
-    funct3: isSubSra:
-    if funct3 == 0 then
-      (if isSubSra then B.sub else B.add)
-    else if funct3 == 1 then
+    funct3: isSra:
+    if funct3 == 1 then
       (a: b: B.shl a (bitAnd b 31))
     else if funct3 == 2 then
       (a: b: if B.lt a b then 1 else 0)
@@ -68,7 +68,7 @@ let
     else if funct3 == 4 then
       bitXor
     else if funct3 == 5 then
-      (if isSubSra then (a: b: B.sra a (bitAnd b 31)) else (a: b: B.srl a (bitAnd b 31)))
+      (if isSra then (a: b: B.sra a (bitAnd b 31)) else (a: b: B.srl a (bitAnd b 31)))
     else if funct3 == 6 then
       bitOr
     else
@@ -824,11 +824,18 @@ let
       op = fetchOp;
     };
 
-  # Execute one instruction (even on a halted state) and return the next, fully forced state.
+  # Execute the instruction at s.pc (even on a halted state) and return the next state.
+  # halted and exitCode are reset first, so the result is halted only if this instruction
+  # halts. The result is forced as by `strict` (pc and regs completely, mem and code to
+  # weak head normal form) and count is forced as well; op is left unevaluated.
   step =
     s:
     let
-      e = strict (fetch s s);
+      r = s // {
+        halted = false;
+        exitCode = null;
+      };
+      e = strict (fetch r r);
       count = s.count + 1;
     in
     seq count (e // { inherit count; });
@@ -870,7 +877,18 @@ let
 
   # Entry to the loop: the op is re-derived from pc, so states built or edited
   # outside this file (e.g. `s // { pc = ...; }`) are always executed correctly.
-  enter = s: s // { op = if s.halted then idleOp else fetchOp; };
+  # A state halted by hand has no `idle`; it is supplied here (the value does not
+  # affect count, since a batch that starts halted counts nothing).
+  enter =
+    s:
+    if s.halted then
+      s
+      // {
+        op = idleOp;
+        idle = s.idle or 0;
+      }
+    else
+      s // { op = fetchOp; };
 
   # Run `chunk` instructions at a time until halted or maxSteps is reached.
   # Recursion depth is proportional to maxSteps / chunk, so keep chunk large.

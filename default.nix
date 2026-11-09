@@ -9,6 +9,18 @@ let
   D = import ./lib/dsl.nix;
   M = import ./lib/mem.nix;
 
+  # The byte range [base, base + size) widened to start at a word boundary, as a code
+  # region (mkCode requires a word-aligned base).
+  alignedRegion =
+    base: size:
+    let
+      pad = builtins.bitAnd base 3;
+    in
+    {
+      base = base - pad;
+      size = size + pad;
+    };
+
   # Run an assembled eDSL program and return the halted state.
   # The whole program image (code and data) is declared as the code region.
   runProgram =
@@ -20,9 +32,7 @@ let
       C.mkState {
         mem = D.toMemory M.empty program;
         pc = program.entry;
-        code = {
-          inherit (program) base size;
-        };
+        code = alignedRegion program.base program.size;
       }
     );
 
@@ -34,15 +44,8 @@ let
       inText = ph: img.entry >= ph.vaddr && img.entry < ph.vaddr + ph.filesz;
       texts = builtins.filter inText img.segments;
       ph = builtins.head texts;
-      pad = builtins.bitAnd ph.vaddr 3;
     in
-    if texts == [ ] then
-      null
-    else
-      {
-        base = ph.vaddr - pad;
-        size = ph.filesz + pad;
-      };
+    if texts == [ ] then null else alignedRegion ph.vaddr ph.filesz;
 
   # Load a hex-encoded ELF, run it, and return the halted state.
   runElfHex =

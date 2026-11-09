@@ -52,12 +52,13 @@ Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizz
 
 - `lib/bits.nix` — 32-bit arithmetic. Values are always unsigned (0..2^32-1). Shifts use a power-of-two table with multiply/divide.
 - `lib/mem.nix` — persistent 64-ary trie over word addresses (5 levels x 6 bits). Sparse; unwritten words read as 0. An update copies the 5 nodes on the path.
-- `lib/cpu.nix` — RV32IM. Instructions in the read-only code region (`mkState { code = { base; size; }; }`) are decoded once into a lazy list of threaded ops (`state -> state`) and fetched with `elemAt`; outside it, or after a store touches it, fetch falls back to the memory trie and re-decodes changed words. `run` folds in chunks and forces state every 64 steps. ECALL supports only a7=64 write and a7=93 exit.
+- `lib/cpu.nix` — RV32IM. The words of the decode-cache region (`mkState { code = { base; size; }; }`; `runProgram` declares the whole image, code and data) are decoded once into a lazy list of threaded ops (`state -> state`). Inside the region, straight-line code and direct branches/jumps go to the linked successor op without a fetch; once a store touches the region, fetch goes through the checked path, which re-reads memory and re-decodes changed words. Outside the region every instruction is decoded from the memory trie. `run` folds in chunks and forces state every 64 steps. ECALL supports only a7=64 write and a7=93 exit.
 - `lib/dsl.nix` — the guest eDSL: instructions, pseudo-instructions (`li`, `la`, `call`, ...), labels, data (`string`, `space`, `align`), and structured control flow (`when`, `ifElse`, `while`). Two-pass assembler `assemble` and loader `toMemory`.
 - `lib/asm.nix` — raw instruction encoders used by the eDSL (encodings verified against llvm-mc).
 - `lib/ascii.nix` — chr/ord tables.
 - `lib/elf.nix` — parses a hex-encoded ELF32 and places its PT_LOAD segments (for external guests such as Doom).
-- `tests/unit.nix`, `tests/mext.nix`, `tests/dsl.nix` — RV32I, M-extension and eDSL tests.
+- `tests/unit.nix`, `tests/mext.nix`, `tests/dsl.nix` — RV32I, M-extension and eDSL tests; every CPU test runs both with and without a code region and the two must agree (`tests/paths.nix`).
+- `tests/fastpath.nix` — regression and self-modifying-code tests for the code-region path.
 - `examples/fizzbuzz/` — FizzBuzz in the eDSL.
 - `examples/fizzbuzz-c/`, `toolchain/guest.nix` — transitional clang-built C version and its hex fixture.
 - `bench/` — `workload.nix`, `report.nix` (Doom performance budget), `default.nix` (`bench.run` / `bench.report`).
