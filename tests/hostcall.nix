@@ -1,8 +1,11 @@
 # Tests for the host-call libc (lib/libc.nix), called directly as pure functions on a
-# `world` without the CPU.
+# `world` without the CPU, and for the register ABI of the host-call dispatch
+# (lib/hostcall.nix) on both execution paths of lib/cpu.nix.
 let
   A = import ../lib/ascii.nix;
   B = import ../lib/bits.nix;
+  C = import ../lib/cpu.nix;
+  D = import ../lib/dsl.nix;
   H = import ../lib/hostcall.nix;
   L = import ../lib/libc.nix;
   M = import ../lib/mem.nix;
@@ -269,8 +272,98 @@ let
 
   # Every table entry other than DG_* needs a body.
   missing = filter (n: match "DG_.*" n == null && !(hasAttr n L)) (map (e: e.name) H.table);
+
+  # --- Host-call ABI through the CPU ---
+
+  # Run an eDSL program (EBREAK appended) with the libc host calls, without and with
+  # a code region covering the image, as tests/paths.nix does (its runner has no way
+  # to pass a host). The result is the code-region run, or a mismatch marker when the
+  # two paths disagree on the observed fields.
+  runHost =
+    program:
+    let
+      prog = D.assemble { } [
+        program
+        D.ebreak
+      ];
+      host = {
+        call = H.dispatch L;
+        world = removeAttrs (world M.empty) [
+          "mem"
+          "out"
+        ];
+      };
+      runWith =
+        code:
+        C.run { maxSteps = 1000; } (
+          C.mkState {
+            mem = D.toMemory M.empty prog;
+            pc = prog.entry;
+            inherit code host;
+          }
+        );
+      observe = s: {
+        inherit (s)
+          pc
+          regs
+          out
+          halted
+          exitCode
+          count
+          ;
+      };
+      slow = runWith null;
+      fast = runWith { inherit (prog) base size; };
+    in
+    if observe slow == observe fast then
+      fast
+    else
+      { regs = "the paths with and without a code region disagree"; };
+
+  hostStrlen =
+    with D;
+    runHost [
+      (la a0 "msg")
+      (li a7 H.byName.strlen.num)
+      ecall
+      ebreak
+      (label "msg")
+      (string "hello, host")
+      (bytes [ 0 ])
+    ];
+
+  # An i64 argument takes two registers and an i64 result returns in a0 / a1.
+  hostUdiv =
+    let
+      n = s64 10000000007;
+    in
+    with D;
+    runHost [
+      (li a0 n.lo)
+      (li a1 n.hi)
+      (li a2 3)
+      (li a3 0)
+      (li a7 H.byName.__udivdi3.num)
+      ecall
+    ];
 in
 [
+  {
+    name = "hostcall: strlen through ecall returns in a0 (both paths)";
+    got = C.getReg hostStrlen 10;
+    expected = 11;
+  }
+  {
+    name = "hostcall: i64 arguments and result in register pairs (both paths)";
+    got = [
+      (C.getReg hostUdiv 10)
+      (C.getReg hostUdiv 11)
+    ];
+    expected = [
+      3333333335
+      0
+    ];
+  }
   {
     name = "libc: every table entry has a body";
     got = missing;

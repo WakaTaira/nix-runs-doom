@@ -388,6 +388,116 @@ let
   };
 
   byName = indexBy (e: e.name) checked;
+  byNum = indexBy (e: toString e.num) checked;
+
+  # --- Emulator-side dispatch ---
+
+  # Argument registers a0..a5 by index.
+  argRegs = genList (i: toString (10 + i)) 6;
+
+  # Arguments of entry e read from the registers: one u32 per "int" / "ptr", one
+  # { lo; hi; } from two consecutive registers per "i64".
+  readArgs =
+    regs: e:
+    let
+      go =
+        i: ts:
+        if ts == [ ] then
+          [ ]
+        else
+          let
+            t = builtins.head ts;
+            reg = k: regs.${elemAt argRegs k};
+          in
+          if t == "i64" then
+            [
+              {
+                lo = reg i;
+                hi = reg (i + 1);
+              }
+            ]
+            ++ go (i + 2) (builtins.tail ts)
+          else
+            [ (reg i) ] ++ go (i + 1) (builtins.tail ts);
+    in
+    go 0 e.args;
+
+  # Registers after returning `ret` of type t: a0, or a0 (low) and a1 (high) for "i64";
+  # unchanged for "void".
+  writeRet =
+    regs: t: ret:
+    if t == "void" then
+      regs
+    else if t == "i64" then
+      regs
+      // {
+        "10" = ret.lo;
+        "11" = ret.hi;
+      }
+    else
+      regs // { "10" = ret; };
+
+  # The ecall handler for `mkState { host = { call = dispatch impls; world; }; }` of
+  # lib/cpu.nix. `impls.<name>` has the lib/libc.nix interface
+  # (world: args: { world; ret; }).
+  #
+  # The world passed to an implementation is `state.host.world` (everything that is not
+  # machine state: brk, files, errnoAddr and wad of lib/libc.nix, plus any fields of
+  # other implementations such as the platform layer) together with the machine's
+  # `mem` and `out` and the instruction count `count`. The count is the one at the
+  # start of the current 64-step batch of lib/cpu.nix, so it lags by fewer than 64
+  # instructions. Afterwards mem and out go back into the state and the remaining
+  # fields into `state.host.world`. Every world field is forced to weak head normal
+  # form and the small libc fields completely, so that no thunk keeps old worlds alive.
+  #
+  # The exit entry halts the machine like the a7 = 93 exit call.
+  dispatch =
+    impls: s:
+    let
+      a7 = s.regs."17";
+      e =
+        byNum.${toString a7}
+        or (throw "lib/hostcall.nix: unknown host call a7=${toString a7} at pc=${toString s.pc}");
+      args = readArgs s.regs e;
+      impl = impls.${e.name} or (throw "lib/hostcall.nix: no implementation of host call ${e.name}");
+      world0 = s.host.world // {
+        inherit (s) mem out count;
+      };
+      r = impl world0 args;
+      w = r.world;
+      rest = removeAttrs w [
+        "mem"
+        "out"
+        "count"
+      ];
+      forced = foldl' (acc: k: builtins.seq rest.${k} acc) true (attrNames rest);
+      small = builtins.deepSeq [
+        (w.brk or null)
+        (w.files or null)
+        (w.errnoAddr or null)
+      ] true;
+    in
+    if e.name == "exit" then
+      s
+      // {
+        halted = true;
+        exitCode = elemAt args 0;
+      }
+    else
+      builtins.seq forced (
+        builtins.seq small (
+          builtins.seq w.out (
+            s
+            // {
+              inherit (w) mem out;
+              regs = writeRet s.regs e.ret r.ret;
+              host = s.host // {
+                world = rest;
+              };
+            }
+          )
+        )
+      );
 
   # Text of one generated header, after checking its prototypes against the table.
   headerText =
@@ -420,8 +530,12 @@ in
   # The validated table, the FILE * handle values, and the entries by name and by
   # number for the emulator-side dispatch.
   table = checked;
-  inherit stdHandles byName;
-  byNum = indexBy (e: toString e.num) checked;
+  inherit
+    stdHandles
+    byName
+    byNum
+    dispatch
+    ;
 
   # { "<path>.h" = text; } for every generated header.
   headerFiles = listToAttrs (

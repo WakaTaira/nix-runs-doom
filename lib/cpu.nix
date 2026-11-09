@@ -532,8 +532,38 @@ let
           exitCode = r."10";
         }
       )
+    else if a7 >= 1000 && s ? host then
+      hostCall nxt nop s
     else
       throw "unsupported syscall a7=${toString a7} at pc=${toString s.pc}";
+
+  # Host call (a7 >= 1000): `s.host.call` receives the state already advanced past the
+  # ecall and returns the next state. A result marked halted (the exit host call) is
+  # halted like a7=93: pc stays at the ecall and the idle op is installed. Host calls
+  # write memory directly, bypassing the code-region store tracking, so they must not
+  # write into a declared code region.
+  hostCall =
+    nxt: nop: s:
+    let
+      r = s.host.call (
+        s
+        // {
+          pc = nxt;
+          op = nop;
+        }
+      );
+    in
+    if r.halted then
+      strict (
+        r
+        // {
+          pc = s.pc;
+          op = idleOp;
+          idle = 0;
+        }
+      )
+    else
+      strict r;
 
   opEbreak =
     s:
@@ -827,14 +857,20 @@ let
   # Build an initial state. `code = { base; size; }` (byte address and length)
   # declares the code region; its words are taken from this `mem`, so a state whose
   # `mem` is replaced afterwards (rather than written by stores) needs a new mkState.
+  # `host = { call; ... }` enables host calls (ecall with a7 >= 1000, see hostCall);
+  # the attributes besides `call` are the handler's own data, carried in `state.host`.
+  # Without a host the state has no `host` attribute, which keeps the state as small
+  # as before for programs that make no host calls.
   mkState =
     {
       mem ? M.empty,
       pc ? 0,
       sp ? 0,
       code ? null,
+      host ? null,
     }:
-    {
+    (if host == null then { } else { inherit host; })
+    // {
       inherit mem pc;
       regs = listToAttrs (
         genList (i: {
@@ -938,6 +974,62 @@ let
 
   # Run exactly n instructions (fewer if the machine halts; for benchmarking).
   runExactly = n: s: runSteps (enter s) n;
+
+  # Like `run`, but also stops at the first forcing point (every `groupLen` steps)
+  # where `stop state` holds. With `profile = true`, the pc at each forcing point is
+  # sampled into `state.profile` = { "<pc>" = samples; }; the samples of a chunk are
+  # merged into the counter once per chunk. `run` itself is left untouched.
+  runUntil =
+    {
+      maxSteps ? 100000000,
+      chunk ? 8192,
+      stop ? (_: false),
+      profile ? false,
+    }:
+    let
+      groups = nulls (if chunk < groupLen then 1 else div chunk groupLen);
+      done = s: s.halted || stop s || s.count >= maxSteps;
+
+      # One group of up to groupLen steps (fewer at the end of the step budget).
+      runGroup =
+        s:
+        let
+          remaining = maxSteps - s.count;
+        in
+        if remaining < groupLen then batch remaining (nulls remaining) s else batch groupLen groupTicks s;
+
+      plainChunk = foldl' (s: _: if done s then s else runGroup s);
+
+      # A chunk that also collects the pc of every group it runs, then merges the
+      # samples into the counter.
+      profiledChunk =
+        s0: _:
+        let
+          r =
+            foldl'
+              (
+                acc: _:
+                if done acc.s then
+                  acc
+                else
+                  {
+                    s = runGroup acc.s;
+                    pcs = acc.pcs ++ [ acc.s.pc ];
+                  }
+              )
+              {
+                s = s0;
+                pcs = [ ];
+              }
+              groups;
+          counts = builtins.mapAttrs (_: builtins.length) (builtins.groupBy toString r.pcs);
+          merged = s0.profile // builtins.mapAttrs (k: n: (s0.profile.${k} or 0) + n) counts;
+        in
+        deepSeq merged (r.s // { profile = merged; });
+
+      go = s: if done s then s else go (if profile then profiledChunk s null else plainChunk s groups);
+    in
+    s: go (if profile then enter s // { profile = s.profile or { }; } else enter s);
 in
 {
   inherit
@@ -945,6 +1037,7 @@ in
     step
     run
     runExactly
+    runUntil
     getReg
     ;
 }
