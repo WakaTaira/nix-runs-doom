@@ -5,6 +5,7 @@
 let
   B = import ./bits.nix;
   M = import ./mem.nix;
+  Ascii = import ./ascii.nix;
   inherit (builtins)
     substring
     stringLength
@@ -15,6 +16,9 @@ let
     div
     bitAnd
     filter
+    sort
+    map
+    length
     ;
 
   hexDigit = i: substring i 1 "0123456789abcdef";
@@ -101,6 +105,118 @@ let
     in
     foldl' (m: w: M.storeWord m (base + w * 4) (wordAt w)) mem (genList (i: i) nwords);
 
+  # Section headers (empty when the file has none, e.g. a stripped or section-less ELF).
+  sectionHeaders =
+    img:
+    let
+      shoff = img.u32 32;
+      shentsize = img.u16 46;
+      shnum = img.u16 48;
+    in
+    if shoff == 0 || shnum == 0 then
+      [ ]
+    else
+      genList (
+        i:
+        let
+          base = shoff + i * shentsize;
+        in
+        {
+          type = img.u32 (base + 4);
+          offset = img.u32 (base + 16);
+          size = img.u32 (base + 20);
+          link = img.u32 (base + 24);
+        }
+      ) shnum;
+
+  # NUL-terminated string at `off`; bytes are read one at a time to avoid scanning the hex text.
+  cstringAt =
+    img: off:
+    let
+      go =
+        i: acc:
+        let
+          c = img.u8 (off + i);
+        in
+        if c == 0 || off + i >= img.size then acc else go (i + 1) (acc + Ascii.chr c);
+    in
+    go 0 "";
+
+  # STT_FUNC symbols of .symtab as [ { name; addr; size; } ], ascending by addr.
+  symbols =
+    hex:
+    let
+      img = mkImage hex;
+      symtabs = filter (sh: sh.type == 2) (sectionHeaders img);
+    in
+    if symtabs == [ ] then
+      [ ]
+    else
+      let
+        symtab = builtins.head symtabs;
+        strtab = elemAt (sectionHeaders img) symtab.link;
+        raw = genList (
+          i:
+          let
+            base = symtab.offset + i * 16;
+          in
+          {
+            nameOff = img.u32 base;
+            addr = img.u32 (base + 4);
+            size = img.u32 (base + 8);
+            info = img.u8 (base + 12);
+          }
+        ) (div symtab.size 16);
+        funcs = filter (s: bitAnd s.info 15 == 2) raw;
+        sorted = sort (a: b: a.addr < b.addr) funcs;
+      in
+      map (s: {
+        name = cstringAt img (strtab.offset + s.nameOff);
+        inherit (s) addr size;
+      }) sorted;
+
+  # Executable PT_LOAD segments (p_flags has the X bit) as [ { base; size; } ], size = p_memsz.
+  execSegments =
+    hex:
+    let
+      img = mkImage hex;
+      hdr = parseHeader img;
+      isExec = i: bitAnd (img.u32 (hdr.phoff + i * hdr.phentsize + 24)) 1 == 1;
+      isLoad = i: img.u32 (hdr.phoff + i * hdr.phentsize) == 1;
+    in
+    map (
+      i:
+      let
+        base = hdr.phoff + i * hdr.phentsize;
+      in
+      {
+        base = img.u32 (base + 8);
+        size = img.u32 (base + 20);
+      }
+    ) (filter (i: isLoad i && isExec i) (genList (i: i) hdr.phnum));
+
+  # Name of the function containing pc, or null. `syms` must be ascending by addr and
+  # stored as a list (elemAt is O(1)); the lookup is a binary search for the last
+  # symbol with addr <= pc.
+  lookup =
+    syms: pc:
+    let
+      n = length syms;
+      # Invariant: syms[lo] has addr <= pc (or lo = -1), syms[hi] has addr > pc (or hi = n).
+      search =
+        lo: hi:
+        if hi - lo <= 1 then
+          lo
+        else
+          let
+            mid = div (lo + hi) 2;
+          in
+          if (elemAt syms mid).addr <= pc then search mid hi else search lo mid;
+      idx = search (-1) n;
+      s = elemAt syms idx;
+    in
+    if idx < 0 || pc >= s.addr + s.size then null else s.name;
+
   load =
     hex:
     let
@@ -116,5 +232,11 @@ let
     };
 in
 {
-  inherit load mkImage;
+  inherit
+    load
+    mkImage
+    symbols
+    execSegments
+    lookup
+    ;
 }
