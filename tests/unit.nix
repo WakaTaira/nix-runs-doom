@@ -1,4 +1,5 @@
-# Unit tests: per-instruction RV32I tests below, plus eDSL tests from tests/dsl.nix.
+# Unit tests: per-instruction RV32I tests below, plus eDSL tests from tests/dsl.nix
+# and M extension tests from tests/mext.nix.
 # Run: nix eval --json -f tests/unit.nix summary
 # Each test places a small machine-code sequence at address 0, runs it until the trailing
 # EBREAK halts, and compares registers, memory and PC against expected values.
@@ -453,7 +454,8 @@ let
       ];
     }
   ]
-  ++ import ./dsl.nix;
+  ++ import ./dsl.nix
+  ++ import ./mext.nix;
 
   failures = filter (t: t.got != t.expected) cases;
 in

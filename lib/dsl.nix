@@ -163,6 +163,15 @@ let
     or = rType A.or;
     and = rType A.and;
 
+    mul = rType A.mul;
+    mulh = rType A.mulh;
+    mulhsu = rType A.mulhsu;
+    mulhu = rType A.mulhu;
+    div = rType A.div;
+    divu = rType A.divu;
+    rem = rType A.rem;
+    remu = rType A.remu;
+
     addi = iType A.addi;
     slti = iType A.slti;
     sltiu = iType A.sltiu;

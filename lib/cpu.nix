@@ -1,4 +1,4 @@
-# RV32I CPU core: single-instruction interpreter (step) and execution loop (run).
+# RV32IM CPU core: single-instruction interpreter (step) and execution loop (run).
 # State is an attribute set { pc, regs, mem, out, halted, exitCode, count }.
 # regs is an attribute set keyed by "0".."31"; mem is the persistent tree from lib/mem.nix.
 let
@@ -100,6 +100,26 @@ let
     else
       bitAnd a b;
 
+  # M extension (OP with funct7 = 1), selected by funct3.
+  mext =
+    funct3: a: b:
+    if funct3 == 0 then
+      B.mul a b
+    else if funct3 == 1 then
+      B.mulh a b
+    else if funct3 == 2 then
+      B.mulhsu a b
+    else if funct3 == 3 then
+      B.mulhu a b
+    else if funct3 == 4 then
+      B.divs a b
+    else if funct3 == 5 then
+      B.divu a b
+    else if funct3 == 6 then
+      B.rems a b
+    else
+      B.remu a b;
+
   branchTaken =
     funct3: a: b:
     if funct3 == 0 then
@@ -191,8 +211,8 @@ let
       writeRd = v: commit s pcNext (setReg s.regs rd v) s.mem s.out false null;
     in
     if opcode == 51 then
-      # OP
-      writeRd (alu funct3 (funct7 == 32) v1 v2)
+      # OP (funct7 = 1 selects the M extension)
+      writeRd (if funct7 == 1 then mext funct3 v1 v2 else alu funct3 (funct7 == 32) v1 v2)
     else if opcode == 19 then
       # OP-IMM (shifts use funct7 to detect SRAI; everything else uses the sign-extended immediate)
       writeRd (

@@ -1,4 +1,4 @@
-# Minimal RV32I assembler (instruction encoder) for tests.
+# Minimal RV32IM assembler (instruction encoder) for tests.
 # Immediates are taken as signed integers and scattered into each format's bit layout.
 let
   B = import ./bits.nix;
@@ -92,6 +92,16 @@ in
   sra = r 32 5 51;
   or = r 0 6 51;
   and = r 0 7 51;
+
+  # M extension
+  mul = r 1 0 51;
+  mulh = r 1 1 51;
+  mulhsu = r 1 2 51;
+  mulhu = r 1 3 51;
+  div = r 1 4 51;
+  divu = r 1 5 51;
+  rem = r 1 6 51;
+  remu = r 1 7 51;
 
   fence = 15;
   ecall = 115;

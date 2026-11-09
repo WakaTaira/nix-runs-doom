@@ -1,6 +1,6 @@
 # nix-doom-tui
 
-An experiment: write an RV32I emulator in pure Nix (`nix eval` only, no derivations) and eventually run Doom on it in a terminal.
+An experiment: write an RV32IM emulator in pure Nix (`nix eval` only, no derivations) and eventually run Doom on it in a terminal.
 
 ## Goals
 
@@ -52,12 +52,12 @@ Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizz
 
 - `lib/bits.nix` — 32-bit arithmetic. Values are always unsigned (0..2^32-1). Shifts use a power-of-two table with multiply/divide.
 - `lib/mem.nix` — persistent 64-ary trie over word addresses (5 levels x 6 bits). Sparse; unwritten words read as 0. An update copies the 5 nodes on the path.
-- `lib/cpu.nix` — `step` (one instruction) and `run` (loop that runs `foldl'` in chunks). ECALL supports only a7=64 write and a7=93 exit.
+- `lib/cpu.nix` — RV32IM. `step` (one instruction) and `run` (loop that runs `foldl'` in chunks). ECALL supports only a7=64 write and a7=93 exit.
 - `lib/dsl.nix` — the guest eDSL: instructions, pseudo-instructions (`li`, `la`, `call`, ...), labels, data (`string`, `space`, `align`), and structured control flow (`when`, `ifElse`, `while`). Two-pass assembler `assemble` and loader `toMemory`.
 - `lib/asm.nix` — raw instruction encoders used by the eDSL (encodings verified against llvm-mc).
 - `lib/ascii.nix` — chr/ord tables.
 - `lib/elf.nix` — parses a hex-encoded ELF32 and places its PT_LOAD segments (for external guests such as Doom).
-- `tests/unit.nix`, `tests/dsl.nix` — instruction tests and eDSL tests.
+- `tests/unit.nix`, `tests/mext.nix`, `tests/dsl.nix` — RV32I, M-extension and eDSL tests.
 - `examples/fizzbuzz/` — FizzBuzz in the eDSL.
 - `examples/fizzbuzz-c/`, `toolchain/guest.nix` — transitional clang-built C version and its hex fixture.
 - `bench/` — `workload.nix`, `report.nix` (Doom performance budget), `default.nix` (`bench.run` / `bench.report`).
