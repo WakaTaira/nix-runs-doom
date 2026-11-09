@@ -34,6 +34,7 @@ Transitional exception: `examples/fizzbuzz-c` embeds C in a Nix string and build
 | FizzBuzz (eDSL guest) stdout | `nix eval --raw -f . fizzbuzz.stdout` |
 | FizzBuzz run stats | `nix eval --json -f . fizzbuzz.stats` |
 | Transitional C FizzBuzz | `nix eval --raw -f . fizzbuzzC.stdout` |
+| Spike report (needs measured stats, see below) | `SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report` |
 | Format | `nix fmt` |
 
 All of these also work as `.#<attr>` through the flake (flakes only see git-tracked files, so `git add -N` new files first).
@@ -44,6 +45,13 @@ Performance budget (two evaluations; the first lets Nix record its own CPU time)
 export NIX_SHOW_STATS_PATH=/tmp/nix-doom-bench.json
 NIX_SHOW_STATS=1 nix eval -f . bench.run
 nix eval --raw -f . bench.report
+```
+
+Execution-strategy spike (M0; compares clang-compiled RV32IM, the same with the `fixmul` instruction, and C translated to Nix; each variant runs 1 and 2 frames three times, and the cost of a frame is the difference of the minimum CPU times):
+
+```sh
+mkdir -p /tmp/spike && for v in rv rvx nix; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report
 ```
 
 Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizzbuzz.hex examples/fizzbuzz-c/`.
@@ -61,6 +69,8 @@ Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizz
 - `tests/fastpath.nix` — regression and self-modifying-code tests for the code-region path.
 - `examples/fizzbuzz/` — FizzBuzz in the eDSL.
 - `examples/fizzbuzz-c/`, `toolchain/guest.nix` — transitional clang-built C version and its hex fixture.
+- `bench/spike/` — the M0 execution-strategy spike: `data.nix` (shared memory image and checks), `rv.nix` / `rvx.nix` (clang output transcribed to the eDSL, without / with `fixmul`), `nix.nix` (the C translated to Nix), `default.nix` (`bench.spike.*` workloads and the report with its verdict).
+- `fixmul` (`lib/cpu.nix`, encoder in `lib/asm.nix`) — custom-0 instruction for Doom's fixed-point multiply: `(a * b) >> 16` on signed 32-bit operands via a 64-bit product.
 - `bench/` — `workload.nix`, `report.nix` (Doom performance budget), `default.nix` (`bench.run` / `bench.report`).
 
 ## Performance budget

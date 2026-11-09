@@ -15,6 +15,8 @@ in
 
   run = import ./workload.nix { inherit steps; };
 
+  spike = import ./spike;
+
   report =
     if statsPath == "" then
       throw "set NIX_SHOW_STATS_PATH to the stats file written by `NIX_SHOW_STATS=1 nix eval -f . bench.run`"
