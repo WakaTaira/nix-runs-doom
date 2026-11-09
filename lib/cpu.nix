@@ -86,6 +86,16 @@ let
     B.remu
   ];
 
+  # Doom extension FIXMUL: the signed 64-bit product shifted right by 16 with floor
+  # rounding, truncated to 32 bits. |product| <= 2^62 fits a Nix integer; clearing the
+  # low 16 bits first makes the division exact, so truncating `div` floors as required.
+  fixmul =
+    a: b:
+    let
+      p = B.toSigned a * B.toSigned b;
+    in
+    bitAnd (div (p - bitAnd p 65535) 65536) mask32;
+
   loadFn =
     funct3:
     if funct3 == 0 then
@@ -721,6 +731,20 @@ let
     link: pc: inst:
     throw "illegal instruction ${toString inst} at pc=${toString pc}";
 
+  # custom-0 (Doom extension): only FIXMUL (funct3 = 0, funct7 = 0) is defined.
+  decCustom0 =
+    link: pc: inst:
+    let
+      rd = fRd inst;
+      nxt = B.add pc 4;
+    in
+    if fFunct3 inst != 0 || fFunct7 inst != 0 then
+      decIllegal link pc inst
+    else if rd == 0 then
+      opNop nxt (link nxt)
+    else
+      opRR fixmul rd (fRs1 inst) (fRs2 inst) nxt (link nxt);
+
   decoders = genList (
     opcode:
     if opcode == 51 then
@@ -745,6 +769,8 @@ let
       decFence
     else if opcode == 115 then
       decSystem
+    else if opcode == 11 then
+      decCustom0
     else
       decIllegal
   ) 128;

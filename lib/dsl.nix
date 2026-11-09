@@ -172,6 +172,8 @@ let
     rem = rType A.rem;
     remu = rType A.remu;
 
+    fixmul = rType A.fixmul;
+
     addi = iType A.addi;
     slti = iType A.slti;
     sltiu = iType A.sltiu;

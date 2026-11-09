@@ -103,6 +103,9 @@ in
   rem = r 1 6 51;
   remu = r 1 7 51;
 
+  # Doom extension (custom-0): fixed-point 16.16 multiply, `.insn r 0x0B, 0, 0, rd, rs1, rs2`.
+  fixmul = r 0 0 11;
+
   fence = 15;
   ecall = 115;
   ebreak = 1048691;
