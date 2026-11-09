@@ -12,7 +12,7 @@ An experiment: write an RV32IM emulator in pure Nix (`nix eval` only, no derivat
 ## Language
 
 - All code comments, documentation, and commit messages are written in **English**.
-- The only exception is `CLAUDE.local.md` (the git-ignored local handoff note), which may be written in any language.
+- The only exceptions are git-ignored private files: `CLAUDE.local.md` (the local handoff note) and `docs/private/` (detailed working documents), which may be written in any language.
 
 ## What "100% Nix" means here
 

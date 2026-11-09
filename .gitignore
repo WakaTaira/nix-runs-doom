@@ -2,3 +2,6 @@ CLAUDE.local.md
 result
 result-*
 *.dis
+
+# Detailed working docs (briefs, spike notes); only README and the high-level design are public
+docs/private/
