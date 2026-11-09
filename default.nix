@@ -98,4 +98,6 @@ in
   bench = import ./bench;
 
   scaffold = import ./scaffold;
+
+  cc = import ./cc;
 }

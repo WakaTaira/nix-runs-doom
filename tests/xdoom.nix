@@ -9,6 +9,7 @@ let
   P = import ./paths.nix;
   Spike = import ../bench/spike;
   SpikeData = import ../bench/spike/data.nix;
+  Cc = import ../cc;
   inherit (builtins)
     bitAnd
     concatMap
@@ -124,6 +125,9 @@ let
     spikeCase "rv" (import ../bench/spike/rv.nix { })
     ++ spikeCase "rvx" (import ../bench/spike/rvx.nix)
     ++ spikeCase "nix" (import ../bench/spike/nix.nix)
+    ++ spikeCase "cc" {
+      run = mem: (Cc.load Cc.examples.spike.src).unit mem SpikeData.PARAMS;
+    }
     ++ [
       {
         name = "xdoom: spike verdict at exactly 2.0 is option 3";
