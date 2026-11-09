@@ -18,17 +18,12 @@ let
   inherit (builtins)
     concatStringsSep
     foldl'
-    floor
-    genList
     getEnv
     head
-    length
     map
     readFile
     fromJSON
-    stringLength
     toString
-    div
     ;
 
   variants = {
@@ -53,19 +48,7 @@ let
 
   pixels = 64000;
 
-  # --- Number formatting (fixed point, as in bench/report.nix) ---
-  repeatStr = n: s: concatStringsSep "" (genList (_: s) n);
-  fixed =
-    digits: x:
-    let
-      scale = foldl' (a: _: a * 10) 1 (genList (i: i) digits);
-      n = floor (x * scale + 0.5);
-      frac = toString (n - div n scale * scale);
-    in
-    if digits == 0 then
-      toString n
-    else
-      "${toString (div n scale)}.${repeatStr (digits - stringLength frac) "0"}${frac}";
+  inherit (import ../format.nix) fixed;
 
   # Option 3 (a C-to-Nix compiler) wins when the custom-instruction RISC-V variant
   # is at least twice as slow; otherwise option 1 (compile to RISC-V) stays.

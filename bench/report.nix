@@ -41,40 +41,18 @@
 let
   inherit (builtins)
     map
-    foldl'
     floor
     toString
     concatStringsSep
-    stringLength
-    genList
     div
     ;
 
-  # --- Number formatting ---
-  repeatStr = n: s: concatStringsSep "" (genList (_: s) n);
-  padLeft = w: s: repeatStr (w - stringLength s) " " + s;
-  padRight = w: s: s + repeatStr (w - stringLength s) " ";
-  fixed =
-    digits: x:
-    let
-      scale = foldl' (a: _: a * 10) 1 (genList (i: i) digits);
-      n = floor (x * scale + 0.5);
-      frac = toString (n - div n scale * scale);
-    in
-    if digits == 0 then
-      toString n
-    else
-      "${toString (div n scale)}.${repeatStr (digits - stringLength frac) "0"}${frac}";
-  # Integers with thousands separators.
-  grouped =
-    n:
-    let
-      s = toString n;
-      len = stringLength s;
-      head = len - (div (len - 1) 3) * 3;
-      groups = genList (i: builtins.substring (head + 3 * i) 3 s) (div (len - 1) 3);
-    in
-    concatStringsSep "," ([ (builtins.substring 0 head s) ] ++ groups);
+  inherit (import ./format.nix)
+    padLeft
+    padRight
+    fixed
+    grouped
+    ;
 
   # --- Measurement ---
   seconds = stats.cpuTime;
