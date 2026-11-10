@@ -1,10 +1,14 @@
 # C code generator: typed syntax tree (cc/check.nix) -> Nix source.
 #
-# Entry point: emit : { funcs; } -> string. The output is the source of a function
-#   { M, B, R }: { <C function name> = <Nix function>; ... }
+# Entry point: emit : { funcs; data; } -> string. The output is the source of a function
+#   { M, B, R }: { <C function name> = <Nix function>; ...; __data = <data>; }
 # with M = lib/mem.nix, B = lib/bits.nix and R = cc/runtime.nix. It imports nothing, so
-# it can be loaded from the store (cc/default.nix). The translation is mechanical, with
-# no optimization:
+# it can be loaded from the store (cc/default.nix). __data describes the file-scope
+# variables (cc/check.nix, "Data"):
+#   { base; size; symbols = { <C name> = <address>; ... }; init = mem: <mem>; }
+# init writes the initial values that are not 0 into a memory where the whole data area
+# reads as 0; callers apply it before calling the functions. The translation is
+# mechanical, with no optimization:
 #   - A C function becomes `mem: <params>:` returning the new memory, or { mem; ret; }
 #     when it returns a value.
 #   - Locals become let bindings, with a new name for each assignment. Assigning a plain
@@ -18,6 +22,8 @@
 #   - Side effects in expressions (assignments, ++ and --, calls, stores) become let
 #     bindings in C evaluation order; pure expressions stay nested.
 #   - Conditions are Nix booleans; a comparison is 0 or 1 only where its value is used.
+#   - File-scope variables live in memory at fixed addresses, written as integer literals;
+#     they are read and written like any memory through a pointer.
 #   - Unsigned and pointer arithmetic and conversions wrap modulo 2^32 as in C.
 #   - The results of +, -, *, unary - and << on int and long wrap to [-2^31, 2^31) with
 #     `wrapInt` (R.wrapInt, bound once at the top), and so does signed / and % unless the
@@ -35,7 +41,8 @@
 #
 # Generated names are `<C name>_<n>` (parameters `<C name>_0`) with n unique within a
 # function, and `<C name>_fn` for functions, so they collide neither with each other nor
-# with M, B, R, mem, wrapInt and the builtins the output uses.
+# with M, B, R, mem, wrapInt and the builtins the output uses. The attribute __data
+# cannot clash with a C function, since identifiers starting with `__` are reserved in C.
 let
   Ch = import ./check.nix;
   T = Ch.types;
@@ -227,6 +234,13 @@ let
       app "B.toSigned" [ (if T.isU32 from then c else app "B.u32" [ c ]) ]
     else if T.isU32 to then
       app "B.u32" [ c ]
+    else if T.isU16 to then
+      app "bitAnd" [
+        c
+        (num 65535)
+      ]
+    else if T.isS16 to then
+      app "R.toS16" [ c ]
     else if T.isU8 to then
       app "bitAnd" [
         c
@@ -242,6 +256,10 @@ let
         (atom mem)
         a
       ];
+      half = app "M.loadHalf" [
+        (atom mem)
+        a
+      ];
       word = app "M.loadWord" [
         (atom mem)
         a
@@ -251,18 +269,32 @@ let
       byte
     else if T.isS8 t then
       app "R.toS8" [ byte ]
+    else if T.isU16 t then
+      half
+    else if T.isS16 t then
+      app "R.toS16" [ half ]
     else if T.isU32 t then
       word
     else
       app "B.toSigned" [ word ];
 
-  storeFn = t: if T.sizeOf t == 1 then "M.storeByte" else "M.storeWord";
+  storeFn =
+    t:
+    let
+      size = T.sizeOf t;
+    in
+    if size == 1 then
+      "M.storeByte"
+    else if size == 2 then
+      "M.storeHalf"
+    else
+      "M.storeWord";
 
-  # A value of type from stored as type t: storeByte keeps the low 8 bits itself, and a
-  # word is stored in its unsigned form.
+  # A value of type from stored as type t: storeByte and storeHalf keep the low bits
+  # themselves (a 2-byte object is 2-aligned), and a word is stored in its unsigned form.
   encode =
     t: from: c:
-    if T.sizeOf t == 1 || T.isUnsigned from then c else app "B.u32" [ c ];
+    if T.sizeOf t < 4 || T.isUnsigned from then c else app "B.u32" [ c ];
 
   # ---- Expressions ----
   # expr s e -> { s; binds; c; } with binds the let bindings of the side effects of e
@@ -356,6 +388,8 @@ let
       mapC (cond s e false) (c: low "if ${c.code} then 1 else 0")
     else if k == "binop" then
       binop s e
+    else if k == "cond" then
+      condExpr s e
     else if k == "ptradd" then
       ptrAdd s e
     else if k == "ptrdiff" then
@@ -801,6 +835,24 @@ let
     else
       mapC (expr s e) (c: infixN 7 (if negated then "==" else "!=") c (num 0));
 
+  # `c ? a : b`. The branches have no side effects (cc/check.nix), so they leave no
+  # bindings and only the chosen one is evaluated.
+  condExpr =
+    s: e:
+    let
+      c = cond s e.cond false;
+      a = expr c.s e.thenExpr;
+      b = expr a.s e.elseExpr;
+    in
+    if a.binds != [ ] || b.binds != [ ] then
+      throw "cc: internal error: side effect in a branch of '?:'"
+    else
+      {
+        inherit (b) s;
+        inherit (c) binds;
+        c = low "if ${c.c.code} then ${a.c.code} else ${b.c.code}";
+      };
+
   # Expression evaluated for its side effects only. -> { s; binds; }
   effect =
     s: e:
@@ -1138,12 +1190,34 @@ let
     in
     "  ${f.name}_fn =\n    ${indent (indent "${signature}\n${renderLet (body.binds ++ r.binds) result}")};\n";
 
+  # ---- Data ----
+
+  # The __data attribute (see the header); init stores [ address size value ] triples
+  # with R.initData.
+  dataAttr =
+    d:
+    let
+      symbols = concatStringsSep "" (
+        map (x: "      ${quoteAttr x.name} = ${toString x.addr};\n") d.symbols
+      );
+      writes = concatStringsSep "" (
+        map (w: "      [ ${toString w.addr} ${toString w.size} ${toString w.value} ]\n") d.inits
+      );
+    in
+    "  __data = {\n"
+    + "    base = ${toString d.base};\n"
+    + "    size = ${toString d.size};\n"
+    + "    symbols = ${if d.symbols == [ ] then "{ }" else "{\n${symbols}    }"};\n"
+    + "    init = mem: ${if d.inits == [ ] then "mem" else "R.initData mem [\n${writes}    ]"};\n"
+    + "  };\n";
+
   emit =
     checked:
     "{ M, B, R }:\nlet\n  inherit (builtins) bitAnd bitOr bitXor div;\n  inherit (R) wrapInt;\n"
     + concatStringsSep "" (map func checked.funcs)
     + "in\n{\n"
     + concatStringsSep "" (map (f: "  ${quoteAttr f.name} = ${f.name}_fn;\n") checked.funcs)
+    + dataAttr checked.data
     + "}\n";
 in
 {

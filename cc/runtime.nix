@@ -3,10 +3,12 @@
 # bench/spike/nix.nix.
 let
   B = import ../lib/bits.nix;
+  M = import ../lib/mem.nix;
   inherit (builtins)
     attrValues
     bitAnd
     div
+    elemAt
     foldl'
     genList
     removeAttrs
@@ -35,9 +37,34 @@ let
     in
     if b >= 128 then b - 256 else b;
 
+  # Conversion to short: the low 16 bits, sign-extended.
+  toS16 =
+    x:
+    let
+      h = bitAnd x 65535;
+    in
+    if h >= 32768 then h - 65536 else h;
+
   # Signed 32-bit wrap of an int or long result: x modulo 2^32, in [-2^31, 2^31). The
   # generated code keeps |x| <= 2^62, so x + 2^31 does not overflow.
   wrapInt = x: bitAnd (x + 2147483648) 4294967295 - 2147483648;
+
+  # The initial values of the data (`__data.init`): each [ address size value ] stores
+  # value (unsigned form) in size bytes at address, in order.
+  initData = foldl' (
+    m: w:
+    let
+      a = elemAt w 0;
+      size = elemAt w 1;
+      v = elemAt w 2;
+    in
+    if size == 1 then
+      M.storeByte m a v
+    else if size == 2 then
+      M.storeHalf m a v
+    else
+      M.storeWord m a v
+  );
 
   # Loop driver, shaped like `run` in lib/cpu.nix. `vars` holds every variable the
   # loop carries (always including mem). Each iteration runs `body` while `cond`
@@ -75,6 +102,8 @@ in
     shlLL
     sraLL
     toS8
+    toS16
     wrapInt
+    initData
     ;
 }

@@ -421,6 +421,148 @@ let
     sizeOf = n: if n.kind == "sizeoftype" && n.type.tag == "int" then 4 else null;
   };
 
+  # ---- Data: file-scope variables, arrays, structs, enums ----
+  # Expected addresses and values follow C and clang's ilp32 layout, worked out by hand.
+
+  base = 4194304; # the default dataBase, 0x00400000
+
+  # The compiled functions of src (loaded with loadFn) and the memory with its data
+  # initialized (__data.init applied to empty memory).
+  loadData =
+    loadFn: src:
+    let
+      f = loadFn src;
+    in
+    {
+      inherit f;
+      mem = f.__data.init M.empty;
+    };
+  # Result ({ mem; ret; }) of fn of src called on the initialized data.
+  dcall =
+    src: fn: args:
+    let
+      d = loadData Cc.load src;
+    in
+    foldl' (g: a: g a) (d.f.${fn} d.mem) args;
+  dret =
+    src: fn: args:
+    (dcall src fn args).ret;
+  # The string s contains needle.
+  contains = needle: s: builtins.replaceStrings [ needle ] [ "" ] s != s;
+  # The __data.symbols of src, relative to base.
+  offsetsOf =
+    src: names:
+    let
+      syms = (Cc.load src).__data.symbols;
+    in
+    map (n: syms.${n} - base) names;
+
+  dataSrc = ''
+    char c; int i; short s; char d; int *p;
+    int g = 5;
+    int arr[4] = { 1, 2, 3 };
+    int m[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    int *pa = &arr[2];
+    int *pn = arr;
+    int *pg = &g;
+    int zero;
+    int readScalar(void) { return g; }
+    int writeScalar(int v) { g = v; return g * 2; }
+    int readArr(int k) { return arr[k]; }
+    int writeArr(int k, int v) { arr[k] = v; return arr[0] + arr[1] + arr[2] + arr[3]; }
+    int readM(int k, int j) { return m[k][j]; }
+    int writeM(int v) { m[1][2] = v; return m[1][2] * 10 + m[0][0]; }
+    int viaPtr(void) { p = &i; *p = 42; return i; }
+    int initAddrs(void) { return *pa * 100 + pn[1] * 10 + *pg; }
+    int uninit(void) { return zero + c + i + s + d + (p == 0); }
+  '';
+
+  shortSrc = ''
+    short gs; unsigned short gu;
+    int narrowS(int v) { short x = v; return x; }
+    int narrowU(int v) { unsigned short x = v; return x; }
+    int storeS(int v) { gs = v; return gs; }
+    int storeU(int v) { gu = v; return gu; }
+    int param(short x) { return x; }
+    int callParam(int v) { return param(v); }
+    int casts(int v) { return (unsigned short)v + (short)v; }
+    int readThrough(short *q) { return *q; }
+  '';
+
+  enumRunSrc = ''
+    enum color { RED, GREEN = 5, BLUE, LAST = BLUE * 2 };
+    int table[LAST] = { RED, GREEN, BLUE };
+    enum color paint = BLUE;
+    enum sign { MINUS = -1, PLUS = 1 };
+    int values(void) { return RED * 1000 + GREEN * 100 + BLUE * 10 + LAST; }
+    int size(void) { return sizeof table; }
+    int initialized(void) { return table[1] * 10 + table[2] + paint; }
+    int unsignedEnum(void) { enum color c = RED; return c - 1 > 0; }
+    int signedEnum(void) { enum sign x = MINUS; return x < 0; }
+    int shadowed(int GREEN) { return GREEN; }
+  '';
+
+  structRunSrc = ''
+    struct pt { char tag; int x; short y; };
+    struct box { struct pt lo, hi; unsigned char name[3]; };
+    struct node { int v; struct node *next; };
+    struct pt pts[3] = { { 'a', 1, 2 }, { 'b', 3, 4 } };
+    struct box bx = { { 'l', 10, 11 }, { 'h', 20, 21 }, { 7, 8, 9 } };
+    struct node n3 = { 3, 0 }, n2 = { 2, &n3 }, n1 = { 1, &n2 };
+    int offsets(void) {
+      return ((char *)&pts[0].x - (char *)pts) * 100 + ((char *)&pts[0].y - (char *)pts) * 10
+        + sizeof(struct pt);
+    }
+    int dot(int k) { return pts[k].x * 10 + pts[k].y; }
+    int arrow(void) { struct pt *q = &pts[1]; q->x = 9; return pts[1].x + q->tag; }
+    int nested(void) { return bx.hi.x + bx.lo.y + bx.name[2]; }
+    int nestedWrite(void) { struct box *b = &bx; b->hi.y = 5; b->name[0] = 1; return bx.hi.y * 10 + bx.name[0]; }
+    int sizes(void) { return sizeof(struct box) * 100 + sizeof bx.name * 10 + sizeof pts / sizeof pts[0]; }
+    int walk(void) { int t = 0; for (struct node *q = &n1; q; q = q->next) t = t * 10 + q->v; return t; }
+    int relink(void) {
+      n1.next = &n3; n3.v = 7;
+      int t = 0;
+      for (struct node *q = &n1; q; q = q->next) t = t * 10 + q->v;
+      return t;
+    }
+  '';
+
+  addrSrc = ''
+    int g = 6;
+    int a[4] = { 10, 20, 30, 40 };
+    struct s { int x; int m; } sv = { 1, 2 };
+    int deref(int *q) { return *q; }
+    int sum(int *q, int n) { int t = 0; for (int i = 0; i < n; i++) t += q[i]; return t; }
+    int addrG(void) { return deref(&g); }
+    int addrElem(int i) { return deref(&a[i]); }
+    int addrMember(void) { return deref(&sv.m); }
+    int addrArrow(void) { struct s *q = &sv; int *r = &q->m; *r = 5; return sv.m; }
+    int derefAddr(void) { return *&g; }
+    int arrayArg(void) { return sum(a, 4); }
+    int arrayParam(int q[], int n) { return q[n - 1]; }
+    int arrayParamCall(void) { return arrayParam(a, 3); }
+    int addrEq(void) { return (&a[1] == a + 1) + (&*a == a) * 10; }
+  '';
+
+  sizeofSrc = ''
+    int g; short h[5]; struct t { char c; short s; } v;
+    unsigned sz(int k) {
+      return k == 0 ? sizeof(short) : k == 1 ? sizeof h : k == 2 ? sizeof(struct t)
+        : k == 3 ? sizeof v.s : k == 4 ? sizeof(int *[3]) : sizeof g;
+    }
+    int isUnsigned(void) { return sizeof(int) - 5 > 0; }
+  '';
+
+  condSrc = ''
+    int pick(int x, int a, int b) { return x ? a : b; }
+    int sign(int x) { return x < 0 ? -1 : x > 0 ? 1 : 0; }
+    unsigned common(int x) { return x ? 1u : -1; }
+    int inCond(int x) { int r = 0; if (x ? x - 1 : 1) r = 5; return r; }
+    int ptrs(int x, int *p) { int *q = x ? p : 0; return q == 0; }
+  '';
+
+  charLitSrc = "int lit(int k) { return k == 0 ? 'a' : k == 1 ? '\\n' : k == 2 ? '\\0' : k == 3 ? '\\\\' : '\\''; } int add(int x) { return x + 'A'; }";
+
   fixmulSrc = import ../cc/examples/spike.nix;
   fixmul =
     a: b:
@@ -1484,31 +1626,440 @@ in
     ]
   )
 
+  # File-scope variables
+  (t "cc data: addresses in declaration order, aligned for their types"
+    (offsetsOf dataSrc [
+      "c"
+      "i"
+      "s"
+      "d"
+      "p"
+      "g"
+      "arr"
+      "m"
+    ])
+    [
+      0
+      4
+      8
+      10
+      12
+      16
+      20
+      36
+    ]
+  )
+  (t "cc data: size and base"
+    {
+      inherit ((Cc.load dataSrc).__data) base size;
+    }
+    {
+      inherit base;
+      size = 76;
+    }
+  )
+  (t "cc data: dataBase moves the variables"
+    (
+      let
+        d = loadData (Cc.loadWith { dataBase = 5242880; }) dataSrc;
+      in
+      {
+        inherit (d.f.__data) base;
+        g = d.f.__data.symbols.g;
+        read = (d.f.readScalar d.mem).ret;
+        addrs = (d.f.initAddrs d.mem).ret;
+      }
+    )
+    {
+      base = 5242880;
+      g = 5242896;
+      read = 5;
+      addrs = 325;
+    }
+  )
+  (t "cc data: a variable is read at its address literal" (contains "M.loadWord mem 4194304" (
+    Cc.compile "int g; int f(void) { return g; }"
+  )) true)
+  (t "cc data: init stores only the values that are not 0"
+    (contains "init = mem: R.initData mem [\n      [ 4194308 4 5 ]\n    ];" (
+      Cc.compile "int a[3] = { 0, 5, 0 };"
+    ))
+    true
+  )
+  (t "cc data: no variables leave memory as it is"
+    ((Cc.load "int f(void) { return 0; }").__data.init M.empty)
+    M.empty
+  )
+  (t "cc run: scalar global read and write"
+    [
+      (dret dataSrc "readScalar" [ ])
+      (dret dataSrc "writeScalar" [ 7 ])
+    ]
+    [
+      5
+      14
+    ]
+  )
+  (t "cc run: array global read and write"
+    [
+      (map (k: dret dataSrc "readArr" [ k ]) [
+        0
+        2
+        3
+      ])
+      (dret dataSrc "writeArr" [
+        3
+        10
+      ])
+    ]
+    [
+      [
+        1
+        3
+        0
+      ]
+      16
+    ]
+  )
+  (t "cc run: two-dimensional array read and write"
+    [
+      (dret dataSrc "readM" [
+        1
+        2
+      ])
+      (dret dataSrc "readM" [
+        0
+        1
+      ])
+      (dret dataSrc "writeM" [ 9 ])
+    ]
+    [
+      6
+      2
+      91
+    ]
+  )
+  (t "cc run: pointer global" (dret dataSrc "viaPtr" [ ]) 42)
+  (t "cc run: initializers &a[2], array name and &g" (dret dataSrc "initAddrs" [ ]) 325)
+  (t "cc run: uninitialized globals are 0" (dret dataSrc "uninit" [ ]) 1)
+  (t "cc run: brace elision and a length from the initializer"
+    [
+      (dret "int m[2][2] = { 1, 2, 3, 4 }; int f(void) { return m[1][0] * 10 + m[0][1]; }" "f" [ ])
+      (dret "int a[] = { 1, 2, 3, 4, 5 }; int f(void) { return sizeof a; }" "f" [ ])
+    ]
+    [
+      32
+      20
+    ]
+  )
+  (t "cc run: extern declaration before the definition" (dret
+    "extern int a[]; int f(void) { return a[2]; } int a[3] = { 1, 2, 3 };"
+    "f"
+    [ ]
+  ) 3)
+  (t "cc run: static at file scope" (dret "static int g = 4; int f(void) { return g; }" "f" [ ]) 4)
+  (t "cc run: initializer with constant arithmetic and casts" (dret ''
+    int a[3]; int *p = a + 2; unsigned char *b = (unsigned char *)0x00110000 + 1;
+    int k = 2147483647 + 1 > 0 ? 1 : (int)(sizeof a) - 1;
+    int f(void) { return (p - a) * 1000 + ((unsigned)b - 0x00110000) * 100 + k; }
+  '' "f" [ ]) 2111)
+
+  # short and unsigned short
+  (t "cc run: short and unsigned short truncate"
+    (map (args: dret shortSrc (head args) (elemAt args 1)) [
+      [
+        "narrowS"
+        [ 40000 ]
+      ]
+      [
+        "narrowS"
+        [ (-1) ]
+      ]
+      [
+        "narrowU"
+        [ (-1) ]
+      ]
+      [
+        "narrowU"
+        [ 70000 ]
+      ]
+    ])
+    [
+      (-25536)
+      (-1)
+      65535
+      4464
+    ]
+  )
+  (t "cc run: short globals store 2 bytes and sign-extend"
+    (
+      let
+        r = dcall shortSrc "storeS" [ (-1) ];
+      in
+      {
+        s = r.ret;
+        u = dret shortSrc "storeU" [ (-2) ];
+        word = M.loadWord r.mem base;
+      }
+    )
+    {
+      s = -1;
+      u = 65534;
+      word = 65535;
+    }
+  )
+  (t "cc run: short parameter, cast and read through a pointer"
+    [
+      (dret shortSrc "callParam" [ 40000 ])
+      (dret shortSrc "casts" [ 98304 ])
+      ((callWith (wordsAt [ 4294901759 ]) shortSrc "readThrough" [ 4096 ]).ret)
+      ((callWith (wordsAt [ 4294901759 ]) shortSrc "readThrough" [ 4098 ]).ret)
+    ]
+    [
+      (-25536)
+      0
+      (-1) # low half of 0xfffeffff
+      (-2) # high half
+    ]
+  )
+
+  # enum
+  (t "cc run: enum constants, explicit and implicit" (dret enumRunSrc "values" [ ]) 572)
+  (t "cc run: enum constant as an array length and in initializers"
+    [
+      (dret enumRunSrc "size" [ ])
+      (dret enumRunSrc "initialized" [ ])
+    ]
+    [
+      48
+      62
+    ]
+  )
+  (t "cc run: enum type is unsigned without negative enumerators"
+    [
+      (dret enumRunSrc "unsignedEnum" [ ])
+      (dret enumRunSrc "signedEnum" [ ])
+    ]
+    [
+      1
+      1
+    ]
+  )
+  (t "cc run: a parameter hides an enum constant" (dret enumRunSrc "shadowed" [ 8 ]) 8)
+
+  # struct
+  (t "cc run: member offsets and size with padding" (dret structRunSrc "offsets" [ ]) 492)
+  (t "cc data: struct array layout"
+    (offsetsOf structRunSrc [
+      "pts"
+      "bx"
+      "n3"
+      "n2"
+      "n1"
+    ])
+    [
+      0
+      36
+      64
+      72
+      80
+    ]
+  )
+  (t "cc run: . on a struct array element" (dret structRunSrc "dot" [ 1 ]) 34)
+  (t "cc run: -> reads and writes" (dret structRunSrc "arrow" [ ]) 107)
+  (t "cc run: nested struct and array member"
+    [
+      (dret structRunSrc "nested" [ ])
+      (dret structRunSrc "nestedWrite" [ ])
+    ]
+    [
+      40
+      51
+    ]
+  )
+  (t "cc run: sizeof of structs and members" (dret structRunSrc "sizes" [ ]) 2833)
+  (t "cc run: following self-referential pointers"
+    [
+      (dret structRunSrc "walk" [ ])
+      (dret structRunSrc "relink" [ ])
+    ]
+    [
+      123
+      17
+    ]
+  )
+
+  # & and arrays as pointers
+  (t "cc run: &g, &a[i], &s.m, &p->m and *&g"
+    [
+      (dret addrSrc "addrG" [ ])
+      (dret addrSrc "addrElem" [ 2 ])
+      (dret addrSrc "addrMember" [ ])
+      (dret addrSrc "addrArrow" [ ])
+      (dret addrSrc "derefAddr" [ ])
+    ]
+    [
+      6
+      30
+      2
+      5
+      6
+    ]
+  )
+  (t "cc run: an array name passed as a pointer"
+    [
+      (dret addrSrc "arrayArg" [ ])
+      (dret addrSrc "arrayParamCall" [ ])
+    ]
+    [
+      100
+      30
+    ]
+  )
+  (t "cc run: &a[1] is a + 1 and &*a is a" (dret addrSrc "addrEq" [ ]) 11)
+  (t "cc compile: constant addresses fold"
+    [
+      (contains "ret = 4194328;" (
+        Cc.compile "int a[4]; struct { int x; int y; } s; int *f(void) { return &a[2] + 4; }"
+      ))
+      (contains "ret = 4194324;" (
+        Cc.compile "int a[4]; struct { int x; int y; } s; int *f(void) { return &s.y; }"
+      ))
+    ]
+    [
+      true
+      true
+    ]
+  )
+
+  # sizeof, ?: and character literals
+  (t "cc run: sizeof of types, arrays, structs and expressions"
+    (map (k: dret sizeofSrc "sz" [ k ]) (genList (k: k) 6))
+    [
+      2
+      10
+      4
+      2
+      12
+      4
+    ]
+  )
+  (t "cc run: sizeof is unsigned" (dret sizeofSrc "isUnsigned" [ ]) 1)
+  (t "cc run: ?: picks a branch"
+    [
+      (ret condSrc "pick" [
+        1
+        2
+        3
+      ])
+      (ret condSrc "pick" [
+        0
+        2
+        3
+      ])
+      (map (x: ret condSrc "sign" [ x ]) [
+        (-5)
+        0
+        7
+      ])
+    ]
+    [
+      2
+      3
+      [
+        (-1)
+        0
+        1
+      ]
+    ]
+  )
+  (t "cc run: ?: converts to the common type" (ret condSrc "common" [ 0 ]) 4294967295)
+  (t "cc run: ?: as a condition"
+    (map (x: ret condSrc "inCond" [ x ]) [
+      0
+      1
+      2
+    ])
+    [
+      5
+      0
+      5
+    ]
+  )
+  (t "cc run: ?: with a null pointer branch" (ret condSrc "ptrs" [
+    0
+    4096
+  ]) 1)
+  (t "cc run: character literals"
+    [
+      (map (k: ret charLitSrc "lit" [ k ]) (genList (k: k) 5))
+      (ret charLitSrc "add" [ 1 ])
+    ]
+    [
+      [
+        97
+        10
+        0
+        92
+        39
+      ]
+      66
+    ]
+  )
+
   # Outside the subset and type errors
   (t "cc compile: switch throws" (compileThrows "void f(int x) { switch (x) { } }") true)
-  (t "cc compile: struct throws" (compileThrows "struct s { int a; };") true)
   (t "cc compile: &x throws" (compileThrows "void f(int x) { int *p = &x; }") true)
-  (t "cc compile: global variable throws" (compileThrows "int g;") true)
-  (t "cc compile: enum throws" (compileThrows "enum e { A };") true)
   (t "cc compile: block-scope struct throws" (compileThrows "void f(void) { struct s { int a; } x; }")
     true
   )
   (t "cc compile: break throws" (compileThrows "void f(int x) { while (x) break; }") true)
   (t "cc compile: case throws" (compileThrows "void f(int x) { if (x) case 1: ; }") true)
-  (t "cc compile: member access throws" (compileThrows "struct s; int f(int *p) { return p->a; }")
-    true
-  )
-  (t "cc compile: ?: throws" (compileThrows "int f(int x) { return x ? 1 : 2; }") true)
-  (t "cc compile: sizeof throws" (compileThrows "int f(void) { return sizeof(int); }") true)
-  (t "cc compile: character literal throws" (compileThrows "int f(void) { return 'a'; }") true)
-  (t "cc compile: short parameter throws" (compileThrows "int f(short x) { return 0; }") true)
-  (t "cc compile: short local with an initializer throws"
-    (compileThrows "void f(void) { short s = 0; }")
+  (t "cc compile: member access through a non-struct pointer throws"
+    (compileThrows "struct s; int f(int *p) { return p->a; }")
     true
   )
   (t "cc compile: local array throws" (compileThrows "void f(void) { int a[3]; }") true)
-  (t "cc compile: cast to unsigned short throws"
-    (compileThrows "int f(int x) { return (unsigned short)x; }")
+  (t "cc compile: union throws" (compileThrows "union u { int a; }; int f(void) { return 0; }") true)
+  (t "cc compile: struct assignment throws"
+    (compileThrows "struct s { int a; }; struct s x, y; void f(void) { x = y; }")
+    true
+  )
+  (t "cc compile: struct passed or returned by value throws"
+    (map compileThrows [
+      "struct s { int a; }; void f(struct s x) { }"
+      "struct s { int a; }; struct s f(void);"
+    ])
+    [
+      true
+      true
+    ]
+  )
+  (t "cc compile: long long in a global variable, array or struct throws"
+    (map compileThrows [
+      "long long g;"
+      "long long g[2];"
+      "struct s { int a; long long b; };"
+    ])
+    [
+      true
+      true
+      true
+    ]
+  )
+  (t "cc compile: extern variable without a definition throws"
+    (compileThrows "extern int g; int f(void) { return g; }")
+    true
+  )
+  (t "cc compile: side effect in a branch of ?: throws"
+    (compileThrows "int f(int x) { return x ? x++ : 0; }")
+    true
+  )
+  (t "cc compile: excess initializer elements throw" (compileThrows "int a[2] = { 1, 2, 3 };") true)
+  (t "cc compile: non-constant initializer throws" (compileThrows "int g; int h = g;") true)
+  (t "cc compile: two initialized definitions throw" (compileThrows "int g = 1; int g = 2;") true)
+  (t "cc compile: member of an incomplete struct throws"
+    (compileThrows "struct s; int f(struct s *p) { return p->a; }")
     true
   )
   (t "cc compile: return before the end throws"
