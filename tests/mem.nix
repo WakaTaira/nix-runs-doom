@@ -1,7 +1,7 @@
 # Tests for lib/mem.nix. The byte, half and word accessors are compared with a naive
 # reference written with loadWordAt / storeWordAt only (the definitions that
 # lib/mem.nix had before its table-driven rewrite). storeRun and storeStride are
-# compared with a fold of storeByte.
+# compared with a fold of storeByte, and readPages with loadByte.
 let
   M = import ../lib/mem.nix;
   B = import ../lib/bits.nix;
@@ -339,6 +339,183 @@ let
     (deepCase "run" 1048577 1 1000000)
     (deepCase "stride" 1048577 16384 5000)
   ];
+
+  # --- readPages ---
+  # Patterned words over three windows: around the leaf at 0x1000 and the 16 KiB node at
+  # 0x4000, around 1 MiB, and below 2^32. Every eighth leaf stays unwritten.
+  pageWindows = [
+    {
+      lo = 3840;
+      hi = 21248;
+    }
+    {
+      lo = 1040384;
+      hi = 1057024;
+    }
+    {
+      lo = 4294950656;
+      hi = 4294967296;
+    }
+  ];
+  pageMem = foldl' (
+    m: win:
+    foldl' (
+      mm: k:
+      let
+        a = win.lo + 4 * k;
+        w = div a 4;
+      in
+      if bitAnd (div a 256) 7 == 3 then mm else M.storeWordAt mm w (pattern w)
+    ) m (genList (k: k) (div (win.hi - win.lo) 4))
+  ) M.empty pageWindows;
+
+  # Byte base + o read from the pages, as readPages lays them out.
+  pageByte =
+    pages: base: o:
+    let
+      q = bitAnd base 255 + o;
+    in
+    elemAt (elemAt pages (div q 256)) (bitAnd q 255);
+  # The number of leaves that [base, base + len) touches: the first one and every one that
+  # starts inside the range.
+  leavesOf =
+    base: len: length (builtins.filter (o: o == 0 || bitAnd (base + o) 255 == 0) (genList (o: o) len));
+
+  pageCase =
+    m: base: len:
+    let
+      pages = M.readPages m base len;
+    in
+    {
+      name = "mem: readPages base=${toString base} len=${toString len} matches loadByte";
+      got = [
+        (length pages)
+        (map length pages)
+        (genList (pageByte pages base) len)
+      ];
+      expected = [
+        (leavesOf base len)
+        (map (_: 256) pages)
+        (genList (o: M.loadByte m (base + o)) len)
+      ];
+    };
+  pageCases = map (x: pageCase pageMem (builtins.head x) (elemAt x 1)) [
+    # low 8 bits 0, 1 and 255; lengths 1, 128, 256, 257, 4096 and 16384
+    [
+      4096
+      1
+    ]
+    [
+      4097
+      128
+    ]
+    [
+      4351
+      128
+    ]
+    [
+      4096
+      256
+    ]
+    [
+      4097
+      256
+    ]
+    [
+      4351
+      257
+    ]
+    [
+      4096
+      4096
+    ]
+    [
+      4351
+      4096
+    ]
+    [
+      4097
+      16384
+    ]
+    # across the 16 KiB node at 0x4000 and the root entry at 1 MiB
+    [
+      16284
+      257
+    ]
+    [
+      16383
+      4096
+    ]
+    [
+      1048575
+      128
+    ]
+    [
+      1040385
+      16384
+    ]
+    # unwritten: a whole region, and a range from an unwritten leaf into a written one
+    [
+      3145729
+      300
+    ]
+    [
+      4865
+      300
+    ]
+    # the last byte at 2^32 - 1
+    [
+      4294967295
+      1
+    ]
+    [
+      4294967040
+      256
+    ]
+    [
+      4294967039
+      257
+    ]
+    [
+      4294950912
+      16384
+    ]
+  ];
+
+  # A memory built directly, whose word 2 of the leaf at 0x1000 and word 0 of the leaf at
+  # 0x1100 fail when read: readPages reads neither for the lengths and for byte 0x1001.
+  lazyMem = {
+    "0" = {
+      "0" = {
+        "16" = {
+          "0" = 43776;
+          "2" = throw "readPages read word 2 of the leaf at 0x1000";
+        };
+        "17" = {
+          "0" = throw "readPages read word 0 of the leaf at 0x1100";
+        };
+      };
+    };
+  };
+  lazyCase =
+    let
+      pages = M.readPages lazyMem 4096 512;
+    in
+    {
+      name = "mem: readPages reads only the bytes that are used";
+      got = [
+        (length pages)
+        (length (elemAt pages 0))
+        (length (elemAt pages 1))
+        (elemAt (elemAt pages 0) 1)
+      ];
+      expected = [
+        2
+        256
+        256
+        171
+      ];
+    };
 in
 map loadCase accessAddrs
 ++ map storeCase accessAddrs
@@ -348,3 +525,5 @@ map loadCase accessAddrs
 ++ emptyCases
 ++ [ keepCase ]
 ++ deepCases
+++ pageCases
+++ [ lazyCase ]

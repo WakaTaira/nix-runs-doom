@@ -13,7 +13,9 @@
 # the byte address; storeByte walks the path once. storeRun writes many bytes with
 # one `//` per leaf instead of one path copy per byte; storeStride does the same
 # with one `//` per 16 KiB node for a stride of 256 or more, is storeRun for a
-# stride of 1, and folds storeByte for a stride of 2 to 255.
+# stride of 1, and folds storeByte for a stride of 2 to 255. readPages hands out the
+# leaves over a byte range as lazy lists of bytes, for code that reads a table many
+# times without walking the trie for each byte.
 let
   inherit (builtins)
     bitAnd
@@ -229,6 +231,29 @@ let
     in
     seq node (seq n0' (m // { ${a0} = n0'; }));
 
+  # The 256 bytes of a leaf in address order, as a lazy list. The first 256 entries of
+  # byteTable give the word key and the divisor of a byte offset inside a leaf.
+  leafBytes =
+    leaf:
+    genList (
+      i:
+      let
+        p = elemAt byteTable i;
+      in
+      bitAnd (div (leaf.${p.lo} or 0) p.d) 255
+    ) 256;
+
+  # The leaves (256 B) that the bytes [base, base + len) touch, from the first one on,
+  # each as the list of its 256 bytes. Byte base + o is element bitAnd q 255 of leaf
+  # div q 256, with q = bitAnd base 255 + o. The caller guarantees len >= 1, 0 <= base
+  # and base + len - 1 < 2^32. Both lists are lazy: a leaf or a byte is read when used.
+  readPages =
+    m: base: len:
+    let
+      first = div base 256;
+    in
+    genList (j: leafBytes (leafAt m ((first + j) * 256))) (div (base + len - 1) 256 - first + 1);
+
   forceAll = s: foldl' (acc: x: seq x acc) 0 (attrValues s);
 
   # nw whole words starting at the word-aligned byte address wa; the word k comes
@@ -362,5 +387,6 @@ in
     storeWord
     storeRun
     storeStride
+    readPages
     ;
 }
