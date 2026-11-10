@@ -54,7 +54,9 @@
 #   { kind = "neg" | "bnot"; expr; }             unary - and ~ (expr has the result type)
 #   { kind = "not"; expr; }                      !; expr is any scalar; type int
 #   { kind = "deref"; expr; }                    memory read at the address expr; type is
-#                                                the scalar read (1, 2 or 4 bytes)
+#                                                the scalar read (1, 2 or 4 bytes). The
+#                                                read of a bit-field also has
+#                                                bitfield = true (only for & and sizeof)
 #   { kind = "binop"; op; lhs; rhs; }            op: * / % + - << >> & | ^ on integers; both
 #                                                operands have the result type, except the
 #                                                rhs of << and >> (its own promoted type)
@@ -418,9 +420,9 @@ let
   # a bit-field also has bitfield = true.
 
   isArray = t: t.tag == "array";
-  # Structs and unions.
-  isStruct = t: t.tag == "struct" || t.tag == "union";
-  isAggregate = t: isArray t || isStruct t;
+  # Structs and unions (records).
+  isRecord = t: t.tag == "struct" || t.tag == "union";
+  isAggregate = t: isArray t || isRecord t;
   isFloat = t: t.tag == "float" || t.tag == "double";
   # A floating-point object: a float or double, or an array of them.
   hasFloat = t: isFloat t || isArray t && hasFloat t.of;
@@ -439,7 +441,7 @@ let
       false
     else if isArray t then
       t.len != null && isComplete ctx t.of
-    else if isStruct t then
+    else if isRecord t then
       hasAttr t.name ctx.structs
     else
       true;
@@ -449,7 +451,7 @@ let
     ctx: t:
     if isArray t then
       t.len * sizeOfT ctx t.of
-    else if isStruct t then
+    else if isRecord t then
       ctx.structs.${t.name}.size
     else if isFloat t then
       floatSizes.${t.tag}
@@ -460,7 +462,7 @@ let
     ctx: t:
     if isArray t then
       alignOfT ctx t.of
-    else if isStruct t then
+    else if isRecord t then
       ctx.structs.${t.name}.align
     else if isFloat t then
       floatSizes.${t.tag}
@@ -755,8 +757,8 @@ let
     in
     if isArray x.type then
       mkCast (ptrTo x.type.of) x.expr
-    else if isStruct x.type then
-      unsupported e "struct value"
+    else if isRecord x.type then
+      unsupported e "${x.type.tag} value"
     else if isFloat x.type then
       unsupported e "floating-point value"
     else
@@ -825,7 +827,7 @@ let
     else if f.variadic then
       unsupported e "call to the variadic function '${e.name}'"
     else if sigHasFloat f then
-      unsupported e "call to a function with a floating-point parameter or return value"
+      unsupported e "call to the function '${e.name}' with a floating-point parameter or return value"
     else if n != m then
       fail e "function '${e.name}' takes ${toString n} argument(s) but ${toString m} were given"
     else
@@ -900,6 +902,8 @@ let
     in
     if isVoid t then
       fail at "arithmetic on a pointer to void"
+    else if t.tag == "fn" then
+      unsupported at "arithmetic on a pointer to the function type '${showType t}'"
     else if !isComplete ctx t then
       fail at "arithmetic on a pointer to an incomplete type '${showType t}'"
     else if p.kind == "lit" && index.kind == "lit" then
@@ -946,8 +950,8 @@ let
       layout = ctx.structs.${t.name};
       f = layout.byName.${name};
     in
-    if !isStruct t then
-      fail at "member reference base type '${showType t}' is not a structure"
+    if !isRecord t then
+      fail at "member reference base type '${showType t}' is not a structure or union"
     else if !hasAttr t.name ctx.structs then
       fail at "incomplete definition of type '${showType t}'"
     else if !hasAttr name layout.byName then
@@ -1016,6 +1020,10 @@ let
           usual ta tb
         else if isPtr ta && ta == tb then
           ta
+        else if isFnPtr ta && isNullFn b then
+          ta
+        else if isNullFn a && isFnPtr tb then
+          tb
         else if isPtr ta && isNullConst b then
           ta
         else if isNullConst a && isPtr tb then
@@ -1284,8 +1292,8 @@ let
     in
     if isArray x.type then
       fail e "array type '${showType x.type}' is not assignable"
-    else if isStruct x.type then
-      unsupported e "struct assignment"
+    else if isRecord x.type then
+      unsupported e "${x.type.tag} assignment"
     else if isFloat x.type then
       unsupported e "floating-point value"
     else if x.kind == "var" || x.kind == "deref" then
@@ -1325,10 +1333,19 @@ let
 
   # ---- Statements ----
 
-  # env: { vars; local; funcs; ret; jumps; ctx; } with vars and local keyed by the C name
-  # (local: the names declared in the innermost block), funcs the function signatures, ret
-  # the return type of the current function, jumps = { break; continue; } whether break and
-  # continue have a target here, and ctx the file-scope context (see checkItems).
+  # env: { vars; local; funcs; fn; ret; jumps; ctx; } with
+  #   vars   the variables in scope by C name: a local variable or parameter
+  #          ({ key; name; type; }), or a block-scope extern or static variable
+  #          ({ name; type; object; }, object its data symbol, see identExpr)
+  #   local  what each name declared in the innermost block is: "object" (a variable),
+  #          "constant" (an enumerator) or "function" (a function declaration), and
+  #          "tag" for the key `tag <name>` of a struct, union or enum tag
+  #   funcs  the function signatures in scope by name ({ ret; params; variadic; defined; })
+  #   fn     the name of the current function (null at file scope)
+  #   ret    the return type of the current function
+  #   jumps  = { break; continue; } whether break and continue have a target here
+  #   ctx    the context (see checkItems), with the tags, structs, enums and enumerators of
+  #          the enclosing blocks added
   enterBlock = env: env // { local = { }; };
 
   # env for the body of a loop, and of a switch.
@@ -1370,7 +1387,7 @@ let
             ${name} = var;
           };
           local = env.local // {
-            ${name} = true;
+            ${name} = "object";
           };
         };
       };
@@ -1495,8 +1512,8 @@ let
           in
           if isArray t then
             unsupported d "local array"
-          else if isStruct t then
-            unsupported d "local struct variable"
+          else if isRecord t then
+            unsupported d "local ${t.tag} variable"
           else if isFloat t then
             unsupported d "floating-point variable"
           else
@@ -1554,7 +1571,7 @@ let
         };
       };
       local = env.local // {
-        ${name} = true;
+        ${name} = "object";
       };
     };
 
@@ -1635,8 +1652,10 @@ let
       name = d.name;
       sig = sigOf env d;
       prev = env.funcs.${name} or null;
+      kind = env.local.${name} or null;
+      otherKind = (kind != null && kind != "function") || hasAttr name env.ctx.globals;
     in
-    if env.local.${name} or "function" != "function" || hasAttr name env.ctx.globals then
+    if otherKind then
       fail d "redefinition of '${name}' as a different kind of symbol"
     else if prev != null && !sameSig prev sig then
       fail d "conflicting types for '${name}'"
@@ -1676,7 +1695,7 @@ let
       env
       // {
         local = env.local // {
-          ${tagKey n.name} = true;
+          ${tagKey n.name} = "tag";
         };
         ctx = env.ctx // {
           tags = env.ctx.tags // {
@@ -1715,30 +1734,24 @@ let
         st: c:
         let
           e = st.env;
-          v = if c.value == null then st.next else (constExpr (hooksOf e) c.value).value;
+          v = enumValue e st.next c;
         in
         builtins.seq (checkLocal e c c.name) (
-          if v < s32.lo || v > s32.hi then
-            unsupported c "enumerator value ${toString v} outside the range of int"
-          else
-            {
-              env = e // {
-                vars = removeAttrs e.vars [ c.name ];
-                local = e.local // {
-                  ${c.name} = true;
-                };
-                ctx = e.ctx // {
-                  consts = e.ctx.consts // {
-                    ${c.name} = {
-                      type = tInt;
-                      value = v;
-                    };
-                  };
+          builtins.seq v {
+            env = e // {
+              vars = removeAttrs e.vars [ c.name ];
+              local = e.local // {
+                ${c.name} = "constant";
+              };
+              ctx = e.ctx // {
+                consts = e.ctx.consts // {
+                  ${c.name} = enumConst v;
                 };
               };
-              next = v + 1;
-              negative = st.negative || v < 0;
-            }
+            };
+            next = v + 1;
+            negative = st.negative || v < 0;
+          }
         );
       r = foldl' step {
         inherit env;
@@ -1751,7 +1764,7 @@ let
     // {
       ctx = env1.ctx // {
         enums = env1.ctx.enums // {
-          ${internal} = if r.negative then tInt else tUInt;
+          ${internal} = enumType r.negative;
         };
       };
     };
@@ -1943,7 +1956,7 @@ let
       resolveArray env at t
     else if t.tag == "enum" then
       env.ctx.enums.${tagName env t} or (fail at "incomplete enum type 'enum ${t.name}'")
-    else if isStruct t then
+    else if isRecord t then
       resolveRecord env at t
     else if t.tag == "fn" then
       {
@@ -2021,12 +2034,12 @@ let
         let
           t = resolveType env p p.type;
         in
-        if isStruct t then unsupported p "struct parameter passed by value" else adjustParam t;
+        if isRecord t then unsupported p "${t.tag} parameter passed by value" else adjustParam t;
     in
     if isArray ret then
       fail item "function cannot return array type '${showType ret}'"
-    else if isStruct ret then
-      unsupported item "struct returned by value"
+    else if isRecord ret then
+      unsupported item "${ret.tag} returned by value"
     else
       {
         inherit ret;
@@ -2079,14 +2092,17 @@ let
   # ---- File scope ----
   # The items are checked in order with the accumulator
   #   acc = { funcs; defs; ctx; size; objects; }
-  # funcs: the function signatures by name ({ ret; params; defined; }); defs: the typed
-  # function definitions; size: the bytes placed so far; objects: the placed variables
-  # ([ { name; addr; writes; } ], writes as the inits of the data). The file-scope context
-  #   ctx = { structs; enums; consts; globals; addrs; }
-  # holds the struct layouts by tag (see "Objects"), the enum types by tag, the enumerators
-  # by name ({ type; value; }), the variables by name ({ type; defined; hasInit; at; }) and the
-  # addresses of all defined variables by name, taken from the end of the fold (an extern
-  # declaration may precede the definition that places the variable).
+  # funcs: the function signatures by name ({ ret; params; variadic; defined; }); defs: the
+  # typed function definitions; size: the bytes placed so far; objects: the placed variables
+  # ([ { name; addr; end; at; writes; } ], writes as the inits of the data). The context
+  #   ctx = { structs; enums; consts; globals; tags; addrs; }
+  # holds the struct and union layouts by tag (see "Objects"), the enum types by tag, the
+  # enumerators by name ({ type; value; }), the file-scope variables by name
+  # ({ type; defined; hasInit; at; }), the internal names of the block-scope tags in scope
+  # by tag (empty at file scope; see resolveType), and the addresses of all defined
+  # variables and static locals by data symbol, taken from the end of the fold and
+  # placeStatics (an extern declaration may precede the definition that places the
+  # variable).
 
   fileEnv = acc: {
     vars = { };
@@ -2192,56 +2208,7 @@ let
   structLayout =
     env: n:
     let
-      inherit (env) ctx;
-      isUnion = n.kind == "union";
-      packed = n.packed or false;
-      step =
-        acc: f:
-        let
-          t = resolveType env f f.type;
-          isBit = (f.width or null) != null;
-          bit = bitField env acc f t;
-          a = if packed then 1 else alignOfT ctx t;
-          type = if isBit then bit.type else t;
-          offset =
-            if isUnion then
-              0
-            else if isBit then
-              acc.size
-            else
-              alignUp acc.size a;
-          field = {
-            inherit (f) name;
-            inherit type offset;
-          }
-          // (if isBit then { bitfield = true; } else { });
-          end = offset + sizeOfT ctx type;
-        in
-        if hasAttr f.name acc.byName then
-          fail f "duplicate member '${f.name}'"
-        else if isArray t && t.len == null then
-          unsupported f "flexible array member"
-        else if !isComplete ctx t then
-          fail f "field '${f.name}' has incomplete type '${showType t}'"
-        else if hasLLong t then
-          unsupported f "8-byte integer in a struct"
-        else if isBit && isUnion then
-          unsupported f "bit-field in a union"
-        else if !isBit && acc.run != 0 then
-          unsupported acc.runAt "bit-fields that do not fill their declared type"
-        else
-          {
-            size = if isUnion && acc.size > end then acc.size else end;
-            align = if a > acc.align then a else acc.align;
-            fields = acc.fields ++ [ field ];
-            byName = acc.byName // {
-              ${f.name} = field;
-            };
-            run = if isBit then bit.run else 0;
-            runType = if isBit then t else null;
-            runAt = f;
-          };
-      r = foldl' step {
+      r = foldl' (layoutStep env n) {
         size = 0;
         align = 1;
         fields = [ ];
@@ -2259,6 +2226,81 @@ let
         inherit (r) align fields byName;
         size = alignUp r.size r.align;
       };
+
+  # The layout so far acc = { size; align; fields; byName; run; runType; runAt; } of the
+  # struct or union n with its member f added. run and runType are those of bitField, and
+  # runAt is the last member. The diagnostics come in member order.
+  layoutStep =
+    env: n: acc: f:
+    let
+      t = resolveType env f f.type;
+      m = placeMember env n acc f t;
+    in
+    builtins.seq (checkMember env n acc f t) (
+      builtins.seq m {
+        size = if n.kind == "union" && acc.size > m.end then acc.size else m.end;
+        align = if m.align > acc.align then m.align else acc.align;
+        fields = acc.fields ++ [ m.field ];
+        byName = acc.byName // {
+          ${f.name} = m.field;
+        };
+        inherit (m) run runType;
+        runAt = f;
+      }
+    );
+
+  # Fails unless the member f of type t can follow the members in acc (see layoutStep) in
+  # the struct or union n; true otherwise.
+  checkMember =
+    env: n: acc: f: t:
+    let
+      isBit = f.width != null;
+    in
+    if hasAttr f.name acc.byName then
+      fail f "duplicate member '${f.name}'"
+    else if isArray t && t.len == null then
+      unsupported f "flexible array member"
+    else if !isComplete env.ctx t then
+      fail f "field '${f.name}' has incomplete type '${showType t}'"
+    else if hasLLong t then
+      unsupported f "8-byte integer in a struct"
+    else if isBit && n.kind == "union" then
+      unsupported f "bit-field in a union"
+    else if !isBit && acc.run != 0 then
+      unsupported acc.runAt "bit-fields that do not fill their declared type"
+    else
+      true;
+
+  # The place of the member f of type t after the members in acc (see layoutStep) in the
+  # struct or union n -> { field; end; align; run; runType; } with field its entry in the
+  # layout, end the offset after it, align its contribution to the alignment, and run and
+  # runType those of bitField (0 and null for other members).
+  placeMember =
+    env: n: acc: f: t:
+    let
+      isBit = f.width != null;
+      bit = bitField env acc f t;
+      align = if n.packed or false then 1 else alignOfT env.ctx t;
+      type = if isBit then bit.type else t;
+      offset =
+        if n.kind == "union" then
+          0
+        else if isBit then
+          acc.size
+        else
+          alignUp acc.size align;
+      field = {
+        inherit (f) name;
+        inherit type offset;
+      }
+      // (if isBit then { bitfield = true; } else { });
+    in
+    builtins.seq (if isBit then bit else null) {
+      inherit field align;
+      end = offset + sizeOfT env.ctx type;
+      run = if isBit then bit.run else 0;
+      runType = if isBit then t else null;
+    };
 
   # The bit-field f of the declared type t (resolved), placed after the members in acc (see
   # structLayout). Only named bit-fields of an unsigned type (not plain char, not an enum)
@@ -2323,28 +2365,43 @@ let
           }
       );
 
-  # Enumerators are int constants: the given value, or one more than the previous one (0
-  # for the first). Each is in scope from the next one on.
+  # The value of the enumerator c in env: the given value, or next (one more than the
+  # previous one, 0 for the first). A value outside the range of int is unsupported.
+  enumValue =
+    env: next: c:
+    let
+      v = if c.value == null then next else (constExpr (hooksOf env) c.value).value;
+    in
+    if v < s32.lo || v > s32.hi then
+      unsupported c "enumerator value ${toString v} outside the range of int"
+    else
+      v;
+
+  # An enumerator: an int constant.
+  enumConst = v: {
+    type = tInt;
+    value = v;
+  };
+
+  # The compatible integer type of an enum, int when an enumerator is negative.
+  enumType = negative: if negative then tInt else tUInt;
+
+  # Enumerators are int constants (enumValue). Each is in scope from the next one on.
   defineEnum =
     acc: n:
     let
       step =
         st: c:
         let
-          v = if c.value == null then st.next else (constExpr (hooksOf (fileEnv st.acc)) c.value).value;
+          v = enumValue (fileEnv st.acc) st.next c;
         in
         if declaredAs st.acc c.name != null then
           fail c "redefinition of '${c.name}'"
-        else if v < s32.lo || v > s32.hi then
-          unsupported c "enumerator value ${toString v} outside the range of int"
         else
-          {
+          builtins.seq v {
             acc = withCtx st.acc {
               consts = st.acc.ctx.consts // {
-                ${c.name} = {
-                  type = tInt;
-                  value = v;
-                };
+                ${c.name} = enumConst v;
               };
             };
             next = v + 1;
@@ -2361,7 +2418,7 @@ let
     else
       withCtx r.acc {
         enums = r.acc.ctx.enums // {
-          ${n.name} = if r.negative then tInt else tUInt;
+          ${n.name} = enumType r.negative;
         };
       };
 
@@ -2399,7 +2456,7 @@ let
       else if isDef && hasFloat t then
         unsupported g "floating-point variable"
       else if prev != null && !compatible prev.type t then
-        fail g "redefinition of '${name}' with a different type"
+        fail g "redeclaration of '${name}' with a different type"
       else if !isDef then
         builtins.deepSeq t (
           withGlobal acc name {
@@ -2630,16 +2687,17 @@ let
     else if k == "while" || k == "do" then
       sub n.body
     else if k == "for" then
-      sub n.init ++ sub n.body
+      # The declaration of a for initialization declares no static or extern variable.
+      sub n.body
     else if k == "switch" then
       concatMap sub (n.skipped ++ concatLists n.sections)
     else
       [ ];
 
-  # The objects acc.objects followed by the static locals of the functions defs in source
-  # order, each at the next offset aligned for it. -> { size; objects; }
+  # The objects acc.objects followed by the static locals of the functions acc.defs in
+  # source order, each at the next offset aligned for it. -> { size; objects; }
   placeStatics =
-    dataBase: acc: defs:
+    dataBase: acc:
     foldl' (
       st: o:
       let
@@ -2658,7 +2716,7 @@ let
           }
         ];
       }
-    ) { inherit (acc) size objects; } (concatMap (f: declsIn "statics" f.body) defs);
+    ) { inherit (acc) size objects; } (concatMap (f: declsIn "statics" f.body) acc.defs);
 
   checkItems =
     dataBase: items:
@@ -2677,7 +2735,7 @@ let
         size = 0;
         objects = [ ];
       } items;
-      placed = placeStatics dataBase r r.defs;
+      placed = placeStatics dataBase r;
       addrs = listToAttrs (
         map (o: {
           inherit (o) name;
@@ -2687,15 +2745,20 @@ let
     in
     r // { inherit (placed) size objects; };
 
-  # Whether the block-scope extern x refers to a defined file-scope variable of the
-  # compatible type in the final context ctx: true, null when there is no definition, or
-  # false for another type.
-  externOk =
+  # How the block-scope extern x refers to the file-scope variable of its name in the final
+  # context ctx: "ok" (defined, with a compatible type), "undefined" or "type" (defined
+  # with another type).
+  externStatus =
     ctx: x:
     let
       g = ctx.globals.${x.name} or null;
     in
-    if g == null || !g.defined then null else compatible g.type x.type;
+    if g == null || !g.defined then
+      "undefined"
+    else if compatible g.type x.type then
+      "ok"
+    else
+      "type";
 
   checkWith =
     { dataBase }:
@@ -2711,7 +2774,7 @@ let
         && (r.funcs.${c.name}.ret != c.type || r.funcs.${c.name}.params != map (a: a.type) c.args)
       ) calls;
       externs = filter (n: !r.ctx.globals.${n}.defined) (attrNames r.ctx.globals);
-      blockExterns = filter (x: externOk r.ctx x != true) (
+      blockExterns = filter (x: externStatus r.ctx x != "ok") (
         concatMap (f: declsIn "externs" f.body) r.defs
       );
       blockExtern = head blockExterns;
@@ -2728,11 +2791,12 @@ let
         };
       };
     in
-    if !(isInt dataBase && dataBase >= 0 && dataBase <= B.mask32 && bitAnd dataBase 3 == 0) then
-      throw "cc: dataBase must be a multiple of 4 in 0..2^32-1"
+    if !(isInt dataBase && dataBase >= 0 && dataBase <= B.mask32 && bitAnd dataBase 7 == 0) then
+      # 8: the largest alignment (of a struct with a double).
+      throw "cc: dataBase must be a multiple of 8 in 0..2^32-1"
     else if externs != [ ] then
       unsupported extern.at "extern variable '${head externs}' without a definition"
-    else if blockExterns != [ ] && externOk r.ctx blockExtern == null then
+    else if blockExterns != [ ] && externStatus r.ctx blockExtern == "undefined" then
       unsupported blockExtern "extern variable '${blockExtern.name}' without a definition"
     else if blockExterns != [ ] then
       fail blockExtern "redeclaration of '${blockExtern.name}' with a different type"

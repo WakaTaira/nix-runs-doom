@@ -589,13 +589,19 @@ let
     else if k == "assign" then
       assign s e true
     else if k == "comma" then
-      let
-        l = effect s e.lhs;
-        r = expr l.s e.rhs;
-      in
-      r // { binds = l.binds ++ r.binds; }
+      afterLhs expr s e
     else
       throw "cc: internal error: unexpected expression '${k}'";
+
+  # The comma expression e: its lhs for the side effects, then f applied to the state after
+  # it and the rhs, with the bindings of both.
+  afterLhs =
+    f: s: e:
+    let
+      l = effect s e.lhs;
+      r = f l.s e.rhs;
+    in
+    r // { binds = l.binds ++ r.binds; };
 
   # ---- Signed 32-bit wrapping ----
   # An unwrapped result is { s; binds; c; bound; } with bound null when c is wrapped (in
@@ -1036,11 +1042,7 @@ let
         c = if isAnd then infixL 8 "&&" l.c r.c else infixL 9 "||" l.c r.c;
       }
     else if k == "comma" then
-      let
-        l = effect s e.lhs;
-        r = cond l.s e.rhs negated;
-      in
-      r // { binds = l.binds ++ r.binds; }
+      afterLhs (st: x: cond st x negated) s e
     else
       mapC (expr s e) (c: infixN 7 (if negated then "==" else "!=") c (num 0));
 
@@ -1068,10 +1070,10 @@ let
       keys = joinKeys s1 (k: varCode r.s k != varCode s1 k);
       memChanged = r.s.mem != s1.mem;
       at = k: attrName s1.names.${k};
-      fields =
-        st:
-        (if memChanged then [ "mem = ${st.mem};" ] else [ ]) ++ map (k: "${at k} = ${varCode st k};") keys;
-      branch = x: renderLet x.binds "{ ${concatStringsSep " " (fields x.s ++ [ "v' = ${x.c.code};" ])} }";
+      branch = x: {
+        inherit (x) binds;
+        code = setCode memChanged keys at x.s [ "v' = ${x.c.code};" ];
+      };
       f = fresh (s1 // { inherit (r.s) n bulkLoads; }) "sc";
     in
     {
@@ -1079,7 +1081,7 @@ let
       binds = l.binds ++ [
         {
           inherit (f) name;
-          code = "if ${l.c.code} then\n  ${indent (branch th)}\nelse\n  ${indent (branch el)}";
+          code = ifCode l.c (branch th) (branch el);
         }
       ];
       c = atom "${f.name}.v'";
@@ -1118,11 +1120,7 @@ let
         else if e.kind == "cast" && T.isVoid e.type then
           effect s e.expr
         else if e.kind == "comma" then
-          let
-            l = effect s e.lhs;
-            x = effect l.s e.rhs;
-          in
-          x // { binds = l.binds ++ x.binds; }
+          afterLhs effect s e
         else
           expr s e;
     in
@@ -1613,13 +1611,13 @@ let
       keys = joinKeys s1 (k: varCode th.s k != varCode s1 k || varCode el.s k != varCode s1 k);
       memChanged = th.s.mem != s1.mem || el.s.mem != s1.mem;
       at = k: attrName s1.names.${k};
-      fields =
-        st:
-        (if memChanged then [ "mem = ${st.mem};" ] else [ ]) ++ map (k: "${at k} = ${varCode st k};") keys;
-      branch = r: renderLet r.binds "{ ${concatStringsSep " " (fields r.s)} }";
+      branch = r: {
+        inherit (r) binds;
+        code = setCode memChanged keys at r.s [ ];
+      };
       # The loads of the branches stay recorded in a bulk iteration (see "Bulk loops").
       f = fresh (s1 // { inherit (el.s) n bulkLoads; }) "if";
-      code = "if ${c.c.code} then\n  ${indent (branch th)}\nelse\n  ${indent (branch el)}";
+      code = ifCode c.c (branch th) (branch el);
     in
     if keys == [ ] && !memChanged then
       {
@@ -1630,18 +1628,7 @@ let
       }
     else
       {
-        s = f.s // {
-          mem = if memChanged then "${f.name}.mem" else s1.mem;
-          vars =
-            s1.vars
-            // listToAttrs (
-              map (k: {
-                name = k;
-                value = "${f.name}.${at k}";
-              }) keys
-            );
-          hits = hitsAfterJoin s1 keys;
-        };
+        s = joined f.s f.name memChanged keys at;
         binds = c.binds ++ [
           {
             inherit (f) name;
@@ -1650,8 +1637,10 @@ let
         ];
       };
 
-  # The keys of the variables of s1 and of its cached reads that changed (a test on a key)
-  # tells to join. The entries share their hits, so they join all together or not at all.
+  # The keys that a join set after code run from the state s1 carries: those of the
+  # variables of s1 for which changed (a test on a key) holds, and the keys of all the
+  # cached reads when it holds for one of them (the entries share their hits, so they join
+  # all together or not at all).
   joinKeys =
     s1: changed:
     let
@@ -3182,6 +3171,18 @@ let
       ];
     } d;
 
+  # The source of a join set in the state st: mem (when memChanged) and the variables and
+  # cached reads keys (named by at), then the fields extra.
+  setCode =
+    memChanged: keys: at: st: extra:
+    "{ ${
+      concatStringsSep " " (
+        (if memChanged then [ "mem = ${st.mem};" ] else [ ])
+        ++ map (key: "${at key} = ${varCode st key};") keys
+        ++ extra
+      )
+    } }";
+
   # The state s reading mem (when memChanged) and the variables keys from the set name.
   joined =
     s: name: memChanged: keys: at:
@@ -3207,13 +3208,7 @@ let
       set = st: extra: {
         s = st;
         binds = [ ];
-        code = "{ ${
-          concatStringsSep " " (
-            (if memChanged then [ "mem = ${st.mem};" ] else [ ])
-            ++ map (key: "${at key} = ${varCode st key};") keys
-            ++ extra
-          )
-        } }";
+        code = setCode memChanged keys at st extra;
       };
       status = code: if withStatus then [ "st' = ${toString code};" ] else [ ];
     in

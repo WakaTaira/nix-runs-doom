@@ -36,9 +36,10 @@
 # `long int` and `signed long` are "long"; `long long` (with optional `int`/`signed`) is
 # "llong"; `short`, `short int` and `signed short` are "short", `unsigned short` (with
 # optional `int`) is "ushort". Specifiers may come in any order. Declarators follow C,
-# parentheses included (`int (*f[2])(void)` is an array of 2 pointers to functions);
-# pointers to arrays, arrays of functions and functions returning a function or an array
-# are unsupported.
+# parentheses included (`int (*f[2])(void)` is an array of 2 pointers to functions). A
+# declarator that makes a pointer to an array (`int (*p)[3]`), an array of functions or a
+# function returning a function or an array is unsupported; a pointer to an array type
+# named by a typedef (`typedef int A[3]; A *p;`) is accepted.
 #
 # `register` and `inline` are accepted and not recorded (`register` only at block scope
 # and on parameters, `inline` only on functions). `__attribute__((...))` may appear among
@@ -49,7 +50,7 @@
 # or after the `}` of a definition makes it packed; anything else is unsupported.
 #
 # Translation unit (line 1, col 1):
-#   { kind = "unit"; items = [ <typedef | proto | func | global | struct | enum> ]; }
+#   { kind = "unit"; items = [ <typedef | proto | func | global | struct | union | enum> ]; }
 #
 # File-scope items (position: the declared name):
 #   { kind = "typedef"; name; type; }
@@ -65,7 +66,9 @@
 # Tag definitions (position: the `struct`, `union` or `enum` keyword), at file scope as
 # items and at block scope in the decls of a "decl" statement. They come before the
 # declarators of their declaration, and a struct, union or enum defined inside a struct or
-# union before it. `struct s;` and the like without a body leave no node.
+# union before it. At file scope, `struct s;` and the like without a body leave no node; at
+# block scope, `struct s;` and `union s;` (which would declare a new tag hiding an outer
+# one) are unsupported.
 #   { kind = "struct" | "union"; name; members = [ <field> ]; packed; }
 #       name as in the struct or union type; packed tells that the attribute is given
 #   { kind = "field"; name; type; width = <expression or null>; }
@@ -229,15 +232,11 @@ let
   # Keywords that can start a type name.
   typeKeywords = setOf (
     counted
+    ++ builtins.attrNames qualifiers
     ++ [
-      "const"
-      "float"
-      "double"
       "struct"
       "union"
       "enum"
-      "volatile"
-      "restrict"
       "_Bool"
       "_Complex"
     ]
@@ -457,28 +456,34 @@ let
             attrs = [ attr ];
             i = args;
           };
-      # Fails on an attribute that is not ignored, with packedWhat the description of
-      # `packed` here (null when it is allowed); true otherwise.
+      # Fails on an attribute that is not ignored, with packedError the description used in
+      # the error for `packed` here (null when it is allowed); true otherwise.
       checkAttrs =
-        packedWhat: attrs:
+        packedError: attrs:
         builtins.all (
           a:
-          if hasAttr a.name ignoredAttrs || (a.name == "packed" && packedWhat == null) then
+          if hasAttr a.name ignoredAttrs || (a.name == "packed" && packedError == null) then
             true
           else if a.name == "packed" then
-            unsupported a.tok packedWhat
+            unsupported a.tok packedError
           else
             unsupported a.tok "attribute '${a.name}'"
         ) attrs;
       hasPacked = attrs: builtins.any (a: a.name == "packed") attrs;
-      # Index after the attributes at i, which must all be ignored ones; packedWhat
-      # describes `packed` there.
+      # Index after the attributes at i, which must all be ignored ones; packedError is the
+      # description used in the error for `packed` there.
       skipAttrs =
-        packedWhat: i:
+        packedError: i:
         let
           r = attributes i;
         in
-        builtins.seq (checkAttrs packedWhat r.attrs) r.i;
+        builtins.seq (checkAttrs packedError r.attrs) r.i;
+
+      # x, unless the specifiers sp have `inline` and do not declare a function (isFn),
+      # which fails at the token at.
+      inlineOnFunction =
+        sp: isFn: at: x:
+        if sp.inline && !isFn then fail at "'inline' can only appear on functions" else x;
 
       # ---- Declarations ----
 
@@ -654,11 +659,12 @@ let
           body = (if isEnum then enumBody else structBody) tn kw type (j + 1);
           trail = attributes body.i;
           attrs = lead.attrs ++ trail.attrs;
-          packedWhat = if isEnum then "'packed' on an enum" else null;
+          onEnum = "'packed' on an enum";
+          packedError = if isEnum then onEnum else null;
           def = body.def // (if isEnum then { } else { packed = hasPacked attrs; });
         in
         if isP j "{" then
-          builtins.seq (checkAttrs packedWhat attrs) {
+          builtins.seq (checkAttrs packedError attrs) {
             inherit type;
             defs = body.nested ++ [ def ];
             inherit (body) tn;
@@ -667,11 +673,15 @@ let
         else if !hasTag then
           fail tagTok "expected a tag name or '{' after '${kw.text}' but found ${describe tagTok}"
         else
-          builtins.seq (checkAttrs "'packed' on a ${kw.text} that is not defined here" lead.attrs) {
-            inherit type tn;
-            defs = [ ];
-            i = j;
-          };
+          builtins.seq
+            (checkAttrs (
+              if isEnum then onEnum else "'packed' on a ${kw.text} that is not defined here"
+            ) lead.attrs)
+            {
+              inherit type tn;
+              defs = [ ];
+              i = j;
+            };
 
       # Members of a struct or union after `{` -> { def; nested; tn; i; } with def its
       # definition node (without packed), nested the definitions in its members, and i
@@ -711,14 +721,10 @@ let
           fail t "expected a member declaration but found ${describe t}"
         else if sp.typedef || sp.storage != null || sp.register then
           fail t "storage class in a member declaration"
-        else if sp.inline then
-          fail t "'inline' can only appear on functions"
-        else if isP sp.i ":" then
-          unsupported (tok sp.i) "unnamed bit-field"
         else if isP sp.i ";" then
           unsupported t "anonymous struct member"
         else
-          {
+          inlineOnFunction sp false t {
             node = {
               inherit (r) fields;
               inherit (sp) defs;
@@ -743,7 +749,9 @@ let
           };
           rest = memberDeclarators tn sp (after + 1);
         in
-        if type.tag == "fn" then
+        if isP i ":" then
+          unsupported (tok i) "unnamed bit-field"
+        else if type.tag == "fn" then
           fail d.nameTok "field '${d.name}' declared as a function"
         else if isP after "," then
           {
@@ -808,7 +816,7 @@ let
             };
           };
 
-      # `*` (each optionally followed by qualifiers) -> { ptrs; i; }.
+      # `*` (each optionally followed by qualifiers and attributes) -> { ptrs; i; }.
       pointers =
         i: k:
         let
@@ -821,6 +829,8 @@ let
           && (t.kind == "keyword" && hasAttr t.text qualifiers || t.kind == "ident" && t.text == "__restrict")
         then
           pointers (i + 1) k
+        else if k > 0 && isAttr t then
+          pointers (skipAttrs "'packed' on a declaration" i) k
         else
           {
             ptrs = k;
@@ -989,12 +999,10 @@ let
           fail (tok i) "'typedef' in a parameter declaration"
         else if sp.storage != null then
           fail (tok i) "storage class in a parameter declaration"
-        else if sp.inline then
-          fail (tok i) "'inline' can only appear on functions"
         else if sp.defs != [ ] then
           unsupported (tok i) "type definition in a parameter declaration"
         else
-          {
+          inlineOnFunction sp false (tok i) {
             node = mk at "param" {
               inherit (d) name;
               type = declType sp.type d;
@@ -1103,27 +1111,29 @@ let
         in
         if sp.register then
           fail at "illegal storage class 'register' at file scope"
-        else if sp.inline && !d.isFn then
-          fail at "'inline' can only appear on functions"
         else if isDef then
-          funcDef tn' d
-        else if hasInit && (sp.typedef || d.isFn) then
+          inlineOnFunction sp d.isFn at (funcDef tn' d)
+        else if hasInit && sp.typedef then
+          fail (tok d.i) "typedef with an initializer"
+        else if hasInit && d.isFn then
           fail (tok d.i) "illegal initializer"
         else
-          builtins.seq item (
-            if isP next "," then
-              {
-                node = [ item ] ++ rest.node;
-                inherit (rest) s;
-              }
-            else
-              {
-                node = [ item ];
-                s = {
-                  i = expect next ";";
-                  tn = tn';
-                };
-              }
+          inlineOnFunction sp d.isFn at (
+            builtins.seq item (
+              if isP next "," then
+                {
+                  node = [ item ] ++ rest.node;
+                  inherit (rest) s;
+                }
+              else
+                {
+                  node = [ item ];
+                  s = {
+                    i = expect next ";";
+                    tn = tn';
+                  };
+                }
+            )
           );
 
       # Initializer at i (after `=`) -> { node; i; }: an expression or an "initlist".
@@ -1175,7 +1185,7 @@ let
         if d.type.variadic then
           unsupported d.nameTok "definition of a variadic function"
         else if unnamed != [ ] then
-          fail (builtins.head unnamed) "parameter name omitted in a function definition"
+          fail (head unnamed) "parameter name omitted in a function definition"
         else
           {
             node = [
@@ -1206,11 +1216,17 @@ let
               }
             else
               localDeclarators sp.tn sp sp.i;
+          # `struct T;` would declare a new tag hiding an outer one, which the checker does
+          # not model.
+          tagOnly = isP sp.i ";" && sp.defs == [ ] && (sp.type.tag == "struct" || sp.type.tag == "union");
         in
-        {
-          node = mk (tok i) "decl" { decls = sp.defs ++ r.decls; };
-          inherit (r) i tn;
-        };
+        if tagOnly then
+          unsupported (tok i) "block-scope tag declaration"
+        else
+          {
+            node = mk (tok i) "decl" { decls = sp.defs ++ r.decls; };
+            inherit (r) i tn;
+          };
       localDeclarators =
         tn: sp: i:
         let
@@ -1239,31 +1255,31 @@ let
               };
           rest = localDeclarators tn' sp (next + 1);
         in
-        if sp.typedef && d.isFn then
-          unsupported at "function type"
-        else if d.isFn && (sp.storage == "static" || sp.register) then
-          fail at "invalid storage class for the block-scope function '${d.name}'"
-        else if sp.inline && !d.isFn then
-          fail at "'inline' can only appear on functions"
-        else if hasInit && sp.typedef then
-          fail (tok d.i) "typedef with an initializer"
-        else if hasInit && d.isFn then
-          fail (tok d.i) "illegal initializer"
-        else if hasInit && sp.storage == "extern" then
-          fail (tok d.i) "block-scope 'extern' declaration with an initializer"
-        else if isList && sp.storage != "static" then
-          unsupported (tok (d.i + 1)) "initializer list"
-        else if isP next "," then
-          {
-            decls = [ item ] ++ rest.decls;
-            inherit (rest) i tn;
-          }
-        else
-          {
-            decls = [ item ];
-            i = expect next ";";
-            tn = tn';
-          };
+        inlineOnFunction sp d.isFn at (
+          if sp.typedef && d.isFn then
+            unsupported at "function type"
+          else if d.isFn && (sp.storage == "static" || sp.register) then
+            fail at "invalid storage class for the block-scope function '${d.name}'"
+          else if hasInit && sp.typedef then
+            fail (tok d.i) "typedef with an initializer"
+          else if hasInit && d.isFn then
+            fail (tok d.i) "illegal initializer"
+          else if hasInit && sp.storage == "extern" then
+            fail (tok d.i) "block-scope 'extern' declaration with an initializer"
+          else if isList && sp.storage != "static" then
+            unsupported (tok (d.i + 1)) "initializer list"
+          else if isP next "," then
+            {
+              decls = [ item ] ++ rest.decls;
+              inherit (rest) i tn;
+            }
+          else
+            {
+              decls = [ item ];
+              i = expect next ";";
+              tn = tn';
+            }
+        );
 
       # ---- Statements ----
 
@@ -1671,14 +1687,12 @@ let
           fail (tok i) "'typedef' in a type name"
         else if sp.storage != null || sp.register then
           fail (tok i) "storage class in a type name"
-        else if sp.inline then
-          fail (tok i) "'inline' can only appear on functions"
         else if sp.defs != [ ] then
           unsupported (tok i) "type definition in a type name"
         else if type.tag == "fn" then
           unsupported (tok sp.i) "function type"
         else
-          {
+          inlineOnFunction sp false (tok i) {
             inherit type;
             inherit (d) i;
           };

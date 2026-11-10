@@ -65,6 +65,7 @@ let
     + "|'([^'\\\n]|\\\\[^\n])*'" # character literal
     + "|[LuU]'([^'\\\n]|\\\\[^\n])*'" # prefixed character literal
     + "|[0-9][0-9A-Za-z_.]*" # preprocessing number
+    + "|[.][0-9][0-9A-Za-z_.]*" # preprocessing number starting with a dot
     + "|[A-Za-z_][0-9A-Za-z_]*" # identifier or keyword
     + "|>>=|<<=|\\.\\.\\.|->|\\+\\+|--|<<|>>|&&|\\|\\||[-*/%+&^|<>=!]="
     + "|[^${ws}]" # any other single character
@@ -309,6 +310,8 @@ let
     in
     if hasAttr c digits then
       intToken line col text
+    else if match "[.][0-9].*" text != null then
+      unsupported line col "floating-point literal '${text}'"
     else if match "[LuU]'.*" text != null then
       unsupported line col "prefixed character literal ${text}"
     else if hasAttr c identStart then

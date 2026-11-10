@@ -1377,9 +1377,9 @@ let
 
   # The value of sizeof(ty) after the declarations decls.
   sizeIn = decls: ty: ret "${decls} int sz(void) { return sizeof(${ty}); }" "sz" [ ];
-  # The memory and return value of fn of src called on its initialized data, with the
-  # symbols of src.
-  run7 =
+  # The result ({ mem; ret; }) of fn of src called on its initialized data (as dcall), with
+  # the data symbols of src in syms.
+  dcallSyms =
     src: fn: args:
     dcall src fn args // { syms = (Cc.load src).__data.symbols; };
 
@@ -1607,17 +1607,17 @@ let
     int and1(int a) { calls = 0; int x = a && f(7); return x * 10 + calls; }
     int or1(int a) { calls = 0; int x = a || f(0); return x * 10 + calls; }
     int chain(int k) { calls = 0; int x = f(1) && f(k) && f(1); return x * 10 + calls; }
-    int nested(int a, int b) { calls = 0; return (a && (b || f(1))) * 10 + calls; }
-    int notAnd(int a) { calls = 0; return !(a && f(0)) * 10 + calls; }
+    int nested(int a, int b) { calls = 0; int r = a && (b || f(1)); return r * 10 + calls; }
+    int notAnd(int a) { calls = 0; int r = !(a && f(0)); return r * 10 + calls; }
     int local(int a) { int x = 1; int y = a && (x = 5); return x * 10 + y; }
     int postb(int b) { int a = 1; int r = a && b++; return r * 10 + b; }
-    int viaPtr(int a, int *p) { return (a || (*p = 9)) * 10 + *p; }
+    int viaPtr(int a, int *p) { int r = a || (*p = 9); return r * 10 + *p; }
     int ifCond(int a) { calls = 0; if (a && f(a > 1)) return 100 + calls; return calls; }
     int whileCond(int n) { int i = 0; calls = 0; while (i < n && f(i) < 3) i++; return i * 10 + calls; }
     int forCond(int n) { int s = 0; calls = 0; for (int i = 0; i < n && f(i) != 2; i++) s += i; return s * 10 + calls; }
     int doCond(int n) { int k = 0; calls = 0; do k++; while (k < n || f(0)); return k * 10 + calls; }
-    int condCond(int a) { calls = 0; return (a && f(1) ? 5 : 6) * 10 + calls; }
-    int argRet(int a) { calls = 0; return f(a || f(3)) * 10 + calls; }
+    int condCond(int a) { calls = 0; int r = a && f(1) ? 5 : 6; return r * 10 + calls; }
+    int argRet(int a) { calls = 0; int r = f(a || f(3)); return r * 10 + calls; }
     int cache(int n) {
       int s = 0;
       for (int i = 0; i < n; i++) { s += g; if (i == 1 && (g = 100)) s += 1000; s += g; }
@@ -3554,10 +3554,6 @@ in
     true
   )
   (t "cc compile: local array throws" (compileThrows "void f(void) { int a[3]; }") true)
-  (t "cc compile: union value assignment throws"
-    (compileThrows "union u { int a; }; union u x, y; void f(void) { x = y; }")
-    true
-  )
   (t "cc compile: struct assignment throws"
     (compileThrows "struct s { int a; }; struct s x, y; void f(void) { x = y; }")
     true
@@ -3601,8 +3597,8 @@ in
   )
   (t "cc run: side effect right of &&, call right of ||"
     [
-      (ret "int f(int x) { return (x && x++) * 10 + x; }" "f" [ 0 ])
-      (ret "int f(int x) { return (x && x++) * 10 + x; }" "f" [ 4 ])
+      (ret "int f(int x) { int r = x && x++; return r * 10 + x; }" "f" [ 0 ])
+      (ret "int f(int x) { int r = x && x++; return r * 10 + x; }" "f" [ 4 ])
       (ret "int g(void) { return 1; } int f(int x) { return x || g(); }" "f" [ 0 ])
     ]
     [
@@ -3778,7 +3774,7 @@ in
       (compileThrows "int a; int b;")
       (!(tryEval (Cc.compileWith { dataBase = 4294967288; } "int a; int b;")).success)
       (!(tryEval (Cc.compileWith { dataBase = 4294967288; } "int a; int b; int c;")).success)
-      (!(tryEval (Cc.compileWith { dataBase = 4294967292; } "char a[5];")).success)
+      (!(tryEval (Cc.compileWith { dataBase = 4294967288; } "char a[9];")).success)
     ]
     [
       false
@@ -6774,7 +6770,7 @@ in
   (t "cc run: function pointer declarations, copies, comparisons and members"
     (
       let
-        r = run7 fnPtrSrc "layout" [ ];
+        r = dcallSyms fnPtrSrc "layout" [ ];
       in
       [
         r.ret
@@ -6828,14 +6824,13 @@ in
     (map compileThrows [
       "int printf(const char *fmt, ...); int f(void) { return printf(0); }"
       "int v(int a, ...) { return a; }"
-      "int bad(...);"
     ])
     [
       true
       true
-      true
     ]
   )
+  (t "cc parse: '...' without a named parameter throws" (throws "int bad(...);") true)
 
   # Unions
   (t "cc run: union sizes and alignments"
@@ -6878,7 +6873,7 @@ in
     "cc run: union members share their bytes, ->, initializers, unions in structs and structs in unions"
     (
       let
-        r = run7 unionSrc "inner" [ ];
+        r = dcallSyms unionSrc "inner" [ ];
       in
       [
         (dret unionSrc "rw" [ ])
@@ -6958,9 +6953,9 @@ in
   (t "cc run: bit-fields read and write their own bytes, like unsigned members"
     (
       let
-        r = run7 bitSrc "around" [ ];
-        h = run7 bitSrc "h16" [ ];
-        b2 = run7 bitSrc "b2f" [ ];
+        r = dcallSyms bitSrc "around" [ ];
+        h = dcallSyms bitSrc "h16" [ ];
+        b2 = dcallSyms bitSrc "b2f" [ ];
       in
       [
         (dret bitSrc "px" [ ])
@@ -7032,7 +7027,7 @@ in
   (t "cc run: float and double in prototypes, typedefs and struct members"
     (
       let
-        r = run7 floatSrc "run" [ ];
+        r = dcallSyms floatSrc "run" [ ];
       in
       [
         r.ret
@@ -7053,7 +7048,7 @@ in
     "float x;"
     "double a[2];"
     "int f(void) { float y; return 0; }"
-    "extern float x; int f(void) { return 0; }"
+    "extern float x; float x;"
     "struct f1 { char c; double d; } s; int f(void) { return s.d + 1; }"
     "struct f1 { char c; double d; } s; int f(void) { return s.d; }"
     "struct f1 { char c; double d; } s; void f(void) { s.d = 1; }"
@@ -7070,25 +7065,26 @@ in
   (t "cc run: register, inline, volatile, restrict and ignored attributes" (dret attrSrc "useAll" [
     4
   ]) 816)
-  (t "cc compile: & of a register local, register at file scope and other attributes throw" (map
-    compileThrows
-    [
-      "int f(int a) { register int x = a; int *p = &x; return *p; }"
-      "register int g;"
-      "inline int g;"
-      "struct __attribute__((aligned(8))) a { int x; };"
-      "int x __attribute__((aligned(4)));"
-      "int f(void) __attribute__((weak));"
-      "struct m { char c; int i __attribute__((packed)); };"
-      "enum __attribute__((packed)) e { A };"
-      "__attribute__((packed)) int y;"
-      "struct s { int a; }; struct __attribute__((packed)) s *p;"
-    ]
+  (t "cc compile: & of a local (register or not), register at file scope and other attributes throw" (
+    map
+      compileThrows
+      [
+        "int f(int a) { register int x = a; int *p = &x; return *p; }"
+        "register int g;"
+        "inline int g;"
+        "struct __attribute__((aligned(8))) a { int x; };"
+        "int x __attribute__((aligned(4)));"
+        "int f(void) __attribute__((weak));"
+        "struct m { char c; int i __attribute__((packed)); };"
+        "enum __attribute__((packed)) e { A };"
+        "__attribute__((packed)) int y;"
+        "struct s { int a; }; struct __attribute__((packed)) s *p;"
+      ]
   ) (genList (_: true) 10))
   (t "cc run: packed structs as clang lays them out"
     (
       let
-        r = run7 packedSrc "rw" [ ];
+        r = dcallSyms packedSrc "rw" [ ];
         at = name: k: r.syms.${name} + k;
       in
       [
@@ -7100,7 +7096,8 @@ in
         (M.loadWord r.mem (at "gp2" 2))
         (M.loadHalf r.mem (at "gp2" 6))
         (M.loadHalf r.mem (at "gpn" 7))
-        (map (n: r.syms.${n} - r.syms.gp1) [
+        (offsetsOf packedSrc [
+          "gp1"
           "gp2"
           "gp3"
           "gpn"
@@ -7117,6 +7114,7 @@ in
       9
       3
       [
+        0
         6
         14
         21
@@ -7311,13 +7309,20 @@ in
       let
         f = Cc.load staticSrc;
         m0 = f.__data.init M.empty;
+        # The results of k calls of fn in a row, each on the memory the previous one leaves.
         seq =
           fn: args: k:
           (foldl'
-            (acc: _: {
-              mem = (foldl' (g: a: g a) (f.${fn} acc.mem) args).mem;
-              rets = acc.rets ++ [ (foldl' (g: a: g a) (f.${fn} acc.mem) args).ret ];
-            })
+            (
+              acc: _:
+              let
+                r = foldl' (g: a: g a) (f.${fn} acc.mem) args;
+              in
+              {
+                inherit (r) mem;
+                rets = acc.rets ++ [ r.ret ];
+              }
+            )
             {
               mem = m0;
               rets = [ ];
@@ -7372,31 +7377,26 @@ in
     ]
   )
   (t "cc data: static locals follow the file-scope variables in source order"
-    (
-      let
-        syms = (Cc.load staticSrc).__data.symbols;
-      in
-      [
-        (map (n: syms.${n} - base) [
-          "sv"
-          "counter'c'3'32"
-          "counter2'c'4'33"
-          "hideS'sv'5'30"
-          "nest'a'7'30"
-          "nest'a'7'50"
-          "sp'p'8'33"
-          "sl't'9'28"
-          "su'z'10'27"
-          "su'pz'10'42"
-          "sa'v'11'28"
-          "self'me'12'30"
-          "self'k'12'49"
-          "fill'base'14'24"
-          "sumTo'acc'18'31"
-        ])
-        (length (attrNames syms))
-      ]
-    )
+    ([
+      (offsetsOf staticSrc [
+        "sv"
+        "counter'c'3'32"
+        "counter2'c'4'33"
+        "hideS'sv'5'30"
+        "nest'a'7'30"
+        "nest'a'7'50"
+        "sp'p'8'33"
+        "sl't'9'28"
+        "su'z'10'27"
+        "su'pz'10'42"
+        "sa'v'11'28"
+        "self'me'12'30"
+        "self'k'12'49"
+        "fill'base'14'24"
+        "sumTo'acc'18'31"
+      ])
+      (length (attrNames (Cc.load staticSrc).__data.symbols))
+    ])
     [
       [
         0
@@ -7685,6 +7685,99 @@ in
     ])
     [
       true
+      true
+    ]
+  )
+  # Review fixes of slice 7
+  (t "cc compile: block-scope tag declarations without a body throw"
+    (map compileThrows [
+      "struct T { int pad; int v; }; int mem[2] = { 11, 22 }; int t0(void) { struct T; struct T *p; struct T { int v; }; p = (struct T *)mem; return p->v; }"
+      "struct T { int pad; int v; }; int t1(void) { struct T; struct T *p = 0; struct T { short s; }; return sizeof(*p); }"
+      "union T { int a; }; int f(void) { union T; return 0; }"
+    ])
+    [
+      true
+      true
+      true
+    ]
+  )
+  (t "cc run: a pointer declared before a block-scope tag definition keeps the outer tag" (dret ''
+    struct T { int pad; int v; };
+    int mem[2] = { 11, 22 };
+    int t2(void) {
+      struct T *p = (void *)mem;
+      struct T { int v; };
+      struct T *q = (void *)mem;
+      return p->v * 100 + q->v + sizeof(*p) * 1000 + sizeof(*q) * 10000;
+    }
+  '' "t2" [ ]) 50211)
+  (t "cc compile: dataBase must be a multiple of 8"
+    [
+      (!(tryEval (Cc.compileWith { dataBase = 4; } "int a;")).success)
+      (Cc.loadWith { dataBase = 8; } "int a;").__data.symbols.a
+    ]
+    [
+      true
+      8
+    ]
+  )
+  (t "cc run: ?: of a function pointer and a null pointer constant" (dret ''
+    typedef int (*fn_t)(int);
+    fn_t g;
+    int f(int c) { fn_t p = c ? g : (void *)0; fn_t q = c ? (void *)0 : g; return (p == 0) + (q == 0) * 10; }
+  '' "f" [ 1 ]) 11)
+  (t "cc parse: a second unnamed bit-field throws, attributes after * are read"
+    [
+      (throws "struct s { unsigned a : 8, : 8, b : 16; };")
+      (showType (head (items "int * __attribute__((unused)) p;")).type)
+      (throws "int * __attribute__((aligned(4))) p;")
+    ]
+    [
+      true
+      "int*"
+      true
+    ]
+  )
+  (t "cc lex: .5 is a floating-point literal, s.x a member access"
+    [
+      (lexThrows "x = .5;")
+      (texts "s.x")
+    ]
+    [
+      true
+      [
+        "s"
+        "."
+        "x"
+        ""
+      ]
+    ]
+  )
+  (t "cc run: pointers to array types named by a typedef"
+    (
+      let
+        src = ''
+          typedef int A[3];
+          A g[2] = { { 1, 2, 3 }, { 4, 5, 6 } };
+          A *p;
+          int f(int i) {
+            p = g;
+            return (*p)[i] * 1000 + (int)((char *)(p + 1) - (char *)p) * 100 + sizeof(*p) * 10 + p[1][2];
+          }
+          int h(void) { A *q = g + 1; (*q)[0] = 40; return g[1][0] + (q - g) * 100; }
+        '';
+      in
+      [
+        (dret src "f" [ 0 ])
+        (dret src "f" [ 2 ])
+        (dret src "h" [ ])
+        (compileThrows "int (*p)[3];")
+      ]
+    )
+    [
+      2326
+      4326
+      140
       true
     ]
   )
