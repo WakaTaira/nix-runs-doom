@@ -80,7 +80,10 @@
 #     entry, writes them with M.storeRun (d = 1) or M.storeStride, and yields the
 #     variables after the loop: induction variables v0 + N * step, n -1 after n-- and 0
 #     after --n, and temporaries their value at the end of iteration N - 1 (their value on
-#     entry when N is 0). The same iteration at k = 0 gives a0 and a0'.
+#     entry when N is 0). The same iteration at k = 0 gives a0 and a0'. In the bulk
+#     form, the address of a load at an invariant pointer plus an index in [0, U] is
+#     `base + index * size` without wrapping, since the entry test has checked that it
+#     stays below 2^32; other addresses wrap as in the loop.
 #   - if/else becomes an attribute set of mem and the variables either branch changes,
 #     which the following code reads.
 #   - A statement completes normally or abruptly by return, break (to the innermost loop
@@ -233,14 +236,15 @@ let
   attrName = name: if name == "mem" || name == "exit" then "${name}'" else quoteAttr name;
 
   # ---- Emitter state ----
-  # s = { n; mem; vars; names; old; retVoid; cached; bulk; bulkLoads; bulkStore; }: n
-  # numbers the next generated name; mem is the current memory; vars maps a variable key
-  # to the code of its current value (a name or a constant); names maps a key to the C
-  # name; old is the code of the target's value while an assignment's value is emitted;
-  # retVoid tells that the function returns void; cached lists the cached reads of the
-  # enclosing loop (see "Cached reads"); bulk tells that the iteration of a bulk loop is
-  # emitted, which records its loads in bulkLoads and its store in bulkStore (see "Bulk
-  # loops").
+  # s = { n; mem; vars; names; old; retVoid; cached; bulk; bulkLoads; bulkStore;
+  # bulkForms; }: n numbers the next generated name; mem is the current memory; vars maps
+  # a variable key to the code of its current value (a name or a constant); names maps a
+  # key to the C name; old is the code of the target's value while an assignment's value
+  # is emitted; retVoid tells that the function returns void; cached lists the cached
+  # reads of the enclosing loop (see "Cached reads"); bulk tells that the iteration of a
+  # bulk loop is emitted, which records its loads in bulkLoads and its store in
+  # bulkStore, with bulkForms the forms of the read ranges of its loads in order (see
+  # "Bulk loops").
   fresh = s: base: {
     name = "${base}_${toString s.n}";
     s = s // {
@@ -542,7 +546,7 @@ let
       if key != null && s.vars ? ${key} then
         readCached s key
       else if s.bulk then
-        bulkLoad a e
+        bulkLoad (if bulkIndexed s e then indexAddr s e.expr else a) e
       else
         a // { c = load a.s.mem e.type a.c; }
     else if k == "call" then
@@ -1104,6 +1108,38 @@ let
         ];
       };
       c = load a.s.mem e.type a.c;
+    };
+
+  # Whether the load e in the iteration of a bulk loop has the read range of an invariant
+  # pointer plus an index in [0, U] (form "index", see loadRegion). The loads are recorded
+  # in evaluation order, so its position follows the loads before it and those in its
+  # address (all of them at addresses other than constants: the others are cached).
+  bulkIndexed =
+    s: e:
+    let
+      inner = length (Ch.collect (x: kindOf x == "deref" && x.expr.kind != "lit") (_: false) e.expr);
+      at = length s.bulkLoads + inner;
+    in
+    e.expr.kind == "ptradd"
+    && e.expr.op == "+"
+    && at < length s.bulkForms
+    && elemAt s.bulkForms at == "index";
+
+  # The address p (a "ptradd" node) of such a load as `base + index * size`, without
+  # wrapping: the base is a pointer (unsigned form, below 2^32), the index lies in [0, U],
+  # and the bulk form runs only when base + U * size + s - 1 < 2^32. -> { s; binds; c; }
+  indexAddr =
+    s: p:
+    let
+      r = exprs s [
+        p.ptr
+        p.index
+      ];
+      idx = elemAt r.cs 1;
+    in
+    {
+      inherit (r) s binds;
+      c = add (head r.cs) (if p.size == 1 then idx else mul idx (num p.size));
     };
 
   entryOf = s: key: head (filter (c: c.key == key) s.cached);
@@ -2453,6 +2489,7 @@ let
         bulk = true;
         bulkLoads = [ ];
         bulkStore = null;
+        bulkForms = map (r: r.form) p.regions;
       };
       seq2 =
         f: g: st:
@@ -3005,6 +3042,7 @@ let
         bulk = false;
         bulkLoads = [ ];
         bulkStore = null;
+        bulkForms = [ ];
       };
       result =
         mem: c:

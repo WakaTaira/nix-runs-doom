@@ -959,6 +959,7 @@ let
     int rSum(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[(i & 3) + (i & 4)]; i++; } return 0; }
     int rVar(unsigned char *d, unsigned char *t, int n) { int i = 0, k = 42; while (n--) { k = i & 7; *d++ = t[k]; i++; } return k; }
     int rDecl(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { int k = i & 7; *d++ = t[k]; i++; } return i; }
+    int linIdx(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[i]; i++; } return i; }
     int xRange(unsigned char *d, unsigned char *t, int n) { int x; while (n--) { x = n * 3; *d++ = t[x]; } return 0; }
     int xBreak(unsigned char *d, int n) { while (n--) { if (n == 1) break; *d++ = n; } return n; }
     int xTwo(unsigned char *d, int n) { while (n--) { *d++ = n; *d++ = n + 10; } return 0; }
@@ -1055,6 +1056,7 @@ let
     "rSum"
     "rVar"
     "rDecl"
+    "linIdx"
   ];
   bulkExcluded = [
     "xRange"
@@ -4877,6 +4879,70 @@ in
           60
           70
           10
+          10
+        ]
+        false
+      ]
+    ]
+  )
+
+  # Bulk loops: addresses of the bulk form's loads
+  (t "cc bulk: the draw loads at a table plus a bounded index add without wrapping in the bulk form"
+    (map
+      (
+        fn:
+        let
+          code = fnCode Cc.examples.draw.src fn;
+        in
+        [
+          (countIn "M\\.loadByte mem \\(B\\.add" code)
+          (countIn "M\\.loadByte mem \\(g_[0-9]+ \\+ " code)
+        ]
+      )
+      [
+        "R_DrawColumn"
+        "R_DrawSpan"
+      ]
+    )
+    [
+      [
+        0
+        2
+      ]
+      [
+        0
+        2
+      ]
+    ]
+  )
+  (t "cc bulk: a load at a table plus an induction variable keeps the wrapping add"
+    [
+      (contains "M.loadByte mem (B.add t_0 " (fnCode bulkSrc "linIdx"))
+      (contains "M.loadByte mem (t_0 + M.loadByte mem s_" (fnCode bulkSrc "rByte"))
+      (bulkTabled "linIdx" [ buf tab 3 ] buf 3)
+      (bulkTabled "linIdx" [
+        (tab + 2)
+        tab
+        3
+      ] (tab + 2) 3)
+    ]
+    [
+      true
+      true
+      [
+        3
+        [
+          10
+          20
+          30
+        ]
+        true
+      ]
+      [
+        3
+        [
+          10
+          20
           10
         ]
         false
