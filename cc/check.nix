@@ -824,13 +824,17 @@ let
     node e "deref" t { expr = litAt e (ptrTo t) ctx.addrs.${sym}; };
 
   # The array of the string literal e (a "strlit" node), at the address of its contents
-  # (see placeStrings).
+  # (see placeStrings). A literal in the operand of sizeof has no storage, so the value
+  # of its address cannot be used (by constant folding) there.
   stringObject =
     ctx: e:
     let
       t = stringType e.bytes;
+      addr =
+        ctx.strings.${stringKey e.bytes}
+        or (unsupported e "value of the address of a string literal in an operand of sizeof");
     in
-    node e "deref" t { expr = litAt e (ptrTo t) ctx.strings.${stringKey e.bytes}; };
+    node e "deref" t { expr = litAt e (ptrTo t) addr; };
 
   # A name in env.vars is a local variable, or a block-scope `extern` or `static` variable
   # ({ name; type; object; } with object its data symbol).
@@ -2649,14 +2653,16 @@ let
     let
       n = length s.bytes;
     in
-    if t.len < n then
-      fail s "initializer-string for char array is too long"
-    else
-      genList (i: {
-        addr = a + i;
-        size = 1;
-        value = elemAt s.bytes i;
-      }) n;
+    if t.len < n then fail s "initializer-string for char array is too long" else byteWrites a s.bytes;
+
+  # The 1-byte stores of the byte values bytes from address a on.
+  byteWrites =
+    a: bytes:
+    genList (i: {
+      addr = a + i;
+      size = 1;
+      value = elemAt bytes i;
+    }) (length bytes);
 
   fillList =
     env: t: a: list:
@@ -2768,16 +2774,16 @@ let
       size = sizeOf t;
       v = if isInteger t then (mkCast t (constExpr (hooksOf env) x)).value else constAddress env t x;
     in
-    if isFloat t then
-      unsupported x "floating-point initializer"
-    else
-      {
-        addr = a;
-        inherit size;
-        value = bitAnd v (B.pow2 (8 * size) - 1);
-        # The initializer, whose string literals need storage (see stringUses).
-        expr = x;
-      };
+    {
+      addr = a;
+      inherit size;
+      # The check sits on the value, so that walking the stores for their string literals
+      # (stringUses) raises no error before the values are read in order.
+      value =
+        if isFloat t then unsupported x "floating-point initializer" else bitAnd v (B.pow2 (8 * size) - 1);
+      # The initializer, whose string literals need storage (see stringUses).
+      expr = x;
+    };
 
   constAddress =
     env: t: x:
@@ -2989,14 +2995,7 @@ let
       stringOverflows = filter (s: s.addr + s.size > B.mask32 + 1) r.strings.list;
       extern = r.ctx.globals.${head externs};
       objectInits = map (w: { inherit (w) addr size value; }) (concatMap (o: o.writes) r.objects);
-      stringInits = concatMap (
-        s:
-        genList (i: {
-          addr = s.addr + i;
-          size = 1;
-          value = elemAt s.bytes i;
-        }) (length s.bytes)
-      ) r.strings.list;
+      stringInits = concatMap (s: byteWrites s.addr s.bytes) r.strings.list;
       result = {
         funcs = r.defs;
         data = {

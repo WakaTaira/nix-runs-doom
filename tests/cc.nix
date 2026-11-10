@@ -1647,6 +1647,14 @@ let
     in
     map (c: (foldl' (g: a: g a) (d.f.${head c} d.mem) (builtins.tail c)).ret) calls;
   dretAll = dretAllWith Cc.load;
+  # A test that calls each argument-less function of src named in expected on the
+  # initialized data (compiled once) and compares the results by name.
+  tRets =
+    name: src: expected:
+    let
+      d = loadData Cc.load src;
+    in
+    t name (builtins.mapAttrs (fn: _: (d.f.${fn} d.mem).ret) expected) expected;
   # __data.strings of the loaded src as [ offset size ] pairs, offsets relative to base.
   stringsOf =
     loaded:
@@ -1666,7 +1674,8 @@ let
     int calls(void) {
       return slen("hello") * 100 + slen("") * 10 + scmp("abc", ret3()) + scmp("abd", "abc") * 1000;
     }
-    int reads(void) { return "abc"[1] * 1000000 + *"abc" * 1000 + *("abc" + 2) + 2["abc"] * 0; }
+    int reads(void) { return "abc"[1] * 1000000 + *"abc" * 1000 + *("abc" + 2); }
+    int swapped(void) { return 2["abc"]; }
     int sizes(void) {
       return sizeof "abc" + sizeof("") * 10 + sizeof("ab" "cd" "e") * 100 + sizeof("abc" + 1) * 1000
         + sizeof(*"abc") * 10000;
@@ -1724,24 +1733,24 @@ let
     int *pi = "abc";
     const char *fp = "same";
     char sp[] = ("abc");
-    int i1(void) { return s8[2] * 1000 + s8[3] + s8[7] + sizeof s8 * 1000000; }
-    int i2(void) { return sizeof sn * 100 + sn[3] + sn[0] * 1000; }
-    int i3(void) { return sizeof s3 * 1000 + s3[2] + after * 10000; }
-    int i4(void) { return s4[2] + s4[3] * 10 + sizeof s4 * 1000 + sizeof sb * 100000 + sb[1] * 10000000; }
-    int i5(void) { return ss[0] * 1000 + us[0] + ss[1] * 1000000; }
-    int i6(void) { return m1.name[2] * 1000000 + m1.p[1] * 1000 + m1.v + sizeof(struct M) * 100; }
-    int i7(void) { return names[1][1] * 1000000 + names[2][2] * 1000 + names[0][1] + sizeof names * 10; }
-    int i8(void) { return (pn[0] == pn[2]) + (pn[0] != pn[1]) * 10 + pn[1][0] * 100; }
-    int i9(void) { return u1.c[1] * 1000 + u1.c[2] + sizeof u1 * 100000; }
-    int i10(void) { return sizeof n1 + n1[1][1] * 100 + sizeof n2 * 100000 + ((char *)n2)[3] * 1000000; }
-    int i11(void) { return sizeof t1 + t1[1].name[1] * 100 + t1[1].v * 100000 + t1[0].v * 1000000; }
-    int i12(void) { return sizeof t2 + t2[1].name[0] * 100 + t2[1].v * 100000 + t2[0].name[1] * 1000000; }
-    int i13(void) { return sizeof cn + cn[0][1] * 100 + cn[1][0] * 100000; }
-    int i14(void) {
+    int paddedArray(void) { return s8[2] * 1000 + s8[3] + s8[7] + sizeof s8 * 1000000; }
+    int unsizedArray(void) { return sizeof sn * 100 + sn[3] + sn[0] * 1000; }
+    int arrayWithoutTerminator(void) { return sizeof s3 * 1000 + s3[2] + after * 10000; }
+    int bracedString(void) { return s4[2] + s4[3] * 10 + sizeof s4 * 1000 + sizeof sb * 100000 + sb[1] * 10000000; }
+    int signedAndUnsignedChar(void) { return ss[0] * 1000 + us[0] + ss[1] * 1000000; }
+    int structMembers(void) { return m1.name[2] * 1000000 + m1.p[1] * 1000 + m1.v + sizeof(struct M) * 100; }
+    int arrayOfArrays(void) { return names[1][1] * 1000000 + names[2][2] * 1000 + names[0][1] + sizeof names * 10; }
+    int pointerArray(void) { return (pn[0] == pn[2]) + (pn[0] != pn[1]) * 10 + pn[1][0] * 100; }
+    int unionFirstMember(void) { return u1.c[1] * 1000 + u1.c[2] + sizeof u1 * 100000; }
+    int nestedArraysWithoutBraces(void) { return sizeof n1 + n1[1][1] * 100 + sizeof n2 * 100000 + ((char *)n2)[3] * 1000000; }
+    int structArrayWithoutBraces(void) { return sizeof t1 + t1[1].name[1] * 100 + t1[1].v * 100000 + t1[0].v * 1000000; }
+    int structArrayWithBraces(void) { return sizeof t2 + t2[1].name[0] * 100 + t2[1].v * 100000 + t2[0].name[1] * 1000000; }
+    int joinedLiterals(void) { return sizeof cn + cn[0][1] * 100 + cn[1][0] * 100000; }
+    int addressConstants(void) {
       return sizeof sz + (pp == pq) * 10 + ((char *)pu == pb) * 100 + *pp * 1000
         + ((char *)pi == pb) * 1000000;
     }
-    int i15(void) { return (fp == "same") + sizeof sp * 10 + sp[2] * 100; }
+    int sharedAndParenthesized(void) { return (fp == "same") + sizeof sp * 10 + sp[2] * 100; }
     int stl(int k) {
       static char b[] = "xy";
       static const char *q = "xy";
@@ -8216,6 +8225,7 @@ in
     (dretAll strExprSrc [
       [ "calls" ]
       [ "reads" ]
+      [ "swapped" ]
       [ "sizes" ]
       [ "ptrs" ]
       [ "retd" ]
@@ -8244,6 +8254,7 @@ in
     [
       1500
       98097099
+      99
       14614
       111122
       99
@@ -8448,54 +8459,31 @@ in
   )
 
   # Initializers
-  (t "cc run: string literals as initializers"
+  (tRets "cc run: string literals as initializers" strInitSrc {
+    paddedArray = 8099000;
+    unsizedArray = 97400;
+    arrayWithoutTerminator = 1223099;
+    bracedString = 980404099;
+    signedAndUnsignedChar = 96999255;
+    structMembers = 99102603;
+    arrayOfArrays = 99102240;
+    pointerArray = 9811;
+    unionFirstMember = 498000;
+    nestedArraysWithoutBraces = 100609916;
+    structArrayWithoutBraces = 1210016;
+    structArrayWithBraces = 102410316;
+    joinedLiterals = 9909808;
+    addressConstants = 1098114;
+    sharedAndParenthesized = 9941;
+  })
+  (t "cc run: a char array without the terminating 0 is followed by the next variable"
+    (offsetsOf strInitSrc [
+      "s3"
+      "after"
+    ])
     [
-      (dretAll strInitSrc (
-        map (n: [ n ]) [
-          "i1"
-          "i2"
-          "i3"
-          "i4"
-          "i5"
-          "i6"
-          "i7"
-          "i8"
-          "i9"
-          "i10"
-          "i11"
-          "i12"
-          "i13"
-          "i14"
-          "i15"
-        ]
-      ))
-      (offsetsOf strInitSrc [
-        "s3"
-        "after"
-      ])
-    ]
-    [
-      [
-        8099000
-        97400
-        1223099
-        980404099
-        96999255
-        99102603
-        99102240
-        9811
-        498000
-        100609916
-        1210016
-        102410316
-        9909808
-        1098114
-        9941
-      ]
-      [
-        12
-        15
-      ]
+      12
+      15
     ]
   )
   (t "cc run: string literals in static locals, sizeof in case labels, &, ! and ?:"
@@ -8554,6 +8542,35 @@ in
     "int x = (int)\"abc\";"
     "void f(void) { \"abc\" = 0; }"
   ]) (genList (_: true) 9))
+
+  (t "cc compile: the value of the address of a literal in sizeof throws unless it has storage"
+    [
+      (map compileThrows [
+        "int f(void) { return sizeof((int)\"abc\" + 1); }"
+        "int f(void) { return sizeof((int)\"abc\" ? 1 : 2); }"
+        "int f(void) { return sizeof(1 << (int)\"abc\"); }"
+        "int f(int x) { switch (x) { case sizeof((int)\"abc\" + 1): return 1; } return 0; }"
+        "int f(void) { static int n = sizeof((int)\"abc\" * 2); return n; }"
+      ])
+      (ret "const char *g(void) { return \"abc\"; } int f(void) { return sizeof((int)\"abc\" + 1); }" "f"
+        [ ]
+      )
+    ]
+    [
+      (genList (_: true) 5)
+      4
+    ]
+  )
+  (t "cc lex: a non-ASCII byte after a backslash throws"
+    (map lexThrows [
+      "x = \"\\${builtins.fromJSON ''"é"''}\";"
+      "x = '\\${builtins.fromJSON ''"é"''}';"
+    ])
+    [
+      true
+      true
+    ]
+  )
 
   # Sizes (the evaluation stack must not overflow)
   (t "cc run: 2000 distinct string literals in one initializer"

@@ -299,9 +299,9 @@ let
   # character. The capture groups give the escape and the text after the backslash.
   escapeRe = "(\\\\([0-7][0-7]?[0-7]?|x[0-9A-Fa-f]*|.))";
 
-  # Byte value of the escape e (the text after the backslash) in the literal at line:col.
+  # Byte value of the escape e (the text after the backslash) in a `what` at line:col.
   escapeValue =
-    line: col: e:
+    line: col: what: e:
     let
       c = substring 0 1 e;
       digits = substring 1 (stringLength e - 1) e;
@@ -318,6 +318,8 @@ let
         hexValue digits
     else if hasAttr e escapes then
       escapes.${e}
+    else if !hasAttr e asciiCodes then
+      unsupported line col "non-ASCII byte in a ${what}"
     else
       fail line col "unknown escape sequence '\\${e}'";
 
@@ -334,9 +336,9 @@ let
     line: col: what: body:
     let
       bytes = concatLists (
-        map (p: if isList p then [ (escapeValue line col (elemAt p 1)) ] else plainBytes line col what p) (
-          split escapeRe body
-        )
+        map (
+          p: if isList p then [ (escapeValue line col what (elemAt p 1)) ] else plainBytes line col what p
+        ) (split escapeRe body)
       );
     in
     builtins.deepSeq bytes bytes;

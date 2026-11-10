@@ -125,7 +125,7 @@
 #   { kind = "strlit"; bytes; }                            string literal (adjacent ones
 #       joined, see cc/lex.nix); bytes are the byte values without the terminating 0;
 #       position: the first literal
-#   { kind = "ident"; name; }                            variable; position: the name
+#   { kind = "ident"; name; }                              variable; position: the name
 #   { kind = "call"; name; args = [ <expression> ]; }      direct call; position: the name
 #   { kind = "cast"; type; expr; }                         position: the `(`
 #   { kind = "unary"; op; expr; }                          op: "-" "~" "!"; position: op
