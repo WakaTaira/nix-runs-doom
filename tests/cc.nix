@@ -1272,6 +1272,88 @@ let
       true
     ]) pageCounts;
 
+  # ---- Leaf reads and live bindings of bulk loops ----
+  # The functions of pageSrc with a M.readLeaves that fails when it is called.
+  unleafedFns = pageFnsWith (
+    markedM
+    // {
+      readLeaves =
+        _: _: _:
+        throw "readLeaves was called";
+    }
+  );
+  # Whether fn of pageSrc runs with the failing M.readLeaves.
+  runsUnleafed =
+    mem: fn: args:
+    let
+      r = pageOnWith unleafedFns mem fn args 0 0;
+    in
+    (tryEval (builtins.deepSeq r r)).success;
+  # The N < T side of the values of a bulk form with page reads in code: from the `else`
+  # that binds the leaves to the end of the arguments of its genList.
+  leafSide =
+    code:
+    head (
+      builtins.split "\n *\\) [A-Za-z_]+_[0-9]+;\n" (
+        elemAt (builtins.split "\n *else\n *let\n *lv_" code) 2
+      )
+    );
+  # The bulk form of the first loop of code, up to the loop that runs when its entry
+  # test fails.
+  bulkPart = code: head (builtins.split "R\\.loopDo" code);
+
+  # Expected values follow the C semantics. In tmpIdx the index is a temporary, selfAddr
+  # stores the low byte of its own address (the value is evaluated before d++), and
+  # condAfter stores the n that the condition's n-- leaves. plain has no bulk loop; after
+  # has a bulk loop followed by a loop with two stores.
+  liveSrc = ''
+    int tmpIdx(unsigned char *d, unsigned char *t, int n) { int i = 0, k = 99; while (n--) { k = (i + 3) & 63; *d++ = t[k] + n; i++; } return k; }
+    int selfAddr(unsigned char *d, int n) { while (n--) *d++ = (int)d; return 0; }
+    int condAfter(unsigned char *d, int n) { while (n--) *d++ = n + 1; return n; }
+    int plain(unsigned char *d, int n) { int s = 0; while (n--) { *d++ = n; *d++ = n + 1; s += n; } return s; }
+    int after(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[i & 63]; i++; } int m = 3; while (m--) { *d++ = m; *d++ = m + 10; } return i; }
+  '';
+  liveCode = fnCode liveSrc;
+  liveFns = import (builtins.toFile "cc-live.nix" (Cc.compile liveSrc)) {
+    M = markedM;
+    inherit B;
+    R = import ../cc/runtime.nix;
+  };
+  liveOn = pageOnWith liveFns;
+  # The counts of the live-binding tests: none, a few, and both sides of T = 32.
+  liveCounts = [
+    0
+    1
+    5
+    31
+    32
+    40
+  ];
+  # The output of plain by the compiler of slice 5 (981b978), which has no bulk loop.
+  plainCode = concatStringsSep "\n" [
+    "    mem: d_0: n_0:"
+    "    let"
+    "      l_8 = R.loopDo ("
+    "        v_1:"
+    "        let"
+    "          n_2 = wrapInt (v_1.n - 1);"
+    "        in"
+    "        if v_1.n != 0 then"
+    "          let"
+    "            d_3 = B.add v_1.d 1;"
+    "            mem_4 = M.storeByte v_1.mem v_1.d n_2;"
+    "            d_5 = B.add d_3 1;"
+    "            mem_6 = M.storeByte mem_4 d_3 (wrapInt (n_2 + 1));"
+    "            s_7 = wrapInt (v_1.s + n_2);"
+    "          in"
+    "          v_1 // { mem = mem_6; d = d_5; n = n_2; s = s_7; }"
+    "        else"
+    "          v_1 // { n = n_2; exit = true; }"
+    "      ) { mem = mem; d = d_0; n = n_0; s = 0; };"
+    "    in"
+    "    { mem = l_8.mem; ret = l_8.s; };"
+  ];
+
   fixmulSrc = import ../cc/examples/spike.nix;
   fixmul =
     a: b:
@@ -5071,7 +5153,7 @@ in
         in
         [
           (countIn "M\\.loadByte mem \\(B\\.add" code)
-          (countIn "M\\.loadByte mem \\(g_[0-9]+ \\+ " code)
+          (countIn "M\\.leafByte lv_[0-9]+ \\(lo_[0-9]+ \\+ " code)
         ]
       )
       [
@@ -5093,7 +5175,8 @@ in
   (t "cc bulk: a load at a table plus an induction variable keeps the wrapping add"
     [
       (contains "M.loadByte mem (B.add t_0 " (fnCode bulkSrc "linIdx"))
-      (contains "M.loadByte mem (t_0 + M.loadByte mem s_" (fnCode bulkSrc "rByte"))
+      (countIn "M\\.leafByte lv_[0-9]+ \\(lo_[0-9]+ \\+ M\\.loadByte mem s_" (fnCode bulkSrc "rByte"))
+      (contains "M.loadWord mem (t_0 + " (fnCode bulkSrc "words"))
       (bulkTabled "linIdx" [ buf tab 3 ] buf 3)
       (bulkTabled "linIdx" [
         (tab + 2)
@@ -5103,6 +5186,7 @@ in
     ]
     [
       true
+      1
       true
       [
         3
@@ -6069,6 +6153,253 @@ in
       true
       false
       true
+    ]
+  )
+
+  # Leaf reads of bulk loops: where they are emitted
+  (t "cc leaf: below the threshold the draw loops read their tables from the leaves"
+    (map
+      (
+        fn:
+        let
+          side = leafSide (fnCode Cc.examples.draw.src fn);
+        in
+        [
+          (countIn "M\\.readLeaves mem" side)
+          (countIn "M\\.leafByte" side)
+          (countIn "M\\.loadByte mem \\(" side)
+          (countIn "M\\.readPages" side)
+        ]
+      )
+      [
+        "R_DrawColumn"
+        "R_DrawSpan"
+      ]
+    )
+    [
+      [
+        2
+        2
+        0
+        0
+      ]
+      [
+        2
+        2
+        0
+        0
+      ]
+    ]
+  )
+  (t "cc leaf: reads of one table share their leaves like their pages"
+    (map
+      (fn: [
+        (countIn "M\\.readLeaves" (pageCode fn))
+        (countIn "M\\.readPages" (pageCode fn))
+      ])
+      [
+        "twice"
+        "two"
+        "lens"
+        "conv"
+        "huge"
+        "copy"
+      ]
+    )
+    [
+      [
+        1
+        1
+      ]
+      [
+        2
+        2
+      ]
+      [
+        2
+        2
+      ]
+      [
+        1
+        1
+      ]
+      [
+        0
+        0
+      ]
+      [
+        0
+        0
+      ]
+    ]
+  )
+
+  # Leaf reads of bulk loops: when they are evaluated
+  (t "cc leaf: the leaves are read only below the threshold, in bulk, and for N >= 1"
+    [
+      (runsUnleafed fMem "colmap" [
+        pbuf
+        tf
+        0
+      ])
+      (runsUnleafed M.empty "zero" [
+        pbuf
+        4294967280
+        0
+      ])
+      (runsUnleafed fMem "colmap" [
+        (tf + 10)
+        tf
+        20
+      ])
+      (runsUnleafed fMem "colmap" [
+        pbuf
+        tf
+        32
+      ])
+      (runsUnleafed qMem "big" [
+        pbuf
+        tq
+        136
+      ])
+      (runsUnleafed fMem "colmap" [
+        pbuf
+        tf
+        31
+      ])
+      (runsUnleafed qMem "big" [
+        pbuf
+        tq
+        135
+      ])
+      (runsUnpaged fMem "colmap" [
+        pbuf
+        tf
+        1
+      ])
+      (runsUnpaged qMem "big" [
+        pbuf
+        tq
+        135
+      ])
+    ]
+    [
+      true
+      true
+      true
+      true
+      true
+      false
+      false
+      true
+      true
+    ]
+  )
+  (t "cc leaf: a write range over the table runs the loop below the threshold too"
+    (pageOn fMem "colmap" [
+      (tf + 10)
+      tf
+      20
+    ] (tf + 10) 20)
+    [
+      20
+      (genList (k: tfOf (k - 10 * (k / 10))) 20)
+      false
+    ]
+  )
+
+  # Live bindings of bulk loops
+  (t "cc live: the bulk forms of the draw loops bind only what their values use"
+    (map
+      (
+        fn:
+        let
+          bulk = bulkPart (fnCode Cc.examples.draw.src fn);
+        in
+        [
+          (countIn "dest_[0-9]+ = B\\.add dest_" bulk)
+          (countIn "position_[0-9]+ = B\\.add position_" bulk)
+          (countIn "count_[0-9]+ = wrapInt \\(count_" bulk)
+          (countIn "count_[0-9]+ = count_[0-9]+ - k_" bulk)
+        ]
+      )
+      [
+        "R_DrawColumn"
+        "R_DrawSpan"
+      ]
+    )
+    [
+      [
+        0
+        0
+        0
+        0
+      ]
+      [
+        0
+        0
+        0
+        0
+      ]
+    ]
+  )
+  (t "cc live: an index temporary, the stored address and the n after n-- are kept"
+    [
+      (map (n: liveOn fMem "tmpIdx" [ pbuf tf n ] pbuf n) liveCounts)
+      (map (n: liveOn M.empty "selfAddr" [ pbuf n ] pbuf n) liveCounts)
+      (map (n: liveOn M.empty "condAfter" [ pbuf n ] pbuf n) liveCounts)
+      (map (fn: countIn "builtins\\.genList" (liveCode fn)) [
+        "tmpIdx"
+        "selfAddr"
+        "condAfter"
+      ])
+    ]
+    [
+      (map (n: [
+        (if n == 0 then 99 else bitAnd (n + 2) 63)
+        (genList (k: bitAnd (tfOf (bitAnd (k + 3) 63) + n - 1 - k) 255) n)
+        (n >= 1)
+      ]) liveCounts)
+      (map (n: [
+        0
+        (genList (k: bitAnd (pbuf + k) 255) n)
+        (n >= 1)
+      ]) liveCounts)
+      (map (n: [
+        (-1)
+        (genList (k: n - k) n)
+        (n >= 1)
+      ]) liveCounts)
+      [
+        2
+        1
+        1
+      ]
+    ]
+  )
+  (t
+    "cc live: a function without a bulk loop compiles as in slice 5, one with a bulk loop and a loop after it runs like C"
+    [
+      (liveCode "plain" == plainCode)
+      (map (n: liveOn fMem "after" [ pbuf tf n ] pbuf (n + 6)) liveCounts)
+    ]
+    [
+      true
+      (map (n: [
+        n
+        (
+          genList (k: tfOf (bitAnd k 63)) n
+          ++ [
+            2
+            12
+            1
+            11
+            0
+            10
+          ]
+        )
+        (n >= 1)
+      ]) liveCounts)
     ]
   )
 ]
