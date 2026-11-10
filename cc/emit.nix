@@ -19,6 +19,31 @@
 #     tests inside the body and sets `exit`.
 #   - if/else becomes an attribute set of mem and the variables either branch changes,
 #     which the following code reads.
+#   - A statement completes normally or abruptly by return, break (to the innermost loop
+#     or switch) or continue (to the innermost loop). Functions, loops and if/else without
+#     return, break or continue in them are translated as above. Otherwise the code of a
+#     region (a function body, one iteration of a loop body, a switch section, a branch
+#     joined into a set) is built in continuation-passing style: the statements after one
+#     that may complete abruptly run only on its normal completion, in the form
+#     `if <not normal> then <result of the region so far> else <rest>`.
+#       - An if/else of which a branch cannot complete normally nests the rest of the
+#         region inside the other branch. Otherwise the branches end in a join set with
+#         mem, the variables assigned in them, st' (status: 0 normal, 1 return, 2 break,
+#         3 continue) and ret' (the return value, on return), and the rest dispatches on
+#         st'.
+#       - Each construct consumes the completions aimed at it: a switch its break, a loop
+#         its break and continue; return goes on to the function. In a loop body, break
+#         sets exit, continue skips the rest of the body, and return sets exit and the
+#         loop variables done' (true) and ret'. Neither runs the for step or the do/while
+#         condition, which normal completion and continue do. Only a loop whose body
+#         contains a return carries done' and ret'; the code after it tests done'.
+#       - A switch binds its controlling value once, finds the section of the first
+#         matching case (else default, else past the end) with an if chain, then runs the
+#         sections in order, each one when its index is at least the found one and the
+#         status is normal. Every section yields a set of mem, the variables assigned in
+#         the sections, the variables declared at the top of the body (0 before their
+#         declaration runs), and st' when a section may complete abruptly.
+#       - A non-void function that reaches its end returns 0.
 #   - Side effects in expressions (assignments, ++ and --, calls, stores) become let
 #     bindings in C evaluation order; pure expressions stay nested.
 #   - Conditions are Nix booleans; a comparison is 0 or 1 only where its value is used.
@@ -43,12 +68,18 @@
 # function, and `<C name>_fn` for functions, so they collide neither with each other nor
 # with M, B, R, mem, wrapInt and the builtins the output uses. The attribute __data
 # cannot clash with a C function, since identifiers starting with `__` are reserved in C.
+# In the loop, join and switch sets a variable is its C name, with ' appended to mem and
+# exit; the generated fields st', ret' and done' contain a ', so they cannot clash. A
+# variable declared in a switch body that hides one the sections assign is `<C name>'<n>`.
 let
   Ch = import ./check.nix;
   T = Ch.types;
   B = import ../lib/bits.nix;
   inherit (builtins)
+    all
+    any
     attrNames
+    concatLists
     concatMap
     concatStringsSep
     elem
@@ -62,6 +93,7 @@ let
     map
     removeAttrs
     replaceStrings
+    tail
     ;
 
   kindOf = x: x.kind or null;
@@ -126,10 +158,10 @@ let
   attrName = name: if name == "mem" || name == "exit" then "${name}'" else quoteAttr name;
 
   # ---- Emitter state ----
-  # s = { n; mem; vars; names; old; }: n numbers the next generated name; mem is the
-  # current memory; vars maps a variable key to the code of its current value (a name or a
-  # constant); names maps a key to the C name; old is the code of the target's value while
-  # an assignment's value is emitted.
+  # s = { n; mem; vars; names; old; retVoid; }: n numbers the next generated name; mem is
+  # the current memory; vars maps a variable key to the code of its current value (a name
+  # or a constant); names maps a key to the C name; old is the code of the target's value
+  # while an assignment's value is emitted; retVoid tells that the function returns void.
   fresh = s: base: {
     name = "${base}_${toString s.n}";
     s = s // {
@@ -904,39 +936,40 @@ let
       effect s n.expr
     else if k == "if" then
       ifStmt s n
-    else if k == "while" then
-      loop s {
-        inherit (n) cond body;
-        step = null;
-        isDo = false;
-      }
-    else if k == "do" then
-      loop s {
-        inherit (n) cond body;
-        step = null;
-        isDo = true;
-      }
-    else if k == "for" then
-      let
-        i =
-          if n.init == null then
-            {
-              inherit s;
-              binds = [ ];
-            }
-          else
-            stmt s n.init;
-        l = loop i.s {
-          inherit (n) cond body step;
-          isDo = false;
-        };
-      in
-      {
-        inherit (l) s;
-        binds = i.binds ++ l.binds;
-      }
+    else if isLoop n then
+      loopStmt s n
+    else if k == "switch" then
+      switchChain s n
     else
       throw "cc: internal error: unexpected statement '${k}'";
+
+  isLoop =
+    n:
+    elem (kindOf n) [
+      "while"
+      "do"
+      "for"
+    ];
+
+  # A while, do or for statement. -> { s; binds; name; } with name the loop's result.
+  loopStmt =
+    s: n:
+    let
+      i =
+        if n.kind != "for" || n.init == null then
+          {
+            inherit s;
+            binds = [ ];
+          }
+        else
+          stmt s n.init;
+      l = loop i.s {
+        inherit (n) cond body;
+        step = n.step or null;
+        isDo = n.kind == "do";
+      };
+    in
+    l // { binds = i.binds ++ l.binds; };
 
   # An uninitialized variable reads as 0, also inside its own initializer.
   declVar =
@@ -1067,71 +1100,88 @@ let
             ++ extra;
         in
         if fields == [ ] then v else "${v} // { ${concatStringsSep " " fields} }";
-      bodyAndStep =
-        s0:
-        let
-          b = stmt s0 l.body;
-          st =
-            if l.step == null then
-              {
-                inherit (b) s;
-                binds = [ ];
-              }
-            else
-              effect b.s l.step;
-        in
-        {
-          inherit (st) s;
-          binds = b.binds ++ st.binds;
-        };
-      always = "(_: true)";
-      gen =
+      # The loop carries done' and ret' when a return in its body leaves the function.
+      returns = (exits l.body) ? return;
+      # The end of an iteration after the body, normal or by continue: the for step, or the
+      # do/while condition setting exit. -> { s; binds; code; }
+      next =
+        st:
         if l.isDo then
           let
-            b = stmt inner l.body;
-            c = cond b.s l.cond true;
+            c = cond st l.cond true;
           in
           {
-            cond = always;
-            body = renderLet (b.binds ++ c.binds) (update c.s [ "exit = ${c.c.code};" ]);
-            inherit (c) s;
+            inherit (c) s binds;
+            code = update c.s [ "exit = ${c.c.code};" ];
           }
-        else if l.cond == null then
+        else if l.step == null then
+          {
+            s = st;
+            binds = [ ];
+            code = update st [ ];
+          }
+        else
           let
-            b = bodyAndStep inner;
+            r = effect st l.step;
+          in
+          {
+            inherit (r) s binds;
+            code = update r.s [ ];
+          };
+      leave = st: extra: {
+        s = st;
+        binds = [ ];
+        code = update st ([ "exit = true;" ] ++ extra);
+      };
+      handlers = {
+        continue = next;
+        break = st: leave st [ ];
+        return =
+          st: c: leave st ([ "done' = true;" ] ++ (if c == null then [ ] else [ "ret' = ${c.code};" ]));
+      };
+      # The body from state s0 followed by next. -> { s; binds; code; }
+      bodyThen = s0: stmtK handlers s0 l.body next;
+      always = "(_: true)";
+      gen =
+        if l.isDo || l.cond == null then
+          let
+            b = bodyThen inner;
           in
           {
             cond = always;
-            body = renderLet b.binds (update b.s [ ]);
+            body = renderLet b.binds b.code;
             inherit (b) s;
           }
         else if !hasEffects l.cond then
           let
             c = cond inner l.cond false;
-            b = bodyAndStep c.s;
+            b = bodyThen c.s;
           in
           {
             cond = "(${v}: ${c.c.code})";
-            body = renderLet b.binds (update b.s [ ]);
+            body = renderLet b.binds b.code;
             inherit (b) s;
           }
         else
           # The condition's side effects stay when it fails, so it is tested in the body.
           let
             c = cond inner l.cond false;
-            b = bodyAndStep c.s;
+            b = bodyThen c.s;
           in
           {
             cond = always;
-            body = renderLet c.binds "if ${c.c.code} then\n  ${
-              indent (renderLet b.binds (update b.s [ ]))
-            }\nelse\n  ${update c.s [ "exit = true;" ]}";
+            body = renderLet c.binds "if ${c.c.code} then\n  ${indent (renderLet b.binds b.code)}\nelse\n  ${update c.s [ "exit = true;" ]}";
             inherit (b) s;
           };
       res = fresh (s // { inherit (gen.s) n; }) "l";
-      init = concatStringsSep " " ([ "mem = ${s.mem};" ] ++ map (k: "${at k} = ${s.vars.${k}};") carried);
+      init = concatStringsSep " " (
+        [ "mem = ${s.mem};" ]
+        ++ map (k: "${at k} = ${s.vars.${k}};") carried
+        ++ (if !returns then [ ] else [ "done' = false;" ] ++ (if s.retVoid then [ ] else [ "ret' = 0;" ]))
+      );
     in
     {
+      inherit (res) name;
       s = res.s // {
         mem = "${res.name}.mem";
         vars =
@@ -1150,6 +1200,392 @@ let
         }
       ];
     };
+
+  # ---- Abrupt completion (see the header) ----
+  # A region is emitted by stmtK handlers s n k -> { s; binds; code; }, the code of the
+  # region from the statement n on being `renderLet binds code`; only s.n of the returned
+  # state is used further. k : state -> { s; binds; code; } is the rest of the region after
+  # a normal completion of n, called at most once. handlers = { return; break; continue; }
+  # end the region on an abrupt completion: `return st c` (c the value, null in a void
+  # function), `break st` and `continue st`, each -> { s; binds; code; }.
+
+  abruptKinds = [
+    "return"
+    "break"
+    "continue"
+  ];
+  statusOf = {
+    return = 1;
+    break = 2;
+    continue = 3;
+  };
+
+  # The abrupt completions that can leave the statement n: a set with the attributes
+  # return, break and continue that apply.
+  exits =
+    n:
+    let
+      k = kindOf n;
+      merged = foldl' (acc: x: acc // exits x) { };
+    in
+    if elem k abruptKinds then
+      { ${k} = true; }
+    else if k == "block" then
+      merged n.items
+    else if k == "if" then
+      merged [
+        n.thenStmt
+        n.elseStmt
+      ]
+    else if isLoop n then
+      (if (exits n.body) ? return then { return = true; } else { })
+    else if k == "switch" then
+      removeAttrs (merged (concatLists n.sections)) [ "break" ]
+    else
+      { };
+
+  # Whether the statement n can complete normally; false when every path through it ends
+  # in return, break or continue.
+  canNormal =
+    n:
+    let
+      k = n.kind;
+    in
+    if elem k abruptKinds then
+      false
+    else if k == "block" then
+      all canNormal n.items
+    else if k == "if" then
+      n.elseStmt == null || canNormal n.thenStmt || canNormal n.elseStmt
+    else
+      true;
+
+  # Whether running x may rebind the memory: stores, calls and loops do.
+  touchesMem =
+    x:
+    Ch.collect (
+      y:
+      elem (kindOf y) [
+        "call"
+        "while"
+        "do"
+        "for"
+      ]
+      || kindOf y == "assign" && y.target.kind != "var"
+    ) (_: false) x != [ ];
+
+  # The result r of the first part of a region followed by the code o of the rest.
+  andThen = r: o: o // { binds = r.binds ++ o.binds; };
+
+  stmtK =
+    handlers: s: n: k:
+    let
+      kind = n.kind;
+    in
+    if exits n == { } then
+      let
+        r = stmt s n;
+      in
+      andThen r (k r.s)
+    else if kind == "return" then
+      let
+        r = if n.expr == null then pure s null else expr s n.expr;
+      in
+      andThen r (handlers.return r.s r.c)
+    else if kind == "break" || kind == "continue" then
+      handlers.${kind} s
+    else if kind == "block" then
+      seqK handlers s n.items k
+    else if kind == "if" then
+      ifK handlers s n k
+    else if kind == "switch" then
+      switchK handlers s n k
+    else
+      loopK handlers s n k;
+
+  # The statements ns in sequence: the leading ones that cannot complete abruptly stay
+  # plain bindings, and the rest follows the first one that can.
+  seqK =
+    handlers: s: ns: k:
+    let
+      count = length ns;
+      firstAbrupt = i: if i == count || exits (elemAt ns i) != { } then i else firstAbrupt (i + 1);
+      split = firstAbrupt 0;
+      pre = seqStmts stmt s (genList (elemAt ns) split);
+      rest = genList (i: elemAt ns (split + 1 + i)) (count - split - 1);
+    in
+    andThen pre (
+      if split == count then
+        k pre.s
+      else
+        stmtK handlers pre.s (elemAt ns split) (st: seqK handlers st rest k)
+    );
+
+  # `if c then <th> else <el>` of two region results.
+  ifCode =
+    c: th: el:
+    "if ${c.code} then\n  ${indent (renderLet th.binds th.code)}\nelse\n  ${indent (renderLet el.binds el.code)}";
+
+  ifK =
+    handlers: s: n: k:
+    let
+      c = cond s n.cond false;
+      nests = !canNormal n.thenStmt || n.elseStmt != null && !canNormal n.elseStmt;
+    in
+    andThen c ((if nests then ifNested else ifJoin) handlers c.s c.c n k);
+
+  # A branch cannot complete normally, so the rest k follows inside the other one.
+  ifNested =
+    handlers: s1: c: n: k:
+    let
+      th = stmtK handlers s1 n.thenStmt k;
+      s2 = s1 // {
+        inherit (th.s) n;
+      };
+      el = if n.elseStmt == null then k s2 else stmtK handlers s2 n.elseStmt k;
+    in
+    {
+      inherit (el) s;
+      binds = [ ];
+      code = ifCode c th el;
+    };
+
+  # Both branches can complete normally: they end in a join set, then the rest dispatches.
+  ifJoin =
+    handlers: s1: c: n: k:
+    let
+      branches = [
+        n.thenStmt
+        n.elseStmt
+      ];
+      assigned = assignedKeys branches;
+      keys = filter (key: elem key assigned) (attrNames s1.vars);
+      memChanged = touchesMem branches;
+      at = key: attrName s1.names.${key};
+      j = joinRegion memChanged keys at true;
+      th = stmtK j.handlers s1 n.thenStmt j.end;
+      s2 = s1 // {
+        inherit (th.s) n;
+      };
+      el = if n.elseStmt == null then j.end s2 else stmtK j.handlers s2 n.elseStmt j.end;
+      f = fresh (s1 // { inherit (el.s) n; }) "if";
+      d = dispatch handlers (joined f.s f.name memChanged keys at) f.name (exits n) k;
+    in
+    andThen {
+      binds = [
+        {
+          inherit (f) name;
+          code = ifCode c th el;
+        }
+      ];
+    } d;
+
+  # The state s reading mem (when memChanged) and the variables keys from the set name.
+  joined =
+    s: name: memChanged: keys: at:
+    s
+    // {
+      mem = if memChanged then "${name}.mem" else s.mem;
+      vars =
+        s.vars
+        // listToAttrs (
+          map (key: {
+            name = key;
+            value = "${name}.${at key}";
+          }) keys
+        );
+    };
+
+  # The end and handlers of a region that yields a set of mem (when memChanged) and the
+  # variables keys of the state, with st' when withStatus and ret' on a return with a value.
+  joinRegion =
+    memChanged: keys: at: withStatus:
+    let
+      set = st: extra: {
+        s = st;
+        binds = [ ];
+        code = "{ ${
+          concatStringsSep " " (
+            (if memChanged then [ "mem = ${st.mem};" ] else [ ])
+            ++ map (key: "${at key} = ${st.vars.${key}};") keys
+            ++ extra
+          )
+        } }";
+      };
+      status = code: if withStatus then [ "st' = ${toString code};" ] else [ ];
+    in
+    {
+      end = st: set st (status 0);
+      handlers = {
+        return =
+          st: c: set st (status statusOf.return ++ (if c == null then [ ] else [ "ret' = ${c.code};" ]));
+        break = st: set st (status statusOf.break);
+        continue = st: set st (status statusOf.continue);
+      };
+    };
+
+  # After the set name with status st': each completion in ex (as from exits) goes to its
+  # handler, and the normal one (and any other) to k.
+  dispatch =
+    handlers: s: name: ex: k:
+    let
+      go =
+        kinds: st:
+        if kinds == [ ] then
+          k st
+        else
+          let
+            kind = head kinds;
+            h =
+              if kind == "return" then
+                handlers.return st (if st.retVoid then null else atom "${name}.ret'")
+              else
+                handlers.${kind} st;
+            rest = go (tail kinds) (st // { inherit (h.s) n; });
+          in
+          {
+            inherit (rest) s;
+            binds = [ ];
+            code = ifCode (atom "${name}.st' == ${toString statusOf.${kind}}") h rest;
+          };
+    in
+    go (filter (kind: ex ? ${kind}) abruptKinds) s;
+
+  # A loop whose body contains a return: after it, done' tells whether the return left it.
+  loopK =
+    handlers: s: n: k:
+    let
+      l = loopStmt s n;
+      h = handlers.return l.s (if s.retVoid then null else atom "${l.name}.ret'");
+      o = k (l.s // { inherit (h.s) n; });
+    in
+    {
+      inherit (o) s;
+      inherit (l) binds;
+      code = ifCode (atom "${l.name}.done'") h o;
+    };
+
+  # A switch that only its own break can leave early.
+  switchK =
+    handlers: s: n: k:
+    let
+      w = switchChain s n;
+    in
+    andThen w (dispatch handlers w.s w.name (exits n) k);
+
+  # The switch n run up to the end of its last section. -> { s; binds; name; } with name
+  # the set of the last section (null when there is none).
+  switchChain =
+    s: n:
+    let
+      x = expr s n.cond;
+      xs = share x.s "sw" x.c;
+      sections = n.sections;
+      count = length sections;
+      fallback = if n.default == null then count else n.default;
+      cases = n.cases;
+      # The chain is built from the last case backwards, so the first case is tested first.
+      position = foldl' (
+        acc: i:
+        let
+          case = elemAt cases (length cases - 1 - i);
+        in
+        low "if ${
+          (infixN 7 "==" xs.c (num case.value)).code
+        } then ${toString case.section} else ${acc.code}"
+      ) (num fallback) (genList (i: i) (length cases));
+      ps = share xs.s "pos" position;
+      declared = concatMap (item: if item.kind == "decl" then map (d: d.var) item.vars else [ ]) (
+        n.skipped ++ concatLists sections
+      );
+      s0 = ps.s // {
+        vars = ps.s.vars // listToAttrs (map (var: nameValue var.key "0") declared);
+        names = ps.s.names // listToAttrs (map (var: nameValue var.key var.name) declared);
+      };
+      assigned = assignedKeys sections;
+      keys = filter (key: elem key assigned) (attrNames ps.s.vars) ++ map (var: var.key) declared;
+      memChanged = touchesMem sections;
+      withStatus = any (item: exits item != { }) (concatLists sections);
+      attrs = uniqueAttrs s0.names keys;
+      at = key: attrs.${key};
+      j = joinRegion memChanged keys at withStatus;
+      step =
+        acc: i:
+        let
+          prev = acc.name;
+          sIn = if prev == null then acc.s else joined acc.s prev memChanged keys at;
+          guard =
+            (if prev != null && withStatus then "${prev}.st' == 0 && " else "")
+            + "${ps.c.code} <= ${toString i}";
+          body = seqK j.handlers sIn (elemAt sections i) j.end;
+          skip =
+            if prev == null then
+              j.end acc.s
+            else
+              {
+                binds = [ ];
+                code = prev;
+              };
+          f = fresh (acc.s // { inherit (body.s) n; }) "w";
+        in
+        {
+          s = acc.s // {
+            inherit (f.s) n;
+          };
+          inherit (f) name;
+          binds = acc.binds ++ [
+            {
+              inherit (f) name;
+              code = ifCode (atom guard) body skip;
+            }
+          ];
+        };
+      chain = foldl' step {
+        s = s0;
+        name = null;
+        binds = [ ];
+      } (genList (i: i) count);
+    in
+    if count == 0 || keys == [ ] && !memChanged && !withStatus then
+      {
+        s = s0;
+        binds = x.binds ++ xs.binds;
+        name = null;
+      }
+    else
+      {
+        s = joined chain.s chain.name memChanged keys at;
+        binds = x.binds ++ xs.binds ++ ps.binds ++ chain.binds;
+        inherit (chain) name;
+      };
+
+  nameValue = name: value: { inherit name value; };
+
+  # The attribute names of the variables keys in a set (attrName of the C name), unique: a
+  # name already taken by an earlier key becomes `<C name>'<position>`. -> { <key> = <name>; }
+  uniqueAttrs =
+    names: keys:
+    (foldl'
+      (
+        acc: i:
+        let
+          key = elemAt keys i;
+          plain = attrName names.${key};
+          name = if elem plain acc.taken then "${names.${key}}'${toString i}" else plain;
+        in
+        {
+          taken = acc.taken ++ [ name ];
+          attrs = acc.attrs // {
+            ${key} = name;
+          };
+        }
+      )
+      {
+        taken = [ ];
+        attrs = { };
+      }
+      (genList (i: i) (length keys))
+    ).attrs;
 
   # ---- Functions ----
 
@@ -1173,22 +1609,29 @@ let
             value = v.name;
           }) params
         );
+        retVoid = T.isVoid f.ret;
       };
-      items = f.body.items;
-      count = length items;
-      last = elemAt items (count - 1);
-      ret = if count > 0 && last.kind == "return" then last else null;
-      body = seqStmts stmt s0 (if ret == null then items else genList (elemAt items) (count - 1));
-      r = if ret == null || ret.expr == null then pure body.s null else expr body.s ret.expr;
-      mem = r.s.mem;
       result =
+        mem: c:
         if T.isVoid f.ret then
           mem
         else
-          "{ ${if mem == "mem" then "inherit mem;" else "mem = ${mem};"} ret = ${r.c.code}; }";
+          "{ ${if mem == "mem" then "inherit mem;" else "mem = ${mem};"} ret = ${c.code}; }";
+      end = st: c: {
+        s = st;
+        binds = [ ];
+        code = result st.mem c;
+      };
+      unexpected = kind: _: throw "cc: internal error: '${kind}' leaves the function";
+      handlers = {
+        return = end;
+        break = unexpected "break";
+        continue = unexpected "continue";
+      };
+      body = stmtK handlers s0 f.body (st: end st (num 0));
       signature = concatStringsSep " " ([ "mem:" ] ++ map (v: "${v.name}_0:") params);
     in
-    "  ${f.name}_fn =\n    ${indent (indent "${signature}\n${renderLet (body.binds ++ r.binds) result}")};\n";
+    "  ${f.name}_fn =\n    ${indent (indent "${signature}\n${renderLet body.binds body.code}")};\n";
 
   # ---- Data ----
 

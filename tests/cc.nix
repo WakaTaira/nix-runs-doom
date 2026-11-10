@@ -563,6 +563,109 @@ let
 
   charLitSrc = "int lit(int k) { return k == 0 ? 'a' : k == 1 ? '\\n' : k == 2 ? '\\0' : k == 3 ? '\\\\' : '\\''; } int add(int x) { return x + 'A'; }";
 
+  # ---- return, break, continue and switch ----
+  # Expected values follow the C semantics, worked out by hand.
+
+  jumpSrc = ''
+    int retIf(int x) { if (x > 0) return 1; return 2; }
+    int retBoth(int x) { if (x) return 10; else return 20; }
+    int retLoop(int n) { for (int i = 0; i < n; i++) { if (i * i > 20) return i; } return -1; }
+    int retNested(int n) {
+      for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+          if (i * j == 12) return i * 100 + j;
+      return 0;
+    }
+    int retDo(int n) { int i = 0; do { if (i == n) return i * 10; i++; } while (1); }
+    int retEffCond(int n) { while (n-- > 0) { if (n == 2) return 100 + n; } return n; }
+    int retStore(int *p, int x) { *p = 1; if (x) return 5; *p = 2; return 6; }
+    void retVoid(int *p, int x) { *p = 1; if (x) return; *p = 2; }
+    void retVoidLoop(int *p, int n) { for (int i = 0; i < n; i++) { if (i == 2) return; p[i] = i + 1; } }
+    int fallOff(int x) { if (x) return 7; }
+    int noReturn(int x) { x = x + 1; }
+    int joinRet(int x) { int r = 0; if (x > 0) { r = 1; if (x > 10) return 99; r = 2; } else r = 3; return r; }
+    int whileBreak(int n) { int i = 0; while (1) { if (i >= n) break; i++; } return i; }
+    int whileCont(int n) { int i = 0, s = 0; while (i < n) { i++; if (i % 2) continue; s += i; } return s; }
+    int effCondBreak(int n) { while (n-- > 0) { if (n == 2) break; } return n; }
+    int doBreak(int n) { int i = 0; do { if (i == n) break; i++; } while (i < 100); return i; }
+    int doCont(int n) { int i = 0, s = 0; do { i++; if (i % 3) continue; s += i; } while (i < n); return s; }
+    int doContCond(int n) { int i = 0, c = 0; do { c++; continue; } while (++i < n); return c * 100 + i; }
+    int forBreak(int n) { int i; for (i = 0; i < 100; i++) { if (i == n) break; } return i; }
+    int forCont(int n) { int s = 0; for (int i = 0; i < n; i++) { if (i % 2) continue; s += i; } return s; }
+    int nestedBreak(int n) {
+      int c = 0;
+      for (int i = 0; i < n; i++) { for (int j = 0; j < n; j++) { if (j == i) break; c++; } }
+      return c;
+    }
+    int forBreakFirst(void) { int i = 0; for (; i < 3; i++) { break; } return i; }
+    int doBreakFirst(void) { int i = 0; do { break; } while (++i < 1); return i; }
+    int joinLoop(int n) {
+      int s = 0;
+      for (int i = 0; i < n; i++) {
+        if (i % 2) { s += 1; if (i == 5) break; s += 10; }
+        else { s += 100; if (i == 4) continue; s += 1000; }
+        s += 10000;
+      }
+      return s;
+    }
+  '';
+  jumpFns = Cc.load jumpSrc;
+  # Result ({ mem; ret; } or the memory) of fn of jumpSrc on memory mem.
+  jumpCall =
+    mem: fn: args:
+    foldl' (f: a: f a) (jumpFns.${fn} mem) args;
+  jumpRet = fn: args: (jumpCall M.empty fn args).ret;
+
+  switchRunSrc = ''
+    enum color { RED, GREEN = 5, BLUE };
+    int k = 1;
+    int sw(int x) {
+      int r = 0;
+      switch (x) {
+      case 1: r = 10; break;
+      case 2: r = 20;
+      case 3: r += 3; break;
+      case 4: case 5: r = 45; break;
+      default: r = -1;
+      }
+      return r;
+    }
+    int defFirst(int x) { int r = 0; switch (x) { default: r = 100; case 1: r += 1; break; case 2: r = 2; } return r; }
+    int defMiddle(int x) { int r = 0; switch (x) { case 1: r = 1; break; default: r = 50; break; case 2: r = 2; } return r; }
+    int noMatch(int x) { int r = 7; switch (x) { case 1: r = 1; } return r; }
+    int swRet(int x) { switch (x) { case 1: return 11; case 2: x = 5; break; } return x * 2; }
+    int swLoop(int n) {
+      int s = 0;
+      for (int i = 0; i < n; i++) {
+        switch (i % 3) { case 0: continue; case 1: s += 10; break; default: s += 1; }
+        s += 100;
+      }
+      return s;
+    }
+    int swLoopRet(int n) {
+      for (int i = 0; ; i++) { switch (i) { case 5: return i * 3; default: break; } if (i > n) break; }
+      return -1;
+    }
+    int nested(int a, int b) {
+      int r = 0;
+      switch (a) {
+      case 1: switch (b) { case 1: r = 11; break; default: r = 19; } r += 100; break;
+      case 2: r = 2;
+      }
+      return r;
+    }
+    int labels(int c) { switch (c) { case RED: return 1; case GREEN: return 2; case BLUE: return 3; case 'a': return 4; } return 0; }
+    int once(void) { int r = 0; switch (k++) { case 1: r = 1; break; case 2: r = 2; break; default: r = 3; } return r * 10 + k; }
+    int decl(int x) { int r = 0; switch (x) { case 1: r = 1; int t = r + 5; r = t; case 2: t = 7; r += t; } return r; }
+    int shadow(int x) { int y = 1; switch (x) { case 1: y = 2; int y = 3; y += 1; case 2: y = 9; } return y; }
+    unsigned char narrow(unsigned char c) { switch (c) { case 200: return 1; case 255: return 2; } return 0; }
+  '';
+  switchFns = Cc.load switchRunSrc;
+  swRet = fn: args: (foldl' (f: a: f a) (switchFns.${fn} (switchFns.__data.init M.empty)) args).ret;
+
+  # Number of occurrences of needle in s.
+  countIn = needle: s: length (filter isList (builtins.split needle s));
+
   fixmulSrc = import ../cc/examples/spike.nix;
   fixmul =
     a: b:
@@ -2007,13 +2110,473 @@ in
     ]
   )
 
+  # return
+  (t "cc run: return inside an if"
+    (map (x: jumpRet "retIf" [ x ]) [
+      1
+      0
+    ])
+    [
+      1
+      2
+    ]
+  )
+  (t "cc run: return in both branches of an if/else"
+    (map (x: jumpRet "retBoth" [ x ]) [
+      1
+      0
+    ])
+    [
+      10
+      20
+    ]
+  )
+  (t "cc run: return inside a loop"
+    (map (n: jumpRet "retLoop" [ n ]) [
+      10
+      3
+    ])
+    [
+      5
+      (-1)
+    ]
+  )
+  (t "cc run: return from the inner of nested loops"
+    (map (n: jumpRet "retNested" [ n ]) [
+      10
+      3
+    ])
+    [
+      206
+      0
+    ]
+  )
+  (t "cc run: return inside a do/while" (jumpRet "retDo" [ 4 ]) 40)
+  (t "cc run: return in a loop whose condition has side effects"
+    (map (n: jumpRet "retEffCond" [ n ]) [
+      5
+      1
+    ])
+    [
+      102
+      (-1)
+    ]
+  )
+  (t "cc run: statements after a return do not run"
+    (map
+      (
+        x:
+        let
+          r = jumpCall M.empty "retStore" [
+            4096
+            x
+          ];
+        in
+        [
+          r.ret
+          (M.loadWord r.mem 4096)
+        ]
+      )
+      [
+        1
+        0
+      ]
+    )
+    [
+      [
+        5
+        1
+      ]
+      [
+        6
+        2
+      ]
+    ]
+  )
+  (t "cc run: return; in the middle of a void function"
+    (map
+      (
+        x:
+        M.loadWord (jumpCall M.empty "retVoid" [
+          4096
+          x
+        ]) 4096
+      )
+      [
+        1
+        0
+      ]
+    )
+    [
+      1
+      2
+    ]
+  )
+  (t "cc run: return; in a loop of a void function"
+    (
+      let
+        m = jumpCall M.empty "retVoidLoop" [
+          4096
+          5
+        ];
+      in
+      map (i: M.loadWord m (4096 + 4 * i)) [
+        0
+        1
+        2
+      ]
+    )
+    [
+      1
+      2
+      0
+    ]
+  )
+  (t "cc run: a non-void function that reaches its end returns 0"
+    [
+      (jumpRet "fallOff" [ 1 ])
+      (jumpRet "fallOff" [ 0 ])
+      (jumpRet "noReturn" [ 3 ])
+    ]
+    [
+      7
+      0
+      0
+    ]
+  )
+  (t "cc run: return from a branch joined with the other"
+    (map (x: jumpRet "joinRet" [ x ]) [
+      5
+      20
+      (-1)
+    ])
+    [
+      2
+      99
+      3
+    ]
+  )
+
+  # break and continue
+  (t "cc run: break and continue in while"
+    [
+      (jumpRet "whileBreak" [ 4 ])
+      (jumpRet "whileCont" [ 6 ])
+    ]
+    [
+      4
+      12
+    ]
+  )
+  (t "cc run: break in a loop whose condition has side effects" (jumpRet "effCondBreak" [ 5 ]) 2)
+  (t "cc run: break and continue in do/while"
+    [
+      (jumpRet "doBreak" [ 7 ])
+      (jumpRet "doCont" [ 10 ])
+    ]
+    [
+      7
+      18
+    ]
+  )
+  (t "cc run: continue in do/while evaluates the condition" (jumpRet "doContCond" [ 3 ]) 303)
+  (t "cc run: break and continue in for (continue runs the step)"
+    [
+      (jumpRet "forBreak" [ 9 ])
+      (jumpRet "forCont" [ 7 ])
+    ]
+    [
+      9
+      12
+    ]
+  )
+  (t "cc run: break leaves only the inner loop" (jumpRet "nestedBreak" [ 5 ]) 10)
+  (t "cc run: break skips the for step" (jumpRet "forBreakFirst" [ ]) 0)
+  (t "cc run: break skips the do/while condition" (jumpRet "doBreakFirst" [ ]) 0)
+  (t "cc run: break and continue from branches joined with the other" (jumpRet "joinLoop" [
+    10
+  ]) 42323)
+
+  # switch
+  (t "cc run: switch matches, falls through and breaks"
+    (map (x: swRet "sw" [ x ]) [
+      1
+      2
+      3
+      4
+      5
+      9
+    ])
+    [
+      10
+      23
+      3
+      45
+      45
+      (-1)
+    ]
+  )
+  (t "cc run: default first, in the middle and with no match"
+    [
+      (map (x: swRet "defFirst" [ x ]) [
+        1
+        2
+        7
+      ])
+      (map (x: swRet "defMiddle" [ x ]) [
+        1
+        2
+        3
+      ])
+      (map (x: swRet "noMatch" [ x ]) [
+        1
+        5
+      ])
+    ]
+    [
+      [
+        1
+        2
+        101
+      ]
+      [
+        1
+        2
+        50
+      ]
+      [
+        1
+        7
+      ]
+    ]
+  )
+  (t "cc run: default last"
+    (map (x: swRet "sw" [ x ]) [
+      0
+      (-3)
+    ])
+    [
+      (-1)
+      (-1)
+    ]
+  )
+  (t "cc run: return inside a switch"
+    (map (x: swRet "swRet" [ x ]) [
+      1
+      2
+      3
+    ])
+    [
+      11
+      10
+      6
+    ]
+  )
+  (t "cc run: continue in a switch reaches the loop, break does not leave it" (swRet "swLoop" [
+    6
+  ]) 422)
+  (t "cc run: return from a switch in a loop"
+    (map (n: swRet "swLoopRet" [ n ]) [
+      10
+      2
+    ])
+    [
+      15
+      (-1)
+    ]
+  )
+  (t "cc run: nested switch"
+    (map (ab: swRet "nested" ab) [
+      [
+        1
+        1
+      ]
+      [
+        1
+        5
+      ]
+      [
+        2
+        1
+      ]
+      [
+        3
+        1
+      ]
+    ])
+    [
+      111
+      119
+      2
+      0
+    ]
+  )
+  (t "cc run: enum constants and character literals as case labels"
+    (map (c: swRet "labels" [ c ]) [
+      0
+      5
+      6
+      97
+      1
+    ])
+    [
+      1
+      2
+      3
+      4
+      0
+    ]
+  )
+  (t "cc run: the controlling expression runs once" (swRet "once" [ ]) 12)
+  (t "cc run: a variable declared in a section is seen by the next one"
+    (map (x: swRet "decl" [ x ]) [
+      1
+      2
+      3
+    ])
+    [
+      13
+      7
+      0
+    ]
+  )
+  (t "cc run: a declaration in a switch body hides an outer variable"
+    (map (x: swRet "shadow" [ x ]) [
+      1
+      2
+    ])
+    [
+      2
+      1
+    ]
+  )
+  (t "cc run: switch on unsigned char"
+    (map (c: swRet "narrow" [ c ]) [
+      200
+      255
+      1
+    ])
+    [
+      1
+      2
+      0
+    ]
+  )
+  (t "cc run: empty switch" (ret "int f(int x) { switch (x) { } return x; }" "f" [ 3 ]) 3)
+
+  # Generated code of loops without return, break or continue
+  (t "cc compile: a loop without return, break or continue carries no done' or ret'"
+    (
+      let
+        code = Cc.compile "int f(int n) { int s = 0; for (int i = 0; i < n; i++) s += i; return s; }";
+      in
+      map (x: contains x code) [
+        "done'"
+        "ret'"
+        "st'"
+      ]
+    )
+    [
+      false
+      false
+      false
+    ]
+  )
+  (t "cc compile: only the loop that contains the return carries done' and ret'"
+    (
+      let
+        code = Cc.compile ''
+          int f(int n) {
+            int s = 0;
+            for (int i = 0; i < n; i++) s += i;
+            while (n) { if (n == 4) break; n--; }
+            for (int i = 0; i < n; i++) if (i == 3) return s;
+            return 0;
+          }
+        '';
+      in
+      [
+        (countIn "done' = false;" code)
+        (countIn "ret' = 0;" code)
+        (countIn "R.loop" code)
+      ]
+    )
+    [
+      1
+      1
+      3
+    ]
+  )
+
   # Outside the subset and type errors
-  (t "cc compile: switch throws" (compileThrows "void f(int x) { switch (x) { } }") true)
+  (t "cc compile: case inside an if throws"
+    (compileThrows "void f(int x) { switch (x) { case 1: if (x) case 2: ; } }")
+    true
+  )
+  (t "cc compile: case in a loop or an inner block of a switch throws"
+    (map compileThrows [
+      "void f(int x) { switch (x) { case 1: while (x) { case 2: ; } } }"
+      "void f(int x) { switch (x) { case 1: { case 2: ; } } }"
+    ])
+    [
+      true
+      true
+    ]
+  )
+  (t "cc compile: case or default outside a switch throws"
+    (map compileThrows [
+      "void f(int x) { case 1: x = 2; }"
+      "void f(int x) { default: x = 2; }"
+    ])
+    [
+      true
+      true
+    ]
+  )
+  (t "cc compile: switch whose body is not a block throws"
+    (compileThrows "void f(int x) { switch (x) case 1: x = 2; }")
+    true
+  )
+  (t "cc compile: break outside a loop or switch throws"
+    (map compileThrows [
+      "void f(void) { break; }"
+      "void f(int x) { if (x) break; }"
+    ])
+    [
+      true
+      true
+    ]
+  )
+  (t "cc compile: continue outside a loop throws"
+    (map compileThrows [
+      "void f(void) { continue; }"
+      "void f(int x) { switch (x) { case 1: continue; } }"
+    ])
+    [
+      true
+      true
+    ]
+  )
+  (t "cc compile: duplicate case values and default labels throw"
+    (map compileThrows [
+      "void f(int x) { switch (x) { case 1: case 1: ; } }"
+      "void f(int x) { switch (x) { case 1: case 4294967297LL: ; } }"
+      "void f(int x) { switch (x) { default: ; default: ; } }"
+    ])
+    [
+      true
+      true
+      true
+    ]
+  )
+  (t "cc compile: switch on a pointer throws" (compileThrows "void f(int *p) { switch (p) { } }")
+    true
+  )
+  (t "cc compile: goto throws" (compileThrows "void f(void) { goto x; x: ; }") true)
   (t "cc compile: &x throws" (compileThrows "void f(int x) { int *p = &x; }") true)
   (t "cc compile: block-scope struct throws" (compileThrows "void f(void) { struct s { int a; } x; }")
     true
   )
-  (t "cc compile: break throws" (compileThrows "void f(int x) { while (x) break; }") true)
   (t "cc compile: case throws" (compileThrows "void f(int x) { if (x) case 1: ; }") true)
   (t "cc compile: member access through a non-struct pointer throws"
     (compileThrows "struct s; int f(int *p) { return p->a; }")
@@ -2060,10 +2623,6 @@ in
   (t "cc compile: two initialized definitions throw" (compileThrows "int g = 1; int g = 2;") true)
   (t "cc compile: member of an incomplete struct throws"
     (compileThrows "struct s; int f(struct s *p) { return p->a; }")
-    true
-  )
-  (t "cc compile: return before the end throws"
-    (compileThrows "int f(int x) { if (x) return 1; return 0; }")
     true
   )
   (t "cc compile: side effect right of && throws" (compileThrows "int f(int x) { return x && x++; }")

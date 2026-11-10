@@ -69,9 +69,18 @@
 #   { kind = "do"; body; cond; }
 #   { kind = "for"; init; cond; step; body; }         init is null, a "decl" or an "expr"
 #                                                     statement; cond and step may be null
-#   { kind = "return"; expr; }                        only as the last item of a function
-#                                                     body; expr is null in a void function
-# Empty statements and block-scope typedefs leave no node.
+#   { kind = "return"; expr; }                        expr is null in a void function
+#   { kind = "break"; }                               inside a loop or a switch
+#   { kind = "continue"; }                            inside a loop
+#   { kind = "switch"; cond; skipped; sections; cases; default; }
+#       cond has its promoted type. The body is a block whose items may carry case and
+#       default labels; a labelled item starts a section, and sections = [ [ statement ] ]
+#       holds the statements of each section in order. skipped are the statements before
+#       the first label, which never run (kept for their declarations, whose scope goes on
+#       into the sections). cases = [ { value; section; } ] in source order, with value
+#       converted to the type of cond; default is the index of its section or null.
+# Empty statements and block-scope typedefs leave no node. Labels anywhere but directly in
+# the body of a switch are unsupported.
 #
 # Typed function (position of its name):
 #   { name; ret; params = [ var ]; body = <block>; line; col; }
@@ -169,13 +178,6 @@ let
   pendingDecls = {
     struct = "block-scope struct definition";
     enum = "block-scope enum definition";
-  };
-  pendingStmts = {
-    break = "'break' statement";
-    continue = "'continue' statement";
-    switch = "'switch' statement";
-    case = "'case' label";
-    default = "'default' label";
   };
 
   # ---- Types ----
@@ -1180,10 +1182,30 @@ let
 
   # ---- Statements ----
 
-  # env: { vars; local; funcs; ret; ctx; } with vars and local keyed by the C name (local:
-  # the names declared in the innermost block), funcs the function signatures, ret the
-  # return type of the current function, and ctx the file-scope context (see checkItems).
+  # env: { vars; local; funcs; ret; jumps; ctx; } with vars and local keyed by the C name
+  # (local: the names declared in the innermost block), funcs the function signatures, ret
+  # the return type of the current function, jumps = { break; continue; } whether break and
+  # continue have a target here, and ctx the file-scope context (see checkItems).
   enterBlock = env: env // { local = { }; };
+
+  # env for the body of a loop, and of a switch.
+  inLoop =
+    env:
+    env
+    // {
+      jumps = {
+        break = true;
+        continue = true;
+      };
+    };
+  inSwitch =
+    env:
+    env
+    // {
+      jumps = env.jumps // {
+        break = true;
+      };
+    };
 
   declare =
     env: at: name: type:
@@ -1210,10 +1232,9 @@ let
         };
       };
 
-  # Check the statement n; tailOk: n is the last item of the function body.
-  # -> { node (null when nothing is left); env; }
+  # Check the statement n. -> { node (null when nothing is left); env; }
   stmt =
-    env: tailOk: n:
+    env: n:
     let
       k = n.kind;
       at = fields: {
@@ -1227,7 +1248,7 @@ let
       kind = k;
     in
     if k == "block" then
-      at { items = blockItems (enterBlock env) n.items false; }
+      at { items = blockItems (enterBlock env) n.items; }
     else if k == "decl" then
       declStmt env n
     else if k == "expr" then
@@ -1246,19 +1267,25 @@ let
     else if k == "while" then
       at {
         cond = rv env n.cond;
-        body = sub env n.body;
+        body = sub (inLoop env) n.body;
       }
     else if k == "do" then
       at {
-        body = sub env n.body;
+        body = sub (inLoop env) n.body;
         cond = rv env n.cond;
       }
     else if k == "for" then
       forStmt env n
     else if k == "return" then
-      returnStmt env tailOk n
-    else if hasAttr k pendingStmts then
-      unsupported n pendingStmts.${k}
+      returnStmt env n
+    else if k == "break" then
+      if env.jumps.break then at { } else fail n "'break' statement not in loop or switch statement"
+    else if k == "continue" then
+      if env.jumps.continue then at { } else fail n "'continue' statement not in loop statement"
+    else if k == "switch" then
+      switchStmt env n
+    else if k == "case" || k == "default" then
+      unsupported n "'${k}' label not directly in the body of a 'switch'"
     else
       fail n "unexpected statement '${k}'";
 
@@ -1266,7 +1293,7 @@ let
   sub =
     env: n:
     let
-      r = stmt env false n;
+      r = stmt env n;
     in
     if r.node == null then
       {
@@ -1354,20 +1381,18 @@ let
         init = init.node;
         cond = if n.cond == null then null else rv ienv n.cond;
         step = if n.step == null then null else valueOf ienv n.step;
-        body = sub ienv n.body;
+        body = sub (inLoop ienv) n.body;
         inherit (n) line col;
       };
       inherit env;
     };
 
   returnStmt =
-    env: tailOk: n:
+    env: n:
     let
       isVoidFn = isVoid env.ret;
     in
-    if !tailOk then
-      unsupported n "'return' before the end of the function"
-    else if isVoidFn && n.expr != null then
+    if isVoidFn && n.expr != null then
       fail n "void function should not return a value"
     else if !isVoidFn && n.expr == null then
       fail n "non-void function should return a value"
@@ -1381,15 +1406,14 @@ let
         inherit env;
       };
 
-  # Items of a block, checked in order; the last one is in tail position when tailLast.
+  # Items of a block, checked in order.
   blockItems =
-    env: items: tailLast:
+    env: items:
     let
-      count = length items;
       step =
-        acc: i:
+        acc: n:
         let
-          r = stmt acc.env (tailLast && i == count - 1) (elemAt items i);
+          r = stmt acc.env n;
         in
         {
           inherit (r) env;
@@ -1399,7 +1423,105 @@ let
     (foldl' step {
       inherit env;
       nodes = [ ];
-    } (genList (i: i) count)).nodes;
+    } items).nodes;
+
+  # `switch` (see the header). The labels are taken from the items of the body block; a
+  # label anywhere else is unsupported (stmt).
+  switchStmt =
+    env: n:
+    let
+      c = rv env n.cond;
+      t = promote c.type;
+      body = n.body;
+      r = foldl' (switchItem t) {
+        env = inSwitch (enterBlock env);
+        skipped = [ ];
+        sections = [ ];
+        cases = [ ];
+        default = null;
+      } body.items;
+    in
+    if !isInteger c.type then
+      fail n.cond "statement requires expression of integer type ('${showType c.type}' invalid)"
+    else if body.kind != "block" then
+      unsupported body "'switch' body that is not a compound statement"
+    else
+      {
+        node = {
+          kind = "switch";
+          cond = mkCast t c;
+          inherit (r)
+            skipped
+            sections
+            cases
+            default
+            ;
+          inherit (n) line col;
+        };
+        inherit env;
+      };
+
+  # One item of a switch body (acc as in switchStmt): its labels start a new section, and
+  # its statement joins the last section (or skipped, before the first label).
+  switchItem =
+    t: acc: item:
+    let
+      l = unlabel item;
+      opened = if l.labels == [ ] then acc.sections else acc.sections ++ [ [ ] ];
+      index = length opened - 1;
+      labelled = foldl' (addLabel acc.env t index) acc l.labels;
+      r = stmt acc.env l.stmt;
+      nodes = if r.node == null then [ ] else [ r.node ];
+    in
+    labelled
+    // {
+      inherit (r) env;
+      skipped = if opened == [ ] then acc.skipped ++ nodes else acc.skipped;
+      sections = genList (i: elemAt opened i ++ (if i == index then nodes else [ ])) (length opened);
+    };
+
+  # The case and default labels in front of the statement n, and that statement.
+  # -> { labels; stmt; }
+  unlabel =
+    n:
+    if n.kind == "case" || n.kind == "default" then
+      let
+        r = unlabel n.stmt;
+      in
+      {
+        labels = [ n ] ++ r.labels;
+        inherit (r) stmt;
+      }
+    else
+      {
+        labels = [ ];
+        stmt = n;
+      };
+
+  # The label (a case or default node) of the section index added to acc; a case value is
+  # converted to t, the promoted type of the controlling expression.
+  addLabel =
+    env: t: index: acc: label:
+    let
+      v = (mkCast t (constExpr (hooksOf env) label.value)).value;
+    in
+    if label.kind == "default" then
+      if acc.default != null then
+        fail label "multiple default labels in one switch"
+      else
+        acc // { default = index; }
+    else if any (x: x.value == v) acc.cases then
+      fail label "duplicate case value '${toString v}'"
+    else
+      acc
+      // {
+        cases = acc.cases ++ [
+          {
+            value = v;
+            section = index;
+          }
+        ];
+      };
 
   # ---- Type resolution ----
 
@@ -1491,27 +1613,22 @@ let
         };
         vars = [ ];
       } (genList (i: i) (length f.params));
-      items = blockItems ps.env f.body.items true;
-      count = length items;
-      endsWithReturn = count > 0 && (elemAt items (count - 1)).kind == "return";
+      items = blockItems ps.env f.body.items;
     in
-    if !isVoid sig.ret && !endsWithReturn then
-      unsupported f "non-void function '${f.name}' without a final 'return'"
-    else
-      {
-        inherit (f)
-          name
-          line
-          col
-          ;
-        inherit (sig) ret;
-        params = ps.vars;
-        body = {
-          kind = "block";
-          inherit items;
-          inherit (f.body) line col;
-        };
+    {
+      inherit (f)
+        name
+        line
+        col
+        ;
+      inherit (sig) ret;
+      params = ps.vars;
+      body = {
+        kind = "block";
+        inherit items;
+        inherit (f.body) line col;
       };
+    };
 
   # ---- File scope ----
   # The items are checked in order with the accumulator
@@ -1529,6 +1646,10 @@ let
     vars = { };
     local = { };
     ret = null;
+    jumps = {
+      break = false;
+      continue = false;
+    };
     inherit (acc) funcs ctx;
   };
 
