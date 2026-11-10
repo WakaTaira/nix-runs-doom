@@ -1149,27 +1149,19 @@ let
     cv 9 (concatStringsSep " || " (map (x: wrap 8 x) tests));
 
   # The state after a store to target at the address a, with s.mem the memory after the
-  # store. A store that may overlap an entry adds its test to hits: the run-time test bound
-  # once for an address that is not a constant, and `true` for a constant address that
-  # overlaps one (the loop excludes such entries, so this does not occur). -> { s; binds; }
+  # store. A store that may overlap an entry adds its run-time test, bound once, to hits.
+  # A store to a constant address never overlaps a cached key: the loop excludes such
+  # entries, so the state is returned as is. -> { s; binds; }
   refreshCache =
     s: target: a:
     let
       size = T.sizeOf target.type;
       constant = target.expr.kind == "lit";
-      hit = any (c: overlaps target.expr.value size c.addr c.size) s.cached;
       f = fresh s "hit";
     in
-    if s.cached == [ ] || constant && !hit then
+    if s.cached == [ ] || constant then
       {
         inherit s;
-        binds = [ ];
-      }
-    else if constant then
-      {
-        s = s // {
-          hits = s.hits ++ [ "true" ];
-        };
         binds = [ ];
       }
     else

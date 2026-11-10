@@ -842,6 +842,9 @@ let
       return s * 100 + g;
     }
     int ternaryAfter(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; i++) { *p = i + 1; s += i ? g : 100; } return s; }
+    int pendIf(int n) { int *p = &g; int s = 0, t = 0; g = 0; for (int i = 0; i < n; i++) { *p = i + 1; if (i & 1) t++; s += g; } return s * 10 + t; }
+    int pendJoin(int n) { int *p = &g; int s = 0, t = 0; g = 0; for (int i = 0; i < n; i++) { *p = i + 1; if (i & 1) { t++; if (t == 5) continue; } s += g; } return s * 10 + t; }
+    int pendSwitch(int n) { int *p = &g; int s = 0, t = 0; g = 0; for (int i = 0; i < n; i++) { *p = i + 1; switch (i) { case 0: t++; break; case 1: continue; default: t += 2; } s += g; } return s * 10 + t; }
   '';
   cacheRet = fn: args: dret cacheSrc fn args;
   cacheSyms = (Cc.load cacheSrc).__data.symbols;
@@ -3449,6 +3452,18 @@ in
       506
       1
       0
+    ]
+  )
+  (t "cc cache: a pending overlap test survives joins of if, continue and switch"
+    [
+      (cacheRet "pendIf" [ 3 ])
+      (cacheRet "pendJoin" [ 3 ])
+      (cacheRet "pendSwitch" [ 3 ])
+    ]
+    [
+      61
+      61
+      43
     ]
   )
   (t "cc cache: a read in a branch of ?: after a store sees the stored value" (cacheRet "ternaryAfter"

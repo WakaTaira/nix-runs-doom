@@ -74,17 +74,9 @@ let
   chunkLen = 64;
   chunkTicks = genList (_: null) chunkLen;
   forceVars = v: foldl' (acc: x: seq x acc) v (attrValues v);
-  loop =
-    cond: body: vars:
+  runLoop =
+    tick: vars:
     let
-      tick =
-        v: _:
-        if v.exit then
-          v
-        else if cond v then
-          body v
-        else
-          v // { exit = true; };
       go =
         v:
         let
@@ -93,20 +85,20 @@ let
         if e.exit then e else go e;
     in
     removeAttrs (go (vars // { exit = false; })) [ "exit" ];
+  loop =
+    cond: body:
+    runLoop (
+      v: _:
+      if v.exit then
+        v
+      else if cond v then
+        body v
+      else
+        v // { exit = true; }
+    );
 
   # `loop` without a condition: each iteration runs `body` until it sets `exit = true`.
-  loopDo =
-    body: vars:
-    let
-      tick = v: _: if v.exit then v else body v;
-      go =
-        v:
-        let
-          e = forceVars (foldl' tick v chunkTicks);
-        in
-        if e.exit then e else go e;
-    in
-    removeAttrs (go (vars // { exit = false; })) [ "exit" ];
+  loopDo = body: runLoop (v: _: if v.exit then v else body v);
 in
 {
   inherit
