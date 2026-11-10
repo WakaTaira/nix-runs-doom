@@ -9,12 +9,18 @@ let
   B = import ../lib/bits.nix;
   M = import ../lib/mem.nix;
   inherit (builtins)
+    all
+    attrNames
+    concatMap
     concatStringsSep
+    elem
     elemAt
     filter
     foldl'
     genList
     head
+    isAttrs
+    isList
     length
     map
     substring
@@ -53,9 +59,64 @@ let
       "(cast ${showType e.type} ${show e.expr})"
     else if k == "call" then
       "(call ${e.name}${concatStringsSep "" (map (a: " " + show a) e.args)})"
+    else if k == "dot" then
+      "(. ${show e.expr} ${e.name})"
+    else if k == "arrow" then
+      "(-> ${show e.expr} ${e.name})"
+    else if k == "addr" then
+      "(& ${show e.expr})"
+    else if k == "sizeof" then
+      "(sizeof ${show e.expr})"
+    else if k == "sizeoftype" then
+      "(sizeof ${showType e.type})"
+    else if k == "cond" then
+      "(? ${show e.cond} ${show e.thenExpr} ${show e.elseExpr})"
+    else if k == "charlit" then
+      "(char ${toString e.value})"
+    else if k == "initlist" then
+      "{${concatStringsSep "," (map show e.items)}}"
     else
       throw "show: ${k}";
-  showType = ty: if ty.tag == "ptr" then showType ty.to + "*" else ty.tag;
+  # Types: pointers as a suffix `*`, arrays as a prefix `[len]` (outermost first).
+  showType =
+    ty:
+    if ty.tag == "ptr" then
+      showType ty.to + "*"
+    else if ty.tag == "array" then
+      "[${if ty.len == null then "" else show ty.len}]${showType ty.of}"
+    else if ty.tag == "struct" || ty.tag == "enum" then
+      "${ty.tag} ${ty.name}"
+    else
+      ty.tag;
+
+  # Prefix rendering of a statement node.
+  showStmt =
+    st:
+    let
+      k = st.kind;
+    in
+    if k == "case" then
+      "(case ${show st.value} ${showStmt st.stmt})"
+    else if k == "default" then
+      "(default ${showStmt st.stmt})"
+    else if k == "break" || k == "continue" then
+      k
+    else if k == "expr" then
+      show st.expr
+    else if k == "empty" then
+      ";"
+    else if k == "block" then
+      "{${concatStringsSep " " (map showStmt st.items)}}"
+    else if k == "switch" then
+      "(switch ${show st.cond} ${showStmt st.body})"
+    else if k == "while" then
+      "(while ${show st.cond} ${showStmt st.body})"
+    else if k == "if" then
+      "(if ${show st.cond} ${showStmt st.thenStmt}${
+        if st.elseStmt == null then "" else " " + showStmt st.elseStmt
+      })"
+    else
+      throw "showStmt: ${k}";
 
   # Body statements of the last function in src.
   lastBody =
@@ -92,6 +153,106 @@ let
   # The M0 spike C (bench/spike), with the address macros written as casts.
   spikeC = import ../cc/examples/spike.nix;
   spikeFuncs = filter (i: i.kind == "func") (P.parse spikeC).items;
+
+  # ---- Slice 2 syntax ----
+
+  items = src: (P.parse src).items;
+  # Declarations of the declaration statements of the last function in src.
+  bodyDecls = src: concatMap (st: st.decls) (lastBody src);
+
+  # The fields of a struct item, as [ name type ].
+  fieldsOf =
+    s:
+    map (f: [
+      f.name
+      (showType f.type)
+    ]) s.members;
+
+  structSrc = ''
+    typedef struct node {
+      int v;
+      struct node *next;
+      struct pair { short lo, hi; } pair;
+      unsigned char name[8];
+    } node_t;
+    node_t *head;
+  '';
+  structItems = items structSrc;
+  anonItems = items "typedef struct { int a; } anon_t;";
+
+  enumSrc = ''
+    enum color { RED, GREEN = 5, BLUE, };
+    enum color paint;
+  '';
+  enumItems = items enumSrc;
+
+  globalSrc = ''
+    int a, *b = 0, c[2] = { 1, 2, };
+    extern int d[2][3];
+    static unsigned short e = 'x';
+    int m[2][2] = { { 1 }, { 2, 3 } };
+  '';
+  # A global item as [ name type storage init ], with "-" for null.
+  showGlobal = g: [
+    g.name
+    (showType g.type)
+    (if g.storage == null then "-" else g.storage)
+    (if g.init == null then "-" else show g.init)
+  ];
+
+  switchSrc = ''
+    void f(int x) {
+      while (x) { if (x) break; else continue; }
+      switch (x) {
+      case 1:
+      case 2: x = 3; break;
+      default: x = 4;
+      }
+      if (x) case 5: ;
+    }
+  '';
+
+  # Every node (attribute set with a kind) in a value; types are searched too.
+  nodesIn =
+    x:
+    if isList x then
+      concatMap nodesIn x
+    else if isAttrs x then
+      (if x ? kind then [ x ] else [ ]) ++ concatMap (k: nodesIn x.${k}) (attrNames x)
+    else
+      [ ];
+  slice2Tree = P.parse (
+    structSrc
+    + enumSrc
+    + globalSrc
+    + switchSrc
+    + ''
+      int g(node_t *n) {
+        return n->pair.lo ? sizeof(int[3]) : sizeof n->v + (int)&n->name[0] + 'a' + n[0].v;
+      }
+    ''
+  );
+  slice2Nodes = nodesIn slice2Tree;
+  newKinds = [
+    "struct"
+    "field"
+    "enum"
+    "enumconst"
+    "global"
+    "initlist"
+    "break"
+    "continue"
+    "switch"
+    "case"
+    "default"
+    "dot"
+    "arrow"
+    "addr"
+    "sizeof"
+    "sizeoftype"
+    "cond"
+    "charlit"
+  ];
 
   # ---- Compile and run ----
 
@@ -324,11 +485,322 @@ in
     "unit"
   ])
 
+  # Lexer: character literals
+  (t "cc lex: character literals"
+    (map (k: [
+      k.kind
+      k.value
+    ]) (filter (k: k.kind == "char") (toks "'a' '\\n' '\\0' '\\\\' '\\'' ' '")))
+    [
+      [
+        "char"
+        97
+      ]
+      [
+        "char"
+        10
+      ]
+      [
+        "char"
+        0
+      ]
+      [
+        "char"
+        92
+      ]
+      [
+        "char"
+        39
+      ]
+      [
+        "char"
+        32
+      ]
+    ]
+  )
+  (t "cc lex: character literal position" (posOf (elemAt (toks "x = '\\''") 2)) "1:5")
+  (t "cc lex: multi-character literal throws" (!(tryEval (toks "'ab'")).success) true)
+  (t "cc lex: octal escape throws" (!(tryEval (toks "'\\012'")).success) true)
+  (t "cc lex: unterminated character literal throws" (!(tryEval (toks "'a")).success) true)
+
+  # Parser: types
+  (t "cc parse: short and unsigned short"
+    (map (d: showType d.type) (
+      bodyDecls "void f(void) { short a; unsigned short b; short int c; signed short d; unsigned short int e; }"
+    ))
+    [
+      "short"
+      "ushort"
+      "short"
+      "short"
+      "ushort"
+    ]
+  )
+  (t "cc parse: struct definitions come before the declaration that uses them"
+    (map (i: [
+      i.kind
+      i.name
+    ]) structItems)
+    [
+      [
+        "struct"
+        "pair"
+      ]
+      [
+        "struct"
+        "node"
+      ]
+      [
+        "typedef"
+        "node_t"
+      ]
+      [
+        "global"
+        "head"
+      ]
+    ]
+  )
+  (t "cc parse: struct members (self-referential pointer, nested struct, array)"
+    (fieldsOf (elemAt structItems 1))
+    [
+      [
+        "v"
+        "int"
+      ]
+      [
+        "next"
+        "struct node*"
+      ]
+      [
+        "pair"
+        "struct pair"
+      ]
+      [
+        "name"
+        "[8]uchar"
+      ]
+    ]
+  )
+  (t "cc parse: struct member declarators share the specifiers" (fieldsOf (head structItems)) [
+    [
+      "lo"
+      "short"
+    ]
+    [
+      "hi"
+      "short"
+    ]
+  ])
+  (t "cc parse: typedef of a struct refers to it by tag"
+    (map (i: showType i.type) (genList (k: elemAt structItems (k + 2)) 2))
+    [
+      "struct node"
+      "struct node*"
+    ]
+  )
+  (t "cc parse: anonymous struct gets a name no identifier can have"
+    {
+      name = (head anonItems).name;
+      same = (head anonItems).name == (elemAt anonItems 1).type.name;
+    }
+    {
+      name = "(anonymous at 1:9)";
+      same = true;
+    }
+  )
+  (t "cc parse: enum constants, explicit and implicit"
+    (map (c: [
+      c.kind
+      c.name
+      (if c.value == null then "-" else show c.value)
+    ]) (head enumItems).consts)
+    [
+      [
+        "enumconst"
+        "RED"
+        "-"
+      ]
+      [
+        "enumconst"
+        "GREEN"
+        "5"
+      ]
+      [
+        "enumconst"
+        "BLUE"
+        "-"
+      ]
+    ]
+  )
+  (t "cc parse: enum type refers to the tag" (showType (elemAt enumItems 1).type) "enum color")
+  (t "cc parse: enum constant shadows a typedef name" (show (head (
+    lastBody "typedef int RED; enum { RED }; void f(void) { RED * 2; }"
+  )).expr) "(* RED 2)")
+  (t "cc parse: array declarators"
+    (map (d: showType d.type) (bodyDecls "void f(void) { int m[2][3], *q[4], n[1 + 1]; }"))
+    [
+      "[2][3]int"
+      "[4]int*"
+      "[(+ 1 1)]int"
+    ]
+  )
+  (t "cc parse: array parameters keep their array type"
+    (map (p: showType p.type) (head (items "void f(int a[], char b[4]);")).params)
+    [
+      "[]int"
+      "[4]char"
+    ]
+  )
+
+  # Parser: declarations
+  (t "cc parse: file-scope variables with initializers and storage classes"
+    (map showGlobal (items globalSrc))
+    [
+      [
+        "a"
+        "int"
+        "-"
+        "-"
+      ]
+      [
+        "b"
+        "int*"
+        "-"
+        "0"
+      ]
+      [
+        "c"
+        "[2]int"
+        "-"
+        "{1,2}"
+      ]
+      [
+        "d"
+        "[2][3]int"
+        "extern"
+        "-"
+      ]
+      [
+        "e"
+        "ushort"
+        "static"
+        "(char 120)"
+      ]
+      [
+        "m"
+        "[2][2]int"
+        "-"
+        "{{1},{2,3}}"
+      ]
+    ]
+  )
+  (t "cc parse: initializer with an address and an array name"
+    (map showGlobal (items "int t[2]; int *p = &t[1], *q = t;"))
+    [
+      [
+        "t"
+        "[2]int"
+        "-"
+        "-"
+      ]
+      [
+        "p"
+        "int*"
+        "-"
+        "(& (index t 1))"
+      ]
+      [
+        "q"
+        "int*"
+        "-"
+        "t"
+      ]
+    ]
+  )
+  (t "cc parse: static and extern functions"
+    (map (i: i.kind) (items "static int f(void) { return 0; } extern int g(int);"))
+    [
+      "func"
+      "proto"
+    ]
+  )
+  (t "cc parse: block-scope struct definition and array"
+    (map (d: d.kind) (bodyDecls "void f(void) { struct s { int a; } x, y[2]; }"))
+    [
+      "struct"
+      "vardecl"
+      "vardecl"
+    ]
+  )
+
+  # Parser: statements
+  (t "cc parse: break and continue" (showStmt (
+    head (lastBody switchSrc)
+  )) "(while x {(if x break continue)})")
+  (t "cc parse: switch with case and default labels" (showStmt (
+    elemAt (lastBody switchSrc) 1
+  )) "(switch x {(case 1 (case 2 (= x 3))) break (default (= x 4))})")
+  (t "cc parse: case outside a switch body is still a label" (showStmt (
+    elemAt (lastBody switchSrc) 2
+  )) "(if x (case 5 ;))")
+
+  # Parser: expressions
+  (t "cc parse: member access" (parsed "p->a.b[1]") "(index (. (-> p a) b) 1)")
+  (t "cc parse: address-of" (parsed "*&a + (a & b)") "(+ (deref (& a)) (& a b))")
+  (t "cc parse: address of an element" (parsed "&p[1]") "(& (index p 1))")
+  (t "cc parse: sizeof an expression binds like a prefix operator" (parsed "sizeof a + 1")
+    "(+ (sizeof a) 1)"
+  )
+  (t "cc parse: sizeof a parenthesized expression" (parsed "sizeof (a) * sizeof *p")
+    "(* (sizeof a) (sizeof (deref p)))"
+  )
+  (t "cc parse: sizeof a type name" (parsed "sizeof(unsigned short) + sizeof(int *[3])")
+    "(+ (sizeof ushort) (sizeof [3]int*))"
+  )
+  (t "cc parse: ?: is right-associative" (parsed "a ? b : c ? a : b") "(? a b (? c a b))")
+  (t "cc parse: ?: below ||, above =" (parsed "a = b || c ? a = b : c")
+    "(= a (? (|| b c) (= a b) c))"
+  )
+  (t "cc parse: character literals" (parsed "'a' + '\\n' - '\\0' + '\\\\' + '\\''")
+    "(+ (+ (- (+ (char 97) (char 10)) (char 0)) (char 92)) (char 39))"
+  )
+
+  # Parser: positions
+  (t "cc parse: every slice-2 node kind occurs in the sample" (filter (
+    k: !(elem k (map (n: n.kind) slice2Nodes))
+  ) newKinds) [ ])
+  (t "cc parse: every node has a line and a column" (all (n: n ? line && n ? col) slice2Nodes) true)
+  (t "cc parse: positions of new nodes"
+    (map posOf [
+      (exprOf "a ? b : c")
+      (exprOf "a.b")
+      (exprOf "&a")
+      (exprOf "sizeof a")
+      (head (items "  struct s { int a; };"))
+      (head (items "int x, y = 1;"))
+    ])
+    [
+      "1:41"
+      "1:40"
+      "1:39"
+      "1:39"
+      "1:3"
+      "1:5"
+    ]
+  )
+
   # Parser: outside the subset
-  (t "cc parse: switch throws" (throws "void f(int x) { switch (x) { } }") true)
-  (t "cc parse: struct throws" (throws "struct s { int a; };") true)
-  (t "cc parse: &x throws" (throws "void f(int x) { int *p = &x; }") true)
-  (t "cc parse: global variable throws" (throws "int g;") true)
+  (t "cc parse: goto throws" (throws "void f(void) { goto x; }") true)
+  (t "cc parse: union throws" (throws "union u { int a; };") true)
+  (t "cc parse: bit-field throws" (throws "struct s { int a : 3; };") true)
+  (t "cc parse: function pointer declarator throws" (throws "void (*fp)(int);") true)
+  (t "cc parse: variadic function throws" (throws "int f(int a, ...);") true)
+  (t "cc parse: comma operator throws" (throws "void f(int a) { a = 1, 2; }") true)
+  (t "cc parse: floating-point type throws" (throws "float x;") true)
+  (t "cc parse: string literal throws" (throws "int f(void) { return g(\"s\"); }") true)
+  (t "cc parse: designated initializer throws" (throws "int a[2] = { [1] = 2 };") true)
+  (t "cc parse: block-scope static throws" (throws "void f(void) { static int x; }") true)
+  (t "cc parse: declaration without a declarator throws" (throws "int;") true)
 
   # Code generation: output shape
   (t "cc compile: output starts with the argument set" (substring 0 12
@@ -587,6 +1059,29 @@ in
   (t "cc compile: switch throws" (compileThrows "void f(int x) { switch (x) { } }") true)
   (t "cc compile: struct throws" (compileThrows "struct s { int a; };") true)
   (t "cc compile: &x throws" (compileThrows "void f(int x) { int *p = &x; }") true)
+  (t "cc compile: global variable throws" (compileThrows "int g;") true)
+  (t "cc compile: enum throws" (compileThrows "enum e { A };") true)
+  (t "cc compile: block-scope struct throws" (compileThrows "void f(void) { struct s { int a; } x; }")
+    true
+  )
+  (t "cc compile: break throws" (compileThrows "void f(int x) { while (x) break; }") true)
+  (t "cc compile: case throws" (compileThrows "void f(int x) { if (x) case 1: ; }") true)
+  (t "cc compile: member access throws" (compileThrows "struct s; int f(int *p) { return p->a; }")
+    true
+  )
+  (t "cc compile: ?: throws" (compileThrows "int f(int x) { return x ? 1 : 2; }") true)
+  (t "cc compile: sizeof throws" (compileThrows "int f(void) { return sizeof(int); }") true)
+  (t "cc compile: character literal throws" (compileThrows "int f(void) { return 'a'; }") true)
+  (t "cc compile: short parameter throws" (compileThrows "int f(short x) { return 0; }") true)
+  (t "cc compile: short local with an initializer throws"
+    (compileThrows "void f(void) { short s = 0; }")
+    true
+  )
+  (t "cc compile: local array throws" (compileThrows "void f(void) { int a[3]; }") true)
+  (t "cc compile: cast to unsigned short throws"
+    (compileThrows "int f(int x) { return (unsigned short)x; }")
+    true
+  )
   (t "cc compile: return before the end throws"
     (compileThrows "int f(int x) { if (x) return 1; return 0; }")
     true

@@ -11,24 +11,50 @@
 # Every node is an attribute set with `kind` (a string) and the 1-based `line` and `col`
 # of the token given below. Fields not listed do not exist. Lists keep source order.
 #
-# Types are plain values, not nodes (no position), so they compare with ==. Typedef names
-# are already resolved to the type they stand for, and `const` is dropped:
+# Types are plain values, not nodes (no position), so they compare with == (except that
+# the length of an array type is an expression node, which carries its position). Typedef
+# names are already resolved to the type they stand for, and `const` is dropped:
 #   { tag = <base>; }                one of "void", "char", "schar" (signed char),
-#                                    "uchar", "int", "uint", "long", "ulong", "llong"
+#                                    "uchar", "short", "ushort", "int", "uint", "long",
+#                                    "ulong", "llong"
 #   { tag = "ptr"; to = <type>; }    pointer
+#   { tag = "array"; of = <type>; len = <expression or null>; }
+#                                    array; len is null for `[]`. `int m[2][3]` is an
+#                                    array of 2 arrays of 3 int. Parameters keep their
+#                                    array type (no adjustment to a pointer).
+#   { tag = "struct"; name; }        struct, by tag; an anonymous struct gets the name
+#                                    "(anonymous at <line>:<col>)" (of its keyword)
+#   { tag = "enum"; name; }          enum, by tag (named like struct)
 # `unsigned` and `unsigned int` are "uint"; `signed`, `signed int` and `int` are "int";
 # `long int` and `signed long` are "long"; `long long` (with optional `int`/`signed`) is
-# "llong". Specifiers may come in any order.
+# "llong"; `short`, `short int` and `signed short` are "short", `unsigned short` (with
+# optional `int`) is "ushort". Specifiers may come in any order.
 #
 # Translation unit (line 1, col 1):
-#   { kind = "unit"; items = [ <typedef | proto | func> ]; }
+#   { kind = "unit"; items = [ <typedef | proto | func | global | struct | enum> ]; }
 #
 # File-scope items (position: the declared name):
 #   { kind = "typedef"; name; type; }
 #   { kind = "proto"; name; ret = <type>; params = [ <param> ]; }
 #   { kind = "func"; name; ret = <type>; params = [ <param> ]; body = <block>; }
+#   { kind = "global"; name; type; storage; init = <initializer or null>; }
+#       file-scope variable; storage is null, "static" or "extern".
 #   One declaration may declare several names (`int f(int), g(void);`); each becomes
-#   its own item. A parameter list `()` or `(void)` gives params = [ ].
+#   its own item. A parameter list `()` or `(void)` gives params = [ ]. `static` and
+#   `extern` on a function are accepted and not recorded.
+#
+# Tag definitions (position: the `struct` or `enum` keyword), at file scope as items and
+# at block scope in the decls of a "decl" statement. They come before the declarators of
+# their declaration, and a struct or enum defined inside a struct before that struct.
+# `struct s;` and `enum e;` without a body leave no node.
+#   { kind = "struct"; name; members = [ <field> ]; }   name as in the struct type
+#   { kind = "field"; name; type; }                     position: the member name
+#   { kind = "enum"; name; consts = [ <enumconst> ]; }  name as in the enum type
+#   { kind = "enumconst"; name; value = <expression or null>; }
+#       position: the name; value is null when not given (one more than the previous).
+#
+# Initializers (of a "global"): an expression, or
+#   { kind = "initlist"; items = [ <initializer> ]; }   `{ ... }`; position: the `{`
 #
 # Parameter (position: the name, or the first specifier token if unnamed):
 #   { kind = "param"; name = <string or null>; type; }
@@ -36,7 +62,8 @@
 #
 # Statements (position: the first token of the statement):
 #   { kind = "block"; items = [ <statement> ]; }
-#   { kind = "decl"; decls = [ <vardecl | typedef> ]; }      a block-scope declaration
+#   { kind = "decl"; decls = [ <vardecl | typedef | struct | enum> ]; }
+#       a block-scope declaration
 #   { kind = "expr"; expr; }                                  expression statement
 #   { kind = "empty"; }                                       `;`
 #   { kind = "if"; cond; thenStmt; elseStmt = <statement or null>; }
@@ -46,34 +73,54 @@
 #       init is null, a "decl" statement or an expression; cond and step are an
 #       expression or null.
 #   { kind = "return"; expr = <expression or null>; }
+#   { kind = "break"; }
+#   { kind = "continue"; }
+#   { kind = "switch"; cond; body = <statement>; }
+#   { kind = "case"; value = <expression>; stmt = <statement>; }    `case value: stmt`
+#   { kind = "default"; stmt = <statement>; }                       `default: stmt`
+#       Labels wrap the statement they label, wherever they appear; `case 1: case 2: s`
+#       is a case whose stmt is a case. In the usual form they are items of the block
+#       that is a switch's body.
 #
 # Block-scope declarators (position: the declared name):
 #   { kind = "vardecl"; name; type; init = <expression or null>; }
 #   { kind = "typedef"; name; type; }
+#   `static` and `extern` at block scope, and `{ ... }` initializers there, are unsupported.
 #
 # Expressions:
 #   { kind = "intlit"; value; unsigned; long; text; }     literal; position: the literal
 #       value is a non-negative integer, unsigned a bool (u/U suffix), long 0, 1 or 2
 #       (no suffix, l/L, ll/LL), text the literal as written. `-1` is a "unary" node.
+#   { kind = "charlit"; value; text; }                     character literal (type int);
+#       value is the character code, text the literal as written; position: the literal
 #   { kind = "ident"; name; }                              variable; position: the name
 #   { kind = "call"; name; args = [ <expression> ]; }      direct call; position: the name
 #   { kind = "cast"; type; expr; }                         position: the `(`
 #   { kind = "unary"; op; expr; }                          op: "-" "~" "!"; position: op
 #   { kind = "deref"; expr; }                              `*e`; position: the `*`
+#   { kind = "addr"; expr; }                               `&e`; position: the `&`
+#   { kind = "sizeof"; expr; }                             `sizeof e`; position: `sizeof`
+#   { kind = "sizeoftype"; type; }                         `sizeof (type)`; position: `sizeof`
 #   { kind = "index"; base; index; }                       `base[index]`; position: `[`
+#   { kind = "dot"; expr; name; }                          `expr.name`; position: the `.`
+#   { kind = "arrow"; expr; name; }                        `expr->name`; position: `->`
 #   { kind = "prefix"; op; expr; }                         op: "++" "--"; position: op
 #   { kind = "postfix"; op; expr; }                        op: "++" "--"; position: op
 #   { kind = "binary"; op; lhs; rhs; }                     position: the operator
 #       op: "*" "/" "%" "+" "-" "<<" ">>" "<" ">" "<=" ">=" "==" "!=" "&" "^" "|" "&&" "||"
+#   { kind = "cond"; cond; thenExpr; elseExpr; }           `?:`; position: the `?`
 #   { kind = "assign"; op; lhs; rhs; }                     position: the operator
 #       op: "=" "*=" "/=" "%=" "+=" "-=" "<<=" ">>=" "&=" "^=" "|="
-# Parentheses leave no node. Binary operators are left-associative and assignment is
-# right-associative, with C precedence (from loosest): ||, &&, |, ^, &, == !=,
-# < > <= >=, << >>, + -, * / %; then casts and prefix operators; then postfix operators.
+# Parentheses leave no node. Binary operators are left-associative, and `?:` and
+# assignment are right-associative, with C precedence (from loosest): assignment, ?:, ||,
+# &&, |, ^, &, == !=, < > <= >=, << >>, + -, * / %; then casts, prefix operators and
+# sizeof; then postfix operators.
 #
 # Left to the type checker: lvalue checks, the types of literals, implicit conversions,
-# calls to undeclared functions, `return` placement, and side effects on the right of
-# && and ||.
+# calls to undeclared functions, `return` placement, side effects on the right of && and
+# ||, the placement of `break`, `continue`, `case` and `default`, constant expressions
+# (array lengths, case labels, enum values, initializers), and the meaning of struct and
+# enum tags (scopes, completeness, duplicate members).
 let
   L = import ./lex.nix;
   inherit (builtins)
@@ -112,6 +159,7 @@ let
   counted = [
     "void"
     "char"
+    "short"
     "int"
     "long"
     "signed"
@@ -119,18 +167,13 @@ let
   ];
   # Declaration keywords outside the subset, with the description used in the error.
   rejected = {
-    short = "short";
     float = "floating-point type";
     double = "floating-point type";
-    struct = "struct";
     union = "union";
-    enum = "enum";
     volatile = "volatile";
     restrict = "restrict";
     _Bool = "_Bool";
     _Complex = "_Complex";
-    static = "storage class 'static'";
-    extern = "storage class 'extern'";
     auto = "storage class 'auto'";
     register = "storage class 'register'";
     inline = "inline";
@@ -140,7 +183,6 @@ let
     counted
     ++ [
       "const"
-      "short"
       "float"
       "double"
       "struct"
@@ -203,6 +245,17 @@ let
     to = ty;
   };
   wrapPtrs = ty: k: if k == 0 then ty else wrapPtrs (ptrTo ty) (k - 1);
+  # The type declared by declarator d on the specifier type ty.
+  declType =
+    ty: d:
+    let
+      n = length d.dims;
+      innermostFirst = genList (k: elemAt d.dims (n - 1 - k)) n;
+    in
+    builtins.foldl' (of: len: {
+      tag = "array";
+      inherit of len;
+    }) (wrapPtrs ty d.ptrs) innermostFirst;
 
   # Hide a typedef name behind an ordinary identifier declared in an inner scope.
   shadow = tn: name: if hasAttr name tn then tn // { ${name} = null; } else tn;
@@ -277,17 +330,23 @@ let
 
       # ---- Declarations ----
 
-      # Declaration specifiers at i -> { type; typedef; i; }.
+      # Declaration specifiers at i -> { type; typedef; storage; defs; tn; i; }. storage is
+      # null, "static" or "extern"; defs are the struct and enum definitions met in the
+      # specifiers (nested ones first), and tn the scope with their enumerators added.
       specs =
         tn: i0:
         let
           first = tok i0;
           zero = {
             typedef = false;
+            storage = null;
             named = null;
             any = false;
+            defs = [ ];
+            inherit tn;
             void = 0;
             char = 0;
+            short = 0;
             int = 0;
             long = 0;
             signed = 0;
@@ -303,7 +362,33 @@ let
               if x == "const" then
                 go (i + 1) acc
               else if x == "typedef" then
-                if acc.typedef then fail t "duplicate 'typedef'" else go (i + 1) (acc // { typedef = true; })
+                if acc.typedef then
+                  fail t "duplicate 'typedef'"
+                else if acc.storage != null then
+                  fail t "multiple storage classes"
+                else
+                  go (i + 1) (acc // { typedef = true; })
+              else if x == "static" || x == "extern" then
+                if acc.typedef || acc.storage != null then
+                  fail t "multiple storage classes"
+                else
+                  go (i + 1) (acc // { storage = x; })
+              else if x == "struct" || x == "enum" then
+                let
+                  tg = tagSpec acc.tn i;
+                in
+                if acc.any then
+                  invalid
+                else
+                  go tg.i (
+                    acc
+                    // {
+                      named = tg.type;
+                      any = true;
+                      defs = acc.defs ++ tg.defs;
+                      inherit (tg) tn;
+                    }
+                  )
               else if builtins.elem x counted then
                 go (i + 1) (
                   acc
@@ -316,7 +401,7 @@ let
                 unsupported t rejected.${x}
               else
                 done i acc
-            else if !acc.any && isTypeName tn t then
+            else if !acc.any && isTypeName acc.tn t then
               go (i + 1) (
                 acc
                 // {
@@ -328,14 +413,19 @@ let
               done i acc;
           done = i: acc: {
             type = baseType acc;
-            inherit (acc) typedef;
+            inherit (acc)
+              typedef
+              storage
+              defs
+              tn
+              ;
             inherit i;
           };
           invalid = fail first "invalid combination of type specifiers";
           baseType =
             a:
             let
-              total = a.void + a.char + a.int + a.long + a.signed + a.unsigned;
+              total = a.void + a.char + a.short + a.int + a.long + a.signed + a.unsigned;
               sign = a.signed + a.unsigned;
             in
             if a.named != null then
@@ -344,6 +434,11 @@ let
               fail first "expected a type specifier but found ${describe first}"
             else if a.void > 0 then
               if total == 1 then { tag = "void"; } else invalid
+            else if a.short > 0 then
+              if a.short > 1 || a.char > 0 || a.int > 1 || a.long > 0 || sign > 1 then
+                invalid
+              else
+                { tag = if a.unsigned == 1 then "ushort" else "short"; }
             else if a.char > 0 then
               if a.char > 1 || a.int > 0 || a.long > 0 || sign > 1 then
                 invalid
@@ -366,6 +461,164 @@ let
         # Force the type so that specifier errors are raised here.
         builtins.seq r.type r;
 
+      # `struct` or `enum` specifier at i (the keyword) -> { type; defs; tn; i; }.
+      tagSpec =
+        tn: i:
+        let
+          kw = tok i;
+          tagTok = tok (i + 1);
+          hasTag = tagTok.kind == "ident";
+          name = if hasTag then tagTok.text else "(anonymous at ${toString kw.line}:${toString kw.col})";
+          j = if hasTag then i + 2 else i + 1;
+          type = {
+            tag = kw.text;
+            inherit name;
+          };
+          body = if kw.text == "struct" then structBody else enumBody;
+        in
+        if isP j "{" then
+          body tn kw type (j + 1)
+        else if !hasTag then
+          fail tagTok "expected a tag name or '{' after '${kw.text}' but found ${describe tagTok}"
+        else
+          {
+            inherit type tn;
+            defs = [ ];
+            i = j;
+          };
+
+      # Members of a struct after `{` -> { type; defs; tn; i; } with i after `}`.
+      structBody =
+        tn: kw: type: i:
+        let
+          r = iterate memberDecl { inherit i tn; };
+          fields = concatLists (map (m: m.fields) r.nodes);
+          nested = concatLists (map (m: m.defs) r.nodes);
+        in
+        if fields == [ ] then
+          unsupported kw "empty struct"
+        else
+          {
+            inherit type;
+            defs = nested ++ [
+              (mk kw "struct" {
+                inherit (type) name;
+                members = fields;
+              })
+            ];
+            inherit (r.s) tn;
+            i = r.s.i + 1;
+          };
+
+      # Member declaration at s -> { node = { fields; defs; }; s; } or null at the `}`.
+      memberDecl =
+        s:
+        let
+          t = tok s.i;
+          sp = specs s.tn s.i;
+          r = memberDeclarators sp.tn sp sp.i;
+        in
+        if isP s.i "}" then
+          null
+        else if t.kind == "eof" then
+          fail t "expected '}' but found end of input"
+        else if !startsDecl s.tn s.i then
+          fail t "expected a member declaration but found ${describe t}"
+        else if sp.typedef || sp.storage != null then
+          fail t "storage class in a member declaration"
+        else if isP sp.i ":" then
+          unsupported (tok sp.i) "bit-field"
+        else if isP sp.i ";" then
+          unsupported t "anonymous struct member"
+        else
+          {
+            node = {
+              inherit (r) fields;
+              inherit (sp) defs;
+            };
+            s = {
+              inherit (r) i;
+              inherit (sp) tn;
+            };
+          };
+      memberDeclarators =
+        tn: sp: i:
+        let
+          d = declarator tn "named" i;
+          field = mk d.nameTok "field" {
+            inherit (d) name;
+            type = declType sp.type d;
+          };
+          rest = memberDeclarators tn sp (d.i + 1);
+        in
+        if d.params != null then
+          fail d.nameTok "field '${d.name}' declared as a function"
+        else if isP d.i ":" then
+          unsupported (tok d.i) "bit-field"
+        else if isP d.i "," then
+          {
+            fields = [ field ] ++ rest.fields;
+            inherit (rest) i;
+          }
+        else
+          {
+            fields = [ field ];
+            i = expect d.i ";";
+          };
+
+      # Enumerators after `{` -> { type; defs; tn; i; } with i after `}`.
+      enumBody =
+        tn: kw: type: i:
+        let
+          r = iterate enumerator { inherit i tn; };
+        in
+        if r.nodes == [ ] then
+          fail (tok i) "expected an enumerator name but found ${describe (tok i)}"
+        else
+          {
+            inherit type;
+            defs = [
+              (mk kw "enum" {
+                inherit (type) name;
+                consts = r.nodes;
+              })
+            ];
+            inherit (r.s) tn;
+            i = r.s.i + 1;
+          };
+
+      # Enumerator at s -> { node; s; } or null at the `}`. Its name is in scope from the
+      # next enumerator on.
+      enumerator =
+        s:
+        let
+          t = tok s.i;
+          hasValue = isP (s.i + 1) "=";
+          v = condExpr s.tn (s.i + 2);
+          after = if hasValue then v.i else s.i + 1;
+        in
+        if isP s.i "}" then
+          null
+        else if t.kind != "ident" then
+          fail t "expected an enumerator name but found ${describe t}"
+        else
+          {
+            node = mk t "enumconst" {
+              name = t.text;
+              value = if hasValue then v.node else null;
+            };
+            s = {
+              i =
+                if isP after "," then
+                  after + 1
+                else if isP after "}" then
+                  after
+                else
+                  fail (tok after) "expected ',' or '}' but found ${describe (tok after)}";
+              tn = shadow s.tn t.text;
+            };
+          };
+
       # `*` (each optionally followed by `const`) -> { ptrs; i; }.
       pointers =
         i: k:
@@ -380,7 +633,8 @@ let
           };
 
       # Declarator at i. mode: "named" (name required), "optional" (parameters) or
-      # "abstract" (type names, no name). -> { name; nameTok; ptrs; params; i; } where
+      # "abstract" (type names, no name). -> { name; nameTok; ptrs; dims; params; i; } where
+      # dims are the array lengths (outermost first; an expression, or null for `[]`) and
       # params is null unless this declares a function.
       declarator =
         tn: mode: i0:
@@ -396,6 +650,7 @@ let
           };
           fn = paramList tn (i1 + 1);
           afterFn = tok fn.i;
+          arr = arrayDims tn i1;
         in
         if !hasName && isP p.i "(" then
           if isP (p.i + 1) "*" then
@@ -407,7 +662,14 @@ let
         else if !hasName && mode == "named" then
           fail t "expected an identifier but found ${describe t}"
         else if isP i1 "[" then
-          unsupported (tok i1) "array declarator"
+          if isP arr.i "(" then
+            unsupported (tok arr.i) "array of functions"
+          else
+            base
+            // {
+              inherit (arr) dims i;
+              params = null;
+            }
         else if isP i1 "(" then
           if isP fn.i "(" || isP fn.i "[" then
             unsupported afterFn "function returning a function or an array"
@@ -415,12 +677,34 @@ let
             base
             // {
               inherit (fn) params i;
+              dims = [ ];
             }
         else
           base
           // {
+            dims = [ ];
             params = null;
             i = i1;
+          };
+
+      # Array suffixes `[n]...` at i -> { dims; i; }.
+      arrayDims =
+        tn: i:
+        let
+          empty = isP (i + 1) "]";
+          len = condExpr tn (i + 1);
+          next = if empty then i + 2 else expect len.i "]";
+          rest = arrayDims tn next;
+        in
+        if isP i "[" then
+          {
+            dims = [ (if empty then null else len.node) ] ++ rest.dims;
+            inherit (rest) i;
+          }
+        else
+          {
+            dims = [ ];
+            inherit i;
           };
 
       # Parameter list after `(` -> { params; i; } with i after `)`.
@@ -467,13 +751,17 @@ let
           fail (tok i) "expected a parameter declaration but found ${describe (tok i)}"
         else if sp.typedef then
           fail (tok i) "'typedef' in a parameter declaration"
+        else if sp.storage != null then
+          fail (tok i) "storage class in a parameter declaration"
+        else if sp.defs != [ ] then
+          unsupported (tok i) "type definition in a parameter declaration"
         else if d.params != null then
           unsupported d.nameTok "function pointer"
         else
           {
             node = mk at "param" {
               inherit (d) name;
-              type = wrapPtrs sp.type d.ptrs;
+              type = declType sp.type d;
             };
             inherit (d) i;
           };
@@ -492,15 +780,45 @@ let
           null
         else if !startsDecl tn i then
           fail (tok i) "expected a declaration but found ${describe (tok i)}"
+        else if isP sp.i ";" then
+          builtins.seq (declaresTag sp i) {
+            node = sp.defs;
+            s = {
+              i = sp.i + 1;
+              inherit (sp) tn;
+            };
+          }
         else
-          externalDeclarators tn sp sp.i true;
+          let
+            r = externalDeclarators sp.tn sp sp.i true;
+          in
+          {
+            node = sp.defs ++ r.node;
+            inherit (r) s;
+          };
+
+      # A declaration without declarators must declare a struct or enum tag.
+      declaresTag =
+        sp: i:
+        if
+          builtins.elem sp.type.tag [
+            "struct"
+            "enum"
+          ]
+        then
+          true
+        else
+          fail (tok i) "declaration does not declare anything";
 
       externalDeclarators =
         tn: sp: i: first:
         let
           d = declarator tn "named" i;
-          type = wrapPtrs sp.type d.ptrs;
+          type = declType sp.type d;
           at = d.nameTok;
+          hasInit = isP d.i "=";
+          init = initializer tn' (d.i + 1);
+          next = if hasInit then init.i else d.i;
           item =
             if sp.typedef then
               if d.params != null then
@@ -511,7 +829,12 @@ let
                   inherit type;
                 }
             else if d.params == null then
-              unsupported at "global variable"
+              mk at "global" {
+                inherit (d) name;
+                inherit type;
+                inherit (sp) storage;
+                init = if hasInit then init.node else null;
+              }
             else
               mk at "proto" {
                 inherit (d) name params;
@@ -519,13 +842,15 @@ let
               };
           tn' = if sp.typedef then tn // { ${d.name} = type; } else shadow tn d.name;
           isDef = first && !sp.typedef && d.params != null && isP d.i "{";
-          rest = externalDeclarators tn' sp (d.i + 1) false;
+          rest = externalDeclarators tn' sp (next + 1) false;
         in
         if isDef then
           funcDef tn' d type
+        else if hasInit && (sp.typedef || d.params != null) then
+          fail (tok d.i) "illegal initializer"
         else
           builtins.seq item (
-            if isP d.i "," then
+            if isP next "," then
               {
                 node = [ item ] ++ rest.node;
                 inherit (rest) s;
@@ -534,11 +859,50 @@ let
               {
                 node = [ item ];
                 s = {
-                  i = expect d.i ";";
+                  i = expect next ";";
                   tn = tn';
                 };
               }
           );
+
+      # Initializer at i (after `=`) -> { node; i; }: an expression or an "initlist".
+      initializer = tn: i: if isP i "{" then initList tn i else assignExpr tn i;
+
+      # `{ ... }` initializer list at i -> { node; i; } with i after `}`.
+      initList =
+        tn: i:
+        let
+          r = iterate (initItem tn) { i = i + 1; };
+        in
+        if r.nodes == [ ] then
+          unsupported (tok i) "empty initializer list"
+        else
+          {
+            node = mk (tok i) "initlist" { items = r.nodes; };
+            i = r.s.i + 1;
+          };
+      initItem =
+        tn: s:
+        let
+          x = initializer tn s.i;
+        in
+        if isP s.i "}" then
+          null
+        else if isP s.i "." || isP s.i "[" then
+          unsupported (tok s.i) "designated initializer"
+        else
+          {
+            inherit (x) node;
+            s = {
+              i =
+                if isP x.i "," then
+                  x.i + 1
+                else if isP x.i "}" then
+                  x.i
+                else
+                  fail (tok x.i) "expected ',' or '}' but found ${describe (tok x.i)}";
+            };
+          };
 
       funcDef =
         tn: d: ret:
@@ -568,17 +932,28 @@ let
         tn: i:
         let
           sp = specs tn i;
-          r = localDeclarators tn sp sp.i;
+          r =
+            if isP sp.i ";" then
+              builtins.seq (declaresTag sp i) {
+                decls = [ ];
+                i = sp.i + 1;
+                inherit (sp) tn;
+              }
+            else
+              localDeclarators sp.tn sp sp.i;
         in
-        {
-          node = mk (tok i) "decl" { decls = r.decls; };
-          inherit (r) i tn;
-        };
+        if sp.storage != null then
+          unsupported (tok i) "storage class '${sp.storage}' at block scope"
+        else
+          {
+            node = mk (tok i) "decl" { decls = sp.defs ++ r.decls; };
+            inherit (r) i tn;
+          };
       localDeclarators =
         tn: sp: i:
         let
           d = declarator tn "named" i;
-          type = wrapPtrs sp.type d.ptrs;
+          type = declType sp.type d;
           at = d.nameTok;
           tn' = if sp.typedef then tn // { ${d.name} = type; } else shadow tn d.name;
           hasInit = isP d.i "=";
@@ -733,17 +1108,45 @@ let
               node = node "return" { expr = if hasExpr then e.node else null; };
               i = expect (if hasExpr then e.i else i + 1) ";";
             }
-          else if
-            builtins.elem x [
-              "break"
-              "continue"
-              "goto"
-              "switch"
-              "case"
-              "default"
-            ]
-          then
-            unsupported t "'${x}' statement"
+          else if x == "break" || x == "continue" then
+            {
+              node = node x { };
+              i = expect (i + 1) ";";
+            }
+          else if x == "switch" then
+            let
+              c = parenExpr tn (i + 1);
+              b = stmt tn c.i;
+            in
+            {
+              node = node "switch" {
+                cond = c.node;
+                body = b.node;
+              };
+              inherit (b) i;
+            }
+          else if x == "case" then
+            let
+              v = condExpr tn (i + 1);
+              st = stmt tn (expect v.i ":");
+            in
+            {
+              node = node "case" {
+                value = v.node;
+                stmt = st.node;
+              };
+              inherit (st) i;
+            }
+          else if x == "default" then
+            let
+              st = stmt tn (expect (i + 1) ":");
+            in
+            {
+              node = node "default" { stmt = st.node; };
+              inherit (st) i;
+            }
+          else if x == "goto" then
+            unsupported t "'goto' statement"
           else if hasAttr x declKeywords then
             fail t "expected a statement but found a declaration"
           else
@@ -857,9 +1260,21 @@ let
       condExpr =
         tn: i:
         let
-          e = binary tn 1 i;
+          c = binary tn 1 i;
+          th = expr tn (c.i + 1);
+          el = condExpr tn (expect th.i ":");
         in
-        if isP e.i "?" then unsupported (tok e.i) "conditional operator" else e;
+        if isP c.i "?" then
+          {
+            node = mk (tok c.i) "cond" {
+              cond = c.node;
+              thenExpr = th.node;
+              elseExpr = el.node;
+            };
+            inherit (el) i;
+          }
+        else
+          c;
 
       precOf = t: if t.kind == "punct" && hasAttr t.text binPrec then binPrec.${t.text} else 0;
 
@@ -906,7 +1321,7 @@ let
           else if x == "*" then
             withOperand "deref" { }
           else if x == "&" then
-            unsupported t "address-of operator"
+            withOperand "addr" { }
           else if x == "+" then
             unsupported t "unary '+'"
           else if x == "(" && startsType tn (i + 1) then
@@ -914,9 +1329,32 @@ let
           else
             postfix tn i
         else if t.kind == "keyword" && x == "sizeof" then
-          unsupported t "sizeof"
+          sizeofExpr tn i
         else
           postfix tn i;
+
+      # `sizeof ( type-name )` or `sizeof unary-expression` at i.
+      sizeofExpr =
+        tn: i:
+        let
+          isType = isP (i + 1) "(" && startsType tn (i + 2);
+          ty = typeName tn (i + 2);
+          close = expect ty.i ")";
+          e = unary tn (i + 1);
+        in
+        if isType then
+          if isP close "{" then
+            unsupported (tok close) "compound literal"
+          else
+            {
+              node = mk (tok i) "sizeoftype" { inherit (ty) type; };
+              i = close;
+            }
+        else
+          {
+            node = mk (tok i) "sizeof" { expr = e.node; };
+            inherit (e) i;
+          };
 
       castExpr =
         tn: i:
@@ -945,11 +1383,15 @@ let
         in
         if sp.typedef then
           fail (tok i) "'typedef' in a type name"
+        else if sp.storage != null then
+          fail (tok i) "storage class in a type name"
+        else if sp.defs != [ ] then
+          unsupported (tok i) "type definition in a type name"
         else if d.params != null then
           unsupported (tok sp.i) "function type"
         else
           {
-            type = wrapPtrs sp.type d.ptrs;
+            type = declType sp.type d;
             inherit (d) i;
           };
 
@@ -966,6 +1408,7 @@ let
           x = t.text;
           idx = expr tn (e.i + 1);
           args = argList tn (e.i + 1);
+          member = tok (e.i + 1);
         in
         if t.kind != "punct" then
           e
@@ -997,7 +1440,16 @@ let
             i = e.i + 1;
           }
         else if x == "." || x == "->" then
-          unsupported t "member access"
+          if member.kind != "ident" then
+            fail member "expected a member name but found ${describe member}"
+          else
+            postfixOps tn {
+              node = mk t (if x == "." then "dot" else "arrow") {
+                expr = e.node;
+                name = member.text;
+              };
+              i = e.i + 2;
+            }
         else
           e;
 
@@ -1044,6 +1496,11 @@ let
                 text
                 ;
             };
+            i = i + 1;
+          }
+        else if t.kind == "char" then
+          {
+            node = mk t "charlit" { inherit (t) value text; };
             i = i + 1;
           }
         else if t.kind == "ident" then

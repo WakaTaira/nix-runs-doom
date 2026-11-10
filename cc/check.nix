@@ -94,6 +94,40 @@ let
 
   kindOf = x: x.kind or null;
 
+  # Syntax the parser accepts but the checker does not support yet, by node kind, with
+  # the description used in the error.
+  pendingItems = {
+    global = "global variable";
+    struct = "struct";
+    enum = "enum";
+  };
+  pendingStmts = {
+    break = "'break' statement";
+    continue = "'continue' statement";
+    switch = "'switch' statement";
+    case = "'case' label";
+    default = "'default' label";
+  };
+  pendingExprs = {
+    dot = "member access";
+    arrow = "member access";
+    addr = "address-of operator";
+    sizeof = "sizeof";
+    sizeoftype = "sizeof";
+    cond = "conditional operator";
+    charlit = "character literal";
+  };
+  pendingTypes = {
+    short = "short";
+    ushort = "unsigned short";
+    array = "array type";
+    struct = "struct";
+    enum = "enum";
+  };
+
+  # Description of the unsupported part of the type t, or null.
+  pendingType = t: if t.tag == "ptr" then pendingType t.to else pendingTypes.${t.tag} or null;
+
   # ---- Types ----
 
   ty = tag: { inherit tag; };
@@ -386,6 +420,8 @@ let
       binaryExpr env e
     else if k == "assign" then
       assignExpr env e
+    else if hasAttr k pendingExprs then
+      unsupported e pendingExprs.${k}
     else
       fail e "unexpected expression '${k}'";
 
@@ -439,7 +475,9 @@ let
     let
       x = ex env e.expr;
     in
-    if isVoid e.type then
+    if pendingType e.type != null then
+      unsupported e (pendingType e.type)
+    else if isVoid e.type then
       node e "cast" e.type { expr = x; }
     else if isVoid x.type then
       fail e.expr "void value used"
@@ -710,6 +748,8 @@ let
       forStmt env n
     else if k == "return" then
       returnStmt env tailOk n
+    else if hasAttr k pendingStmts then
+      unsupported n pendingStmts.${k}
     else
       fail n "unexpected statement '${k}'";
 
@@ -735,6 +775,10 @@ let
         acc: d:
         if d.kind == "typedef" then
           acc
+        else if hasAttr d.kind pendingItems then
+          unsupported d pendingItems.${d.kind}
+        else if pendingType d.type != null then
+          unsupported d (pendingType d.type)
         else
           let
             # The scope of a name starts after its declarator, so the initializer sees it.
@@ -889,6 +933,31 @@ let
         };
       };
 
+  # The first part of the signature of a proto or func whose type is not supported yet, as
+  # { at; what; }, or null.
+  pendingSig =
+    item:
+    let
+      parts = [
+        {
+          at = item;
+          type = item.ret;
+        }
+      ]
+      ++ map (p: {
+        at = p;
+        inherit (p) type;
+      }) item.params;
+      bad = filter (x: pendingType x.type != null) parts;
+    in
+    if bad == [ ] then
+      null
+    else
+      {
+        inherit (head bad) at;
+        what = pendingType (head bad).type;
+      };
+
   # Signatures of the prototypes and definitions in unit order, and the checked definitions.
   checkItems =
     items:
@@ -901,6 +970,7 @@ let
             params = map (p: p.type) item.params;
           };
           prev = acc.funcs.${item.name} or null;
+          pending = pendingSig item;
           isDef = item.kind == "func";
           funcs = acc.funcs // {
             ${item.name} = sig // {
@@ -910,6 +980,10 @@ let
         in
         if item.kind == "typedef" then
           acc
+        else if hasAttr item.kind pendingItems then
+          unsupported item pendingItems.${item.kind}
+        else if pending != null then
+          unsupported pending.at pending.what
         else if prev != null && (prev.ret != sig.ret || prev.params != sig.params) then
           fail item "conflicting types for '${item.name}'"
         else if isDef && prev != null && prev.defined then

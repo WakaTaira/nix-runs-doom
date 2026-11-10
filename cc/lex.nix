@@ -6,6 +6,9 @@
 #   "keyword"  C keyword (text is the keyword)
 #   "int"      integer literal; also has value (a non-negative Nix integer),
 #              unsigned (bool, a u/U suffix) and long (0, 1 or 2: none, l/L, ll/LL)
+#   "char"     character literal; also has value (the character code). Accepted: one
+#              printable ASCII character, or one of the escapes \n \t \r \0 \a \b \f
+#              \v \\ \' \" \?
 #   "punct"    operator or punctuator (text is the operator, e.g. ">>=")
 #   "eof"      end of input (always the last token, text is "")
 # Comments (/* */ and //) and whitespace are dropped.
@@ -17,10 +20,12 @@
 # refers to element i - 1; the list is forced in order by foldl', so the recursion stays
 # shallow.
 #
-# Rejected here: preprocessor directives, character and string literals, floating-point
+# Rejected here: preprocessor directives, string literals, character literals other than
+# the ones above (multi-character, octal and hex escapes, prefixes such as L), floating-point
 # and octal literals, and characters that start no C token. Errors are thrown as
 # "cc: <line>:<col>: <message>" ("unsupported: ..." for valid C outside the subset).
 let
+  A = import ../lib/ascii.nix;
   inherit (builtins)
     elemAt
     filter
@@ -53,6 +58,7 @@ let
     + "/\\*([^*]|\\*+[^*/])*\\*+/" # block comment
     + "|//[^\n]*" # line comment
     + "|/\\*" # unterminated block comment
+    + "|'([^'\\\n]|\\\\[^\n])*'" # character literal
     + "|[0-9][0-9A-Za-z_.]*" # preprocessing number
     + "|[A-Za-z_][0-9A-Za-z_]*" # identifier or keyword
     + "|>>=|<<=|\\.\\.\\.|->|\\+\\+|--|<<|>>|&&|\\|\\||[-*/%+&^|<>=!]="
@@ -219,6 +225,54 @@ let
         inherit (suffix) unsigned long;
       };
 
+  # Simple escape sequences: the character after the backslash -> character code.
+  escapes = {
+    n = 10;
+    t = 9;
+    r = 13;
+    "0" = 0;
+    a = 7;
+    b = 8;
+    f = 12;
+    v = 11;
+    "\\" = 92;
+    "'" = 39;
+    "\"" = 34;
+    "?" = 63;
+  };
+
+  # Code of a one-character string if it is printable ASCII, or null.
+  printable = c: if match "[ -~]" c != null then A.ord c else null;
+
+  # A complete character literal ('...') as a token.
+  charToken =
+    line: col: text:
+    let
+      body = substring 1 (stringLength text - 2) text;
+      esc = substring 1 1 body;
+      value =
+        if stringLength body == 1 then
+          printable body
+        else if stringLength body == 2 && substring 0 1 body == "\\" && hasAttr esc escapes then
+          escapes.${esc}
+        else
+          null;
+    in
+    if body == "" then
+      fail line col "empty character literal"
+    else if value == null then
+      unsupported line col "character literal ${text}"
+    else
+      {
+        kind = "char";
+        inherit
+          text
+          line
+          col
+          value
+          ;
+      };
+
   # Classify the matched text at line:col: a token, or null for a comment.
   classify =
     line: col: text:
@@ -247,7 +301,10 @@ let
     else if c == "\"" then
       unsupported line col "string literal"
     else if c == "'" then
-      unsupported line col "character literal"
+      if stringLength text > 1 then
+        charToken line col text
+      else
+        fail line col "unterminated character literal"
     else
       fail line col "unexpected character '${text}'";
 
