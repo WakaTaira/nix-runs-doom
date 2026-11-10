@@ -93,10 +93,25 @@ let
         if e.exit then e else go e;
     in
     removeAttrs (go (vars // { exit = false; })) [ "exit" ];
+
+  # `loop` without a condition: each iteration runs `body` until it sets `exit = true`.
+  loopDo =
+    body: vars:
+    let
+      tick = v: _: if v.exit then v else body v;
+      go =
+        v:
+        let
+          e = forceVars (foldl' tick v chunkTicks);
+        in
+        if e.exit then e else go e;
+    in
+    removeAttrs (go (vars // { exit = false; })) [ "exit" ];
 in
 {
   inherit
     loop
+    loopDo
     shlInt
     sraInt
     shlLL

@@ -727,6 +727,195 @@ let
     in
     elemAt parts (2 * (at 0 + 1));
 
+  # ---- Unconditional loop driver and cached reads ----
+  # Expected values follow the C semantics, worked out by hand.
+
+  # The source of the generated function fn in the compiled src (up to the next function).
+  fnCodeWith =
+    compileFn: src: fn:
+    let
+      parts = builtins.split "\n  ([A-Za-z_][A-Za-z0-9_]*)_fn =\n" (compileFn src);
+      at = i: if elemAt parts (2 * i + 1) == [ fn ] then elemAt parts (2 * i + 2) else at (i + 1);
+    in
+    at 0;
+  fnCode = fnCodeWith Cc.compile;
+
+  loopDoSrc = ''
+    int doW(int n) { int s = 0; do { s += n; } while (--n > 0); return s; }
+    int forEver(int n) { int i = 0; for (;;) { if (i == n) break; i++; } return i; }
+    int whileOne(int n) { int i = 0; while (1) { i += 3; if (i > n) return i; } }
+    int preDec(int n) { int k = 0; while (--n) k += 2; return k; }
+    int whileLess(int n) { int i = 0, s = 0; while (i < n) { s += i; i++; } return s; }
+  '';
+
+  # Globals at base + 0 (g), 4 (h), 8 (hs), 10 (hc), 12 (arr), 24 (limit), 28 (a2), 32 (b2).
+  cacheSrc = ''
+    int g; int h; short hs; signed char hc; int arr[3]; int limit; int a2; int b2;
+    int id(int x) { return x; }
+    int byteAt(int k, int n, int which) {
+      unsigned char *p = (unsigned char *)&g + k;
+      int before = 0, after = 0;
+      g = 0;
+      for (int i = 0; i < n; i++) { before += g; *p = i + 1; after += g; }
+      return which ? after : before;
+    }
+    int straddleWord(int which) {
+      int *p = (int *)((unsigned char *)&a2 + 2);
+      int ra = 0, rb = 0;
+      for (int i = 0; i < 1; i++) { ra = a2; rb = b2; *p = 0x01020304; ra = a2; rb = b2; }
+      return which ? rb : ra;
+    }
+    int straddleHalf(int which) {
+      unsigned short *p = (unsigned short *)((unsigned char *)&a2 + 3);
+      int ra = 0, rb = 0;
+      for (int i = 0; i < 1; i++) { ra = a2; rb = b2; *p = 0x0506; ra = a2; rb = b2; }
+      return which ? rb : ra;
+    }
+    int signedReload(int n) {
+      unsigned char *p = (unsigned char *)&hs;
+      unsigned char *q = (unsigned char *)&hc;
+      int s = 0, t = 0;
+      for (int i = 0; i < n; i++) { s = hs; t = hc; p[1] = 0x80; q[0] = 0xff; s = hs; t = hc; }
+      return s * 1000 + t;
+    }
+    int noOverlap(int n) {
+      unsigned char *lo = (unsigned char *)&g - 1;
+      unsigned char *hi = (unsigned char *)&g + 4;
+      int s = 0;
+      g = 7;
+      for (int i = 0; i < n; i++) { *lo = 0xff; *hi = i; s += g; }
+      return s * 100 + h;
+    }
+    int compound(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; i++) { *p += 1; s += g; } return s; }
+    int postInc(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; i++) { (*p)++; s += g; } return s; }
+    int inCond(int n) { int *p = &g; int s = 0, i = 0; g = 0; while ((*p = i) < n) { s += g; i++; } return s * 100 + g; }
+    int inStep(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; *p = ++i) s += g; return s * 100 + g; }
+    int inDoCond(int n) { int *p = &g; int s = 0, i = 0; g = 0; do { s += g; } while ((*p = ++i) < n); return s * 100 + g; }
+    int inTernary(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; i++) s += (*p = i) ? g * 10 : g + 100; return s; }
+    int inAnd(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; i++) { if ((*p = i) && g > 1) s += g; } return s; }
+    int joinIf(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; i++) { if (i == 1) *p = 5; s += g; } return s; }
+    int joinIfBreak(int n) {
+      int *p = &g; int s = 0; g = 0;
+      for (int i = 0; i < n; i++) { if (i == 1) { *p = 5; if (n == 0) break; } s += g; }
+      return s;
+    }
+    int joinSwitch(int n) {
+      int *p = &g; int s = 0; g = 1;
+      for (int i = 0; i < n; i++) { switch (i) { case 0: *p = 2; break; default: ; } s += g; }
+      return s;
+    }
+    int contAfter(int n) {
+      int *p = &g; int s = 0; g = 0;
+      for (int i = 0; i < n; i++) { s += g; if (i % 2 == 0) { *p = g + 10; continue; } s += 1000; }
+      return s;
+    }
+    int breakAfter(int n) {
+      int *p = &g; int s = 0; g = 0;
+      for (int i = 0; i < n; i++) { s += g; if (i == 2) { *p = 42; break; } *p = g + 1; }
+      return g * 100 + s;
+    }
+    int retAfter(int n) {
+      int *p = &g; g = 1;
+      for (int i = 0; i < n; i++) { if (g == 1 && i == 1) { *p = 9; return g; } }
+      return -1;
+    }
+    int constStore(int n) { int s = 0; for (int i = 0; i < n; i++) { g = i; s += g; } return s; }
+    int constElem(int n) {
+      int s = 0; arr[0] = 100;
+      for (int i = 0; i < n; i++) { arr[1] = i * 2; s += arr[1] + arr[0]; }
+      return s;
+    }
+    int withCall(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; i++) { *p = id(i); s += g; } return s; }
+    int outer(int n) {
+      int *p = &g; int s = 0; g = 0;
+      for (int i = 0; i < n; i++) { s += g; *p = i + 1; for (int j = 0; j < 2; j++) s += j; }
+      return s;
+    }
+    int limitCond(int n) {
+      int *p = &limit; int i = 0; limit = n;
+      while (i < limit) { i++; if (i == 2) *p = 4; }
+      return i;
+    }
+    int twoStores(int n) {
+      int *p = &g; int *q = &h; int s = 0; g = 0;
+      for (int i = 0; i < n; i++) { s += g; *p = i + 5; *q = 0; }
+      return s * 100 + g;
+    }
+    int ternaryAfter(int n) { int *p = &g; int s = 0; g = 0; for (int i = 0; i < n; i++) { *p = i + 1; s += i ? g : 100; } return s; }
+  '';
+  cacheRet = fn: args: dret cacheSrc fn args;
+  cacheSyms = (Cc.load cacheSrc).__data.symbols;
+  # The generated fn of cacheSrc caches the read of type tag at the address of the global
+  # name.
+  cachesIn =
+    fn: name: tag:
+    contains "g'${toString cacheSyms.${name}}'${tag}" (fnCode cacheSrc fn);
+
+  # The data at address 0: g is at 0.
+  wrapSrc0 = ''
+    int g;
+    int wrapHalf(unsigned a, int n) {
+      unsigned short *p = (unsigned short *)a;
+      int s = 0; g = 0;
+      for (int i = 0; i < n; i++) { s = g; *p = 0x0102; s = g; }
+      return s;
+    }
+    int wrapWord(unsigned a, int n) {
+      unsigned *p = (unsigned *)a;
+      int s = 0; g = 0;
+      for (int i = 0; i < n; i++) { s = g; *p = 0x04030201; s = g; }
+      return s;
+    }
+  '';
+  wrapRet0 =
+    fn: args:
+    let
+      d = loadData (Cc.loadWith { dataBase = 0; }) wrapSrc0;
+    in
+    (foldl' (f: a: f a) (d.f.${fn} d.mem) args).ret;
+
+  # In the draw input, the loop of fn reads the pointer at the address of the global name
+  # through its cached value, and loads it only for the initial value (from mem, the
+  # memory at the call) and in the set added to the update when the store hits; no
+  # re-read is bound per entry.
+  drawCacheCase =
+    fn: name:
+    let
+      code = fnCode Cc.examples.draw.src fn;
+      k = toString (Cc.load Cc.examples.draw.src).__data.symbols.${name};
+    in
+    t "cc cache: ${fn} reads ${name} through the cached value"
+      [
+        (countIn "M\\.loadWord [A-Za-z0-9_.]+ ${k}([^0-9]|$)" code)
+        (contains "g'${k}'ptr = M.loadWord mem ${k};" code)
+        (countIn "// \\(if hit_[0-9]+ then \\{[^}]* g'${k}'ptr = M\\.loadWord mem_[0-9]+ ${k};[^}]*} else \\{ }\\)" code)
+        (countIn "B\\.add [A-Za-z0-9_]+\\.g'${k}'ptr " code)
+        (countIn "g_[0-9]+ = if" code)
+      ]
+      [
+        2
+        true
+        1
+        1
+        0
+      ];
+
+  # The right-hand sides of the overlap tests (`hit_<n> = <test>;`) in code.
+  hitTests = code: map head (filter isList (builtins.split "hit_[0-9]+ = ([^;]*);" code));
+
+  # Globals at base + 0 (a), 4 (b), 8 (pad), 24 (c), 28 (hs), 30 (hc). The stores go
+  # through a pointer parameter, so the address in the tests is p_0.
+  rangeSrc = ''
+    int a; int b; int pad[4]; int c; short hs; signed char hc;
+    int adjWord(int *p, int n) { int s = 0; for (int i = 0; i < n; i++) { *p = i; s += a + b; } return s; }
+    int adjByte(unsigned char *p, int n) { int s = 0; for (int i = 0; i < n; i++) { *p = i; s += a + b; } return s; }
+    int adjHalf(unsigned short *p, int n) { int s = 0; for (int i = 0; i < n; i++) { *p = i * 257; s += a + b; } return s; }
+    int farWord(int *p, int n) { int s = 0; for (int i = 0; i < n; i++) { *p = i; s += a + c; } return s; }
+    int mixedByte(unsigned char *p, int n) { int s = 0; for (int i = 0; i < n; i++) { *p = i; s += c + hs + hc; } return s; }
+  '';
+  rangeRet = fn: args: dret rangeSrc fn args;
+  rangeHits = fn: hitTests (fnCode rangeSrc fn);
+
   fixmulSrc = import ../cc/examples/spike.nix;
   fixmul =
     a: b:
@@ -2924,4 +3113,345 @@ in
       true
     ]
   )
+  # Unconditional loop driver
+  (t "cc run: loops driven by R.loopDo"
+    [
+      (ret loopDoSrc "doW" [ 4 ])
+      (ret loopDoSrc "forEver" [ 5 ])
+      (ret loopDoSrc "whileOne" [ 10 ])
+      (ret loopDoSrc "preDec" [ 4 ])
+      (ret loopDoSrc "whileLess" [ 5 ])
+    ]
+    [
+      10
+      5
+      12
+      6
+      10
+    ]
+  )
+  (t "cc emit: do/while, for (;;), while (1) and a condition with side effects use R.loopDo"
+    (map
+      (fn: [
+        (contains "R.loop " (fnCode loopDoSrc fn))
+        (contains "R.loopDo" (fnCode loopDoSrc fn))
+      ])
+      [
+        "doW"
+        "forEver"
+        "whileOne"
+        "preDec"
+        "whileLess"
+      ]
+    )
+    [
+      [
+        false
+        true
+      ]
+      [
+        false
+        true
+      ]
+      [
+        false
+        true
+      ]
+      [
+        false
+        true
+      ]
+      [
+        true
+        false
+      ]
+    ]
+  )
+  # Cached reads of constant addresses
+  (drawCacheCase "R_DrawColumn" "dc_source")
+  (drawCacheCase "R_DrawColumn" "dc_colormap")
+  (drawCacheCase "R_DrawSpan" "ds_source")
+  (drawCacheCase "R_DrawSpan" "ds_colormap")
+  (t "cc cache: the loops of the overlap tests cache their reads"
+    [
+      (cachesIn "byteAt" "g" "int")
+      (cachesIn "straddleWord" "a2" "int")
+      (cachesIn "straddleWord" "b2" "int")
+      (cachesIn "signedReload" "hs" "short")
+      (cachesIn "signedReload" "hc" "schar")
+      (cachesIn "compound" "g" "int")
+      (cachesIn "joinSwitch" "g" "int")
+      (cachesIn "limitCond" "limit" "int")
+    ]
+    [
+      true
+      true
+      true
+      true
+      true
+      true
+      true
+      true
+    ]
+  )
+  (t "cc cache: a byte store through a pointer is seen in the same and the next iteration"
+    (map
+      (k: [
+        (cacheRet "byteAt" [
+          k
+          2
+          0
+        ])
+        (cacheRet "byteAt" [
+          k
+          2
+          1
+        ])
+      ])
+      [
+        0
+        1
+        2
+        3
+      ]
+    )
+    [
+      [
+        1
+        3
+      ]
+      [
+        256
+        768
+      ]
+      [
+        65536
+        196608
+      ]
+      [
+        16777216
+        50331648
+      ]
+    ]
+  )
+  (t "cc cache: unaligned word and half stores over two adjacent globals"
+    [
+      (cacheRet "straddleWord" [ 0 ])
+      (cacheRet "straddleWord" [ 1 ])
+      (cacheRet "straddleHalf" [ 0 ])
+      (cacheRet "straddleHalf" [ 1 ])
+    ]
+    [
+      50593792
+      258
+      100663296
+      5
+    ]
+  )
+  (t "cc cache: stores that wrap around 2^32 onto a global at address 0"
+    [
+      (wrapRet0 "wrapHalf" [
+        4294967295
+        1
+      ])
+      (wrapRet0 "wrapWord" [
+        4294967293
+        1
+      ])
+      (wrapRet0 "wrapHalf" [
+        4294967294
+        1
+      ])
+      (wrapRet0 "wrapWord" [
+        4294967292
+        1
+      ])
+    ]
+    [
+      1
+      4
+      0
+      0
+    ]
+  )
+  (t "cc cache: re-read short and signed char globals are sign-extended" (cacheRet "signedReload" [
+    2
+  ]) (-32768001))
+  (t "cc cache: stores next to a global leave its cached value" (cacheRet "noOverlap" [ 3 ]) 2102)
+  (t "cc cache: stores by op=, ++, in conditions, in the for step, ?: and &&"
+    [
+      (cacheRet "compound" [ 3 ])
+      (cacheRet "postInc" [ 3 ])
+      (cacheRet "inCond" [ 3 ])
+      (cacheRet "inStep" [ 3 ])
+      (cacheRet "inDoCond" [ 3 ])
+      (cacheRet "inTernary" [ 3 ])
+      (cacheRet "inAnd" [ 4 ])
+    ]
+    [
+      6
+      6
+      303
+      303
+      303
+      130
+      5
+    ]
+  )
+  (t "cc cache: re-read values survive if, switch, continue, break and return"
+    [
+      (cacheRet "joinIf" [ 3 ])
+      (cacheRet "joinIfBreak" [ 3 ])
+      (cacheRet "joinSwitch" [ 2 ])
+      (cacheRet "contAfter" [ 3 ])
+      (cacheRet "breakAfter" [ 5 ])
+      (cacheRet "retAfter" [ 3 ])
+    ]
+    [
+      10
+      10
+      4
+      1020
+      4203
+      9
+    ]
+  )
+  (t "cc cache: a read that a store at a constant address overlaps is not cached"
+    [
+      (cacheRet "constStore" [ 4 ])
+      (cacheRet "constElem" [ 3 ])
+      (cachesIn "constStore" "g" "int")
+      (contains "g'${toString (cacheSyms.arr + 4)}'int" (fnCode cacheSrc "constElem"))
+      (contains "g'${toString cacheSyms.arr}'int" (fnCode cacheSrc "constElem"))
+    ]
+    [
+      6
+      306
+      false
+      false
+      true
+    ]
+  )
+  (t "cc cache: a loop with a call and the outer loop of a nest do not cache"
+    [
+      (cacheRet "withCall" [ 4 ])
+      (cacheRet "outer" [ 3 ])
+      (cachesIn "withCall" "g" "int")
+      (cachesIn "outer" "g" "int")
+    ]
+    [
+      6
+      6
+      false
+      false
+    ]
+  )
+  (t "cc cache: a loop whose condition reads a global it stores through a pointer stops" (cacheRet
+    "limitCond"
+    [ 10 ]
+  ) 4)
+  (t "cc cache: overlap tests merge touching ranges; a byte store tests only its address"
+    (map rangeHits [
+      "adjWord"
+      "adjByte"
+      "adjHalf"
+      "farWord"
+      "mixedByte"
+    ])
+    [
+      [ "bitAnd (p_0 - 4194304) 4294967295 < 8 || bitAnd (4194304 - p_0) 4294967295 < 4" ]
+      [ "bitAnd (p_0 - 4194304) 4294967295 < 8" ]
+      [ "bitAnd (p_0 - 4194304) 4294967295 < 8 || bitAnd (4194304 - p_0) 4294967295 < 2" ]
+      [
+        "bitAnd (p_0 - 4194304) 4294967295 < 4 || bitAnd (4194304 - p_0) 4294967295 < 4 || bitAnd (p_0 - 4194328) 4294967295 < 4 || bitAnd (4194328 - p_0) 4294967295 < 4"
+      ]
+      [ "bitAnd (p_0 - 4194328) 4294967295 < 7" ]
+    ]
+  )
+  (t "cc cache: stores inside, at the edges of and outside the merged ranges"
+    [
+      (rangeRet "adjWord" [
+        (base + 4)
+        3
+      ])
+      (rangeRet "adjWord" [
+        (base + 8)
+        3
+      ])
+      (rangeRet "adjByte" [
+        (base + 7)
+        3
+      ])
+      (rangeRet "adjByte" [
+        (base - 1)
+        3
+      ])
+      (rangeRet "adjHalf" [
+        (base - 1)
+        3
+      ])
+      (rangeRet "adjHalf" [
+        (base + 7)
+        3
+      ])
+      (rangeRet "adjHalf" [
+        (base - 2)
+        3
+      ])
+      (rangeRet "farWord" [
+        (base + 24)
+        3
+      ])
+      (rangeRet "farWord" [
+        (base + 12)
+        3
+      ])
+      (rangeRet "farWord" [
+        base
+        3
+      ])
+      (rangeRet "mixedByte" [
+        (base + 30)
+        3
+      ])
+      (rangeRet "mixedByte" [
+        (base + 29)
+        3
+      ])
+      (rangeRet "mixedByte" [
+        (base + 31)
+        3
+      ])
+    ]
+    [
+      3
+      0
+      50331648
+      0
+      3
+      50331648
+      0
+      3
+      0
+      3
+      3
+      768
+      0
+    ]
+  )
+  (t "cc cache: two checked stores without a later read add the re-read under either hit"
+    [
+      (cacheRet "twoStores" [ 2 ])
+      (countIn "// \\(if hit_[0-9]+ \\|\\| hit_[0-9]+ then \\{" (fnCode cacheSrc "twoStores"))
+      (countIn "g_[0-9]+ = if" (fnCode cacheSrc "twoStores"))
+    ]
+    [
+      506
+      1
+      0
+    ]
+  )
+  (t "cc cache: a read in a branch of ?: after a store sees the stored value" (cacheRet "ternaryAfter"
+    [ 3 ]
+  ) 105)
 ]

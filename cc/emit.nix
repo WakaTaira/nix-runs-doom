@@ -8,15 +8,33 @@
 #   { base; size; symbols = { <C name> = <address>; ... }; init = mem: <mem>; }
 # init writes the initial values that are not 0 into a memory where the whole data area
 # reads as 0; callers apply it before calling the functions. The translation is
-# mechanical, with no optimization:
+# mechanical, except for the loop driver and the cached reads described below:
 #   - A C function becomes `mem: <params>:` returning the new memory, or { mem; ret; }
 #     when it returns a value.
 #   - Locals become let bindings, with a new name for each assignment. Assigning a plain
 #     name or a non-negative constant only renames.
-#   - Every loop becomes `R.loop cond body vars`. vars holds mem and the variables that
-#     are declared outside the loop and assigned in it; the others are read from the
-#     enclosing scope. A do/while loop, and a loop whose condition has side effects,
-#     tests inside the body and sets `exit`.
+#   - A loop becomes `R.loop cond body vars`, or `R.loopDo body vars` (no condition to
+#     call) when it is a do/while loop, has no condition, has a condition that is a
+#     constant other than 0, or has a condition with side effects. vars holds mem and the
+#     variables that are declared outside the loop and assigned in it; the others are read
+#     from the enclosing scope. A do/while loop, and a loop whose condition has side
+#     effects, tests inside the body and sets `exit`.
+#   - A loop that contains no loop and no call caches its scalar reads at constant
+#     addresses (file-scope variables, constant indices, members): each pair of address
+#     and type (a key) that no store at a constant address in the loop overlaps becomes a
+#     variable in vars, read on entry (after the for initialization) from the memory
+#     there, and its reads use that variable. Every other store (address a, s bytes) is
+#     followed by `hit_<n> = <test>`, which detects an overlap modulo 2^32 with the byte
+#     ranges of the keys, merged where they touch or overlap: for each range [k, k + n),
+#     `bitAnd (a - k) 4294967295 < n || bitAnd (k - a) 4294967295 < s`, without the
+#     second term when s is 1, the ranges joined by ||. When a hit holds, every key reads
+#     again from the memory. A read of a key after such stores in the same iteration binds
+#     `g_<n> = if <hits> then <load> else <value>` for each key, and so does a join set
+#     (as a field); otherwise the end of the iteration adds
+#     `// (if <hits> then { <key> = <load>; ... } else { })` to the loop update, with the
+#     hits since the start of the iteration joined by ||. The cached values are versioned
+#     like mem: the join sets of if/else and switch carry them wherever mem may change,
+#     every way out of an iteration passes them on, and they are dropped after the loop.
 #   - if/else becomes an attribute set of mem and the variables either branch changes,
 #     which the following code reads.
 #   - A statement completes normally or abruptly by return, break (to the innermost loop
@@ -75,7 +93,8 @@
 # cannot clash with a C function, since identifiers starting with `__` are reserved in C.
 # In the loop, join and switch sets a variable is its C name, with ' appended to mem and
 # exit; the generated fields st', ret' and done' contain a ', so they cannot clash. A
-# variable declared in a switch body that hides one the sections assign is `<C name>'<n>`.
+# variable declared in a switch body that hides one the sections assign is `<C name>'<n>`,
+# and a cached read is `g'<address>'<type tag>`.
 let
   Ch = import ./check.nix;
   T = Ch.types;
@@ -84,6 +103,8 @@ let
     all
     any
     attrNames
+    attrValues
+    bitAnd
     concatLists
     concatMap
     concatStringsSep
@@ -98,6 +119,8 @@ let
     map
     removeAttrs
     replaceStrings
+    sort
+    substring
     tail
     ;
 
@@ -163,10 +186,11 @@ let
   attrName = name: if name == "mem" || name == "exit" then "${name}'" else quoteAttr name;
 
   # ---- Emitter state ----
-  # s = { n; mem; vars; names; old; retVoid; }: n numbers the next generated name; mem is
-  # the current memory; vars maps a variable key to the code of its current value (a name
-  # or a constant); names maps a key to the C name; old is the code of the target's value
-  # while an assignment's value is emitted; retVoid tells that the function returns void.
+  # s = { n; mem; vars; names; old; retVoid; cached; }: n numbers the next generated name;
+  # mem is the current memory; vars maps a variable key to the code of its current value
+  # (a name or a constant); names maps a key to the C name; old is the code of the
+  # target's value while an assignment's value is emitted; retVoid tells that the function
+  # returns void; cached lists the cached reads of the enclosing loop (see "Cached reads").
   fresh = s: base: {
     name = "${base}_${toString s.n}";
     s = s // {
@@ -463,8 +487,9 @@ let
     else if k == "deref" then
       let
         a = expr s e.expr;
+        key = readKey e;
       in
-      a // { c = load a.s.mem e.type a.c; }
+      if key != null && s.vars ? ${key} then readCached s key else a // { c = load a.s.mem e.type a.c; }
     else if k == "call" then
       call s e
     else if k == "assign" then
@@ -793,9 +818,10 @@ let
       node = if !newUsed && e.value.kind == "cast" then e.value.expr else e.value;
       v = expr (s // { old = oldC; }) node;
       a = expr (v.s // { inherit (s) old; }) e.target.expr;
-      # The address is used twice when the value reads the target.
+      # The address is used twice when the value reads the target, or when the store is
+      # checked against the cached reads (see refreshCache).
       ad =
-        if hasOld e.value then
+        if hasOld e.value || checksCache s e.target then
           share a.s "p" a.c
         else
           {
@@ -828,12 +854,16 @@ let
         ad.c
         (encode t node.type vb.c)
       ];
+      r = refreshCache (
+        m.s
+        // {
+          mem = m.name;
+          inherit (s) old;
+        }
+      ) e.target ad.c;
     in
     {
-      s = m.s // {
-        mem = m.name;
-        inherit (s) old;
-      };
+      inherit (r) s;
       binds =
         v.binds
         ++ a.binds
@@ -845,7 +875,8 @@ let
             inherit (m) name;
             inherit (store) code;
           }
-        ];
+        ]
+        ++ r.binds;
       c = if e.post then o.c else vb.c;
     };
 
@@ -898,7 +929,12 @@ let
     s: e:
     let
       c = cond s e.cond false;
-      a = expr c.s e.thenExpr;
+      # A cached read in a branch must not bind, so the entries are settled before.
+      st = settleFor c.s [
+        e.thenExpr
+        e.elseExpr
+      ];
+      a = expr st.s e.thenExpr;
       b = expr a.s e.elseExpr;
     in
     if a.binds != [ ] || b.binds != [ ] then
@@ -906,7 +942,7 @@ let
     else
       {
         inherit (b) s;
-        inherit (c) binds;
+        binds = c.binds ++ st.binds;
         c = low "if ${c.c.code} then ${a.c.code} else ${b.c.code}";
       };
 
@@ -925,6 +961,264 @@ let
     {
       inherit (r) s binds;
     };
+
+  # ---- Cached reads (see the header) ----
+  # An entry is { key; attr; addr; type; size; }: the read of the scalar type at the
+  # constant address addr. Inside the loop that caches it, s.cached lists the entries
+  # (empty elsewhere), s.names.${key} = attr is the name of an entry in the loop and join
+  # sets, and its value is given by s.vars.${key}, the code of its base (its value at some
+  # earlier point), together with s.hits, the overlap tests (atoms) of the checked stores
+  # since that point, shared by all entries. With no hits the value is the base; otherwise
+  # it is the value in the current memory when a hit holds (after the last store that hits,
+  # no store touches a cached byte), else the base. Reading an entry, or joining it into a
+  # set, settles it: the value is bound and becomes the new base, and hits is emptied.
+
+  # The key of a read of type t at the constant address addr. It contains ', which the
+  # keys of variables (`<name>@<line>:<col>`) do not.
+  cacheKey = addr: t: "'${toString addr}'${t.tag}";
+  isCacheKey = key: substring 0 1 key == "'";
+
+  # A read or store at a constant address.
+  atConst = x: kindOf x == "deref" && x.expr.kind == "lit";
+
+  # The key of the read e (a "deref" node) when its address is a constant, otherwise null.
+  readKey = e: if e.expr.kind == "lit" then cacheKey e.expr.value e.type else null;
+
+  # Whether the bytes [a, a + s) and [k, k + n) overlap, with addresses modulo 2^32.
+  overlaps =
+    a: s: k: n:
+    bitAnd (k - a) B.mask32 < s || bitAnd (a - k) B.mask32 < n;
+
+  # A loop caches reads only when it contains no loop and no call.
+  cachesReads = parts: Ch.collect (x: isLoop x || kindOf x == "call") (_: false) parts == [ ];
+
+  # The entries of a loop of parts (condition, body and step): its reads at constant
+  # addresses, except those that a store at a constant address in it overlaps.
+  cacheEntries =
+    parts:
+    let
+      reads = Ch.collect atConst (_: false) parts;
+      stores = map (x: x.target) (
+        Ch.collect (x: kindOf x == "assign" && atConst x.target) (_: false) parts
+      );
+      overlapsRead = r: w: overlaps w.expr.value (T.sizeOf w.type) r.expr.value (T.sizeOf r.type);
+      kept = filter (r: !any (overlapsRead r) stores) reads;
+      entry =
+        r:
+        let
+          key = cacheKey r.expr.value r.type;
+        in
+        nameValue key {
+          inherit key;
+          attr = "g${key}";
+          addr = r.expr.value;
+          inherit (r) type;
+          size = T.sizeOf r.type;
+        };
+    in
+    if cachesReads parts then attrValues (listToAttrs (map entry kept)) else [ ];
+
+  # The value of the entry c read from mem.
+  loadEntry = mem: c: load mem c.type (num c.addr);
+
+  entryOf = s: key: head (filter (c: c.key == key) s.cached);
+
+  # Whether a store to target is checked against the cached entries at run time: its
+  # address is not a constant (one that is, is checked by refreshCache when emitted).
+  checksCache = s: target: s.cached != [ ] && target.expr.kind != "lit";
+
+  # The current value of the entry c (see above), as a code value.
+  cachedValue =
+    s: c:
+    if s.hits == [ ] then
+      atom s.vars.${c.key}
+    else
+      low "if ${concatStringsSep " || " s.hits} then ${(loadEntry s.mem c).code} else ${s.vars.${c.key}}";
+
+  # The code of the current value of the variable or entry key, as a join set takes it.
+  varCode = s: key: if isCacheKey key then (cachedValue s (entryOf s key)).code else s.vars.${key};
+
+  # The state s with the entries settled: each value bound to a new name, which becomes its
+  # base. -> { s; binds; }
+  settle =
+    s:
+    let
+      step =
+        acc: c:
+        let
+          f = fresh acc.s "g";
+        in
+        {
+          s = f.s // {
+            vars = f.s.vars // {
+              ${c.key} = f.name;
+            };
+          };
+          binds = acc.binds ++ [
+            {
+              inherit (f) name;
+              inherit (cachedValue s c) code;
+            }
+          ];
+        };
+      r = foldl' step {
+        inherit s;
+        binds = [ ];
+      } s.cached;
+    in
+    if s.hits == [ ] then
+      {
+        inherit s;
+        binds = [ ];
+      }
+    else
+      r
+      // {
+        s = r.s // {
+          hits = [ ];
+        };
+      };
+
+  # The cached read key. -> { s; binds; c; }
+  readCached =
+    s: key:
+    let
+      r = settle s;
+    in
+    r // { c = atom r.s.vars.${key}; };
+
+  # s settled when the expressions es read an entry; used before the branches of ?:,
+  # which must not bind.
+  settleFor =
+    s: es:
+    if s.hits != [ ] && any (r: s.vars ? ${readKey r}) (Ch.collect atConst (_: false) es) then
+      settle s
+    else
+      {
+        inherit s;
+        binds = [ ];
+      };
+
+  # The byte ranges of the entries cs in address order, those that touch or overlap merged:
+  # [ { addr; size; } ].
+  cacheRanges =
+    cs:
+    let
+      sorted = sort (x: y: x.addr < y.addr) cs;
+      step =
+        acc: c:
+        let
+          last = elemAt acc (length acc - 1);
+          end = last.addr + last.size;
+          cEnd = c.addr + c.size;
+        in
+        if acc != [ ] && c.addr <= end then
+          genList (i: elemAt acc i) (length acc - 1)
+          ++ [
+            {
+              inherit (last) addr;
+              size = (if cEnd > end then cEnd else end) - last.addr;
+            }
+          ]
+        else
+          acc
+          ++ [
+            {
+              inherit (c) addr size;
+            }
+          ];
+    in
+    foldl' step [ ] sorted;
+
+  # Run-time test that the store of size bytes at the address a (an atom) overlaps one of
+  # the ranges of the entries cs: per range [k, k + n), a in it, or (size > 1) k in
+  # [a, a + size), modulo 2^32.
+  overlapCode =
+    a: size: cs:
+    let
+      below =
+        x: y: n:
+        infixN 6 "<" (app "bitAnd" [
+          (sub x y)
+          (num B.mask32)
+        ]) (num n);
+      tests = concatMap (
+        r: [ (below a (num r.addr) r.size) ] ++ (if size == 1 then [ ] else [ (below (num r.addr) a size) ])
+      ) (cacheRanges cs);
+    in
+    cv 9 (concatStringsSep " || " (map (x: wrap 8 x) tests));
+
+  # The state after a store to target at the address a, with s.mem the memory after the
+  # store. A store that may overlap an entry adds its test to hits: the run-time test bound
+  # once for an address that is not a constant, and `true` for a constant address that
+  # overlaps one (the loop excludes such entries, so this does not occur). -> { s; binds; }
+  refreshCache =
+    s: target: a:
+    let
+      size = T.sizeOf target.type;
+      constant = target.expr.kind == "lit";
+      hit = any (c: overlaps target.expr.value size c.addr c.size) s.cached;
+      f = fresh s "hit";
+    in
+    if s.cached == [ ] || constant && !hit then
+      {
+        inherit s;
+        binds = [ ];
+      }
+    else if constant then
+      {
+        s = s // {
+          hits = s.hits ++ [ "true" ];
+        };
+        binds = [ ];
+      }
+    else
+      {
+        s = f.s // {
+          hits = s.hits ++ [ f.name ];
+        };
+        binds = [
+          {
+            inherit (f) name;
+            inherit (overlapCode a size s.cached) code;
+          }
+        ];
+      };
+
+  # The cached keys a join set carries besides the assigned variables: all of them when
+  # the joined code may store (memChanged).
+  cacheJoinKeys = s: memChanged: if memChanged then map (c: c.key) s.cached else [ ];
+
+  # The hits of a state that reads the variables keys from a join set: none when the set
+  # carries the entries (it holds their settled values).
+  hitsAfterJoin = s: keys: if any isCacheKey keys then [ ] else s.hits;
+
+  # The tail of a loop's update set for the entries in state st: entries whose base is
+  # still the one the iteration started with are added only when a hit holds,
+  # `// (if <hits> then { <attr> = <value in st.mem>; ... } else { })`; otherwise every
+  # entry is a field. -> { fields; tail; }
+  cacheUpdate =
+    inner: st:
+    let
+      cs = st.cached;
+      unchanged = all (c: st.vars.${c.key} == inner.vars.${c.key}) cs;
+      loads = concatStringsSep " " (map (c: "${c.attr} = ${(loadEntry st.mem c).code};") cs);
+    in
+    if cs == [ ] || unchanged && st.hits == [ ] then
+      {
+        fields = [ ];
+        tail = "";
+      }
+    else if unchanged then
+      {
+        fields = [ ];
+        tail = " // (if ${concatStringsSep " || " st.hits} then { ${loads} } else { })";
+      }
+    else
+      {
+        fields = map (c: "${c.attr} = ${(cachedValue st c).code};") cs;
+        tail = "";
+      };
 
   # ---- Statements ----
   # stmt s n -> { s; binds; }
@@ -1035,13 +1329,17 @@ let
           }
         else
           stmt (s1 // { inherit (th.s) n; }) n.elseStmt;
-      changed = k: th.s.vars.${k} != s1.vars.${k} || el.s.vars.${k} != s1.vars.${k};
-      keys = filter changed (attrNames s1.vars);
+      changed = k: varCode th.s k != varCode s1 k || varCode el.s k != varCode s1 k;
+      # The entries share their hits, so they join all together or not at all.
+      cacheKeys = map (c: c.key) s1.cached;
+      keys =
+        filter (k: !isCacheKey k && changed k) (attrNames s1.vars)
+        ++ (if any changed cacheKeys then cacheKeys else [ ]);
       memChanged = th.s.mem != s1.mem || el.s.mem != s1.mem;
       at = k: attrName s1.names.${k};
       fields =
         st:
-        (if memChanged then [ "mem = ${st.mem};" ] else [ ]) ++ map (k: "${at k} = ${st.vars.${k}};") keys;
+        (if memChanged then [ "mem = ${st.mem};" ] else [ ]) ++ map (k: "${at k} = ${varCode st k};") keys;
       branch = r: renderLet r.binds "{ ${concatStringsSep " " (fields r.s)} }";
       f = fresh (s1 // { inherit (el.s) n; }) "if";
       code = "if ${c.c.code} then\n  ${indent (branch th)}\nelse\n  ${indent (branch el)}";
@@ -1065,6 +1363,7 @@ let
                 value = "${f.name}.${at k}";
               }) keys
             );
+          hits = hitsAfterJoin s1 keys;
         };
         binds = c.binds ++ [
           {
@@ -1094,13 +1393,14 @@ let
   loop =
     s: l:
     let
-      assigned = assignedKeys [
+      parts = [
         l.cond
         l.body
         l.step
       ];
+      assigned = assignedKeys parts;
       carried = filter (k: elem k assigned) (attrNames s.vars);
-      at = k: attrName s.names.${k};
+      cached = cacheEntries parts;
       lv = fresh s "v";
       v = lv.name;
       inner = lv.s // {
@@ -1110,21 +1410,28 @@ let
           // listToAttrs (
             map (k: {
               name = k;
-              value = "${v}.${at k}";
+              value = "${v}.${attrName s.names.${k}}";
             }) carried
-          );
+          )
+          // listToAttrs (map (c: nameValue c.key "${v}.${c.attr}") cached);
+        names = s.names // listToAttrs (map (c: nameValue c.key c.attr) cached);
+        inherit cached;
+        hits = [ ];
       };
+      at = k: attrName inner.names.${k};
       update =
         st: extra:
         let
+          cu = cacheUpdate inner st;
           fields =
             (if st.mem != inner.mem then [ "mem = ${st.mem};" ] else [ ])
             ++ concatMap (
               k: if st.vars.${k} != inner.vars.${k} then [ "${at k} = ${st.vars.${k}};" ] else [ ]
             ) carried
+            ++ cu.fields
             ++ extra;
         in
-        if fields == [ ] then v else "${v} // { ${concatStringsSep " " fields} }";
+        (if fields == [ ] then v else "${v} // { ${concatStringsSep " " fields} }") + cu.tail;
       # The loop carries done' and ret' when a return in its body leaves the function.
       returns = (exits l.body) ? return;
       # The end of an iteration after the body, normal or by continue: the for step, or the
@@ -1166,14 +1473,15 @@ let
       };
       # The body from state s0 followed by next. -> { s; binds; code; }
       bodyThen = s0: stmtK handlers s0 l.body next;
-      always = "(_: true)";
+      # A condition that is a constant other than 0 is never tested.
+      alwaysTrue = l.cond != null && l.cond.kind == "lit" && l.cond.value != 0;
       gen =
-        if l.isDo || l.cond == null then
+        if l.isDo || l.cond == null || alwaysTrue then
           let
             b = bodyThen inner;
           in
           {
-            cond = always;
+            driver = "R.loopDo";
             body = renderLet b.binds b.code;
             inherit (b) s;
           }
@@ -1183,7 +1491,7 @@ let
             b = bodyThen c.s;
           in
           {
-            cond = "(${v}: ${c.c.code})";
+            driver = "R.loop (${v}: ${c.c.code})";
             body = renderLet b.binds b.code;
             inherit (b) s;
           }
@@ -1194,14 +1502,16 @@ let
             b = bodyThen c.s;
           in
           {
-            cond = always;
+            driver = "R.loopDo";
             body = renderLet c.binds "if ${c.c.code} then\n  ${indent (renderLet b.binds b.code)}\nelse\n  ${update c.s [ "exit = true;" ]}";
             inherit (b) s;
           };
       res = fresh (s // { inherit (gen.s) n; }) "l";
+      # The cached values start from the memory after the for initialization.
       init = concatStringsSep " " (
         [ "mem = ${s.mem};" ]
         ++ map (k: "${at k} = ${s.vars.${k}};") carried
+        ++ map (c: "${c.attr} = ${(loadEntry s.mem c).code};") cached
         ++ (if !returns then [ ] else [ "done' = false;" ] ++ (if s.retVoid then [ ] else [ "ret' = 0;" ]))
       );
     in
@@ -1221,7 +1531,7 @@ let
       binds = [
         {
           inherit (res) name;
-          code = "R.loop ${gen.cond} (\n  ${indent "${v}:\n${gen.body}"}\n) { ${init} }";
+          code = "${gen.driver} (\n  ${indent "${v}:\n${gen.body}"}\n) { ${init} }";
         }
       ];
     };
@@ -1384,8 +1694,8 @@ let
         n.elseStmt
       ];
       assigned = assignedKeys branches;
-      keys = filter (key: elem key assigned) (attrNames s1.vars);
       memChanged = touchesMem branches;
+      keys = filter (key: elem key assigned) (attrNames s1.vars) ++ cacheJoinKeys s1 memChanged;
       at = key: attrName s1.names.${key};
       j = joinRegion memChanged keys at true;
       th = stmtK j.handlers s1 n.thenStmt j.end;
@@ -1411,6 +1721,7 @@ let
     s
     // {
       mem = if memChanged then "${name}.mem" else s.mem;
+      hits = hitsAfterJoin s keys;
       vars =
         s.vars
         // listToAttrs (
@@ -1432,7 +1743,7 @@ let
         code = "{ ${
           concatStringsSep " " (
             (if memChanged then [ "mem = ${st.mem};" ] else [ ])
-            ++ map (key: "${at key} = ${st.vars.${key}};") keys
+            ++ map (key: "${at key} = ${varCode st key};") keys
             ++ extra
           )
         } }";
@@ -1530,8 +1841,11 @@ let
         names = ps.s.names // listToAttrs (map (var: nameValue var.key var.name) declared);
       };
       assigned = assignedKeys sections;
-      keys = filter (key: elem key assigned) (attrNames ps.s.vars) ++ map (var: var.key) declared;
       memChanged = touchesMem sections;
+      keys =
+        filter (key: elem key assigned) (attrNames ps.s.vars)
+        ++ map (var: var.key) declared
+        ++ cacheJoinKeys ps.s memChanged;
       withStatus = any (item: exits item != { }) (concatLists sections);
       attrs = uniqueAttrs s0.names keys;
       at = key: attrs.${key};
@@ -1637,6 +1951,8 @@ let
           }) params
         );
         retVoid = T.isVoid f.ret;
+        cached = [ ];
+        hits = [ ];
       };
       result =
         mem: c:
