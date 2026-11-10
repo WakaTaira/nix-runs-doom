@@ -1,7 +1,8 @@
 # Unit tests: per-instruction RV32I tests below, plus eDSL tests from tests/dsl.nix,
 # M extension tests from tests/mext.nix, Doom extension tests from tests/xdoom.nix and
 # ELF symbol tests from tests/elf.nix, code-region tests from tests/fastpath.nix,
-# host-call libc tests from tests/hostcall.nix and C front-end tests from tests/cc.nix.
+# host-call libc tests from tests/hostcall.nix, memory tests from tests/mem.nix and C
+# front-end tests from tests/cc.nix.
 # Run: nix eval --json -f tests/unit.nix summary
 # Each test places a small machine-code sequence at address 0, runs it until the trailing
 # EBREAK halts, and compares registers, memory and PC against expected values. Every CPU
@@ -475,6 +476,7 @@ let
         ];
       }
     ]
+    ++ import ./mem.nix
     ++ import ./dsl.nix
     ++ import ./mext.nix
     ++ import ./xdoom.nix

@@ -8,6 +8,11 @@
 # An update copies only the 4 nodes on the path. The root grows only with the
 # number of touched MiB, so it stays small for working sets of a few MiB.
 # See bench/memlayout.nix for the comparison against other layouts.
+# Byte-granular accessors resolve the three lower keys, the byte divisor and the
+# keep mask with one lookup in a 16384-entry table indexed by the low 14 bits of
+# the byte address; storeByte walks the path once. storeRun / storeStride write
+# many bytes with one `//` per leaf (or per 16 KiB node) instead of one path copy
+# per byte.
 let
   inherit (builtins)
     bitAnd
@@ -17,6 +22,9 @@ let
     elemAt
     toString
     bitOr
+    foldl'
+    listToAttrs
+    attrValues
     ;
 
   rootKeys = genList toString 4096;
@@ -61,8 +69,45 @@ let
     seq v (seq n2' (seq n1' (seq n0' (m // { ${a0} = n0'; }))));
   B = import ./bits.nix;
 
+  # Indexed by the low 14 bits of a byte address: the keys of the level-2 node and
+  # of the leaf word, the divisor of the byte inside the word, and the mask that
+  # keeps the other three bytes of the word.
+  byteDivisors = [
+    1
+    256
+    65536
+    16777216
+  ];
+  byteTable = genList (
+    i:
+    let
+      w = div i 4;
+      d = elemAt byteDivisors (bitAnd i 3);
+    in
+    {
+      hi = elemAt keyList (div w 64);
+      lo = elemAt keyList (bitAnd w 63);
+      inherit d;
+      keep = B.mask32 - 255 * d;
+    }
+  ) 16384;
+
+  # Keys of the root and of the level-1 node for a byte address (< 2^32).
+  rootKey = a: elemAt rootKeys (div a 1048576);
+  midKey = a: elemAt keyList (bitAnd (div a 16384) 63);
+
+  # The word holding byte address a (a is not necessarily a multiple of 4).
+  wordOf =
+    m: a: p:
+    (((m.${rootKey a} or { }).${midKey a} or { }).${p.hi} or { }).${p.lo} or 0;
+
   # Byte-addressed accessors (little-endian).
-  loadByte = m: a: bitAnd (div (loadWordAt m (div a 4)) (B.pow2 (8 * bitAnd a 3))) 255;
+  loadByte =
+    m: a:
+    let
+      p = elemAt byteTable (bitAnd a 16383);
+    in
+    bitAnd (div (wordOf m a p) p.d) 255;
 
   loadHalf =
     m: a:
@@ -73,19 +118,63 @@ let
 
   loadWord =
     m: a:
-    if bitAnd a 3 == 0 then loadWordAt m (div a 4) else loadHalf m a + 65536 * loadHalf m (B.add a 2);
+    if bitAnd a 3 == 0 then
+      wordOf m a (elemAt byteTable (bitAnd a 16383))
+    else
+      loadHalf m a + 65536 * loadHalf m (B.add a 2);
 
   # Replace the field of width widthMask starting at bit `shift` with v.
   replaceField =
     old: shift: widthMask: v:
     bitOr (bitAnd old (B.mask32 - widthMask * B.pow2 shift)) (bitAnd v widthMask * B.pow2 shift);
 
-  storeByte =
+  # Store the word nv(old word) at the byte address a, forcing the path.
+  storeWordWith =
+    m: a: nv:
+    let
+      p = elemAt byteTable (bitAnd a 16383);
+      a0 = rootKey a;
+      a1 = midKey a;
+      n0 = m.${a0} or { };
+      n1 = n0.${a1} or { };
+      n2 = n1.${p.hi} or { };
+      v = nv p (n2.${p.lo} or 0);
+      n2' = n2 // {
+        ${p.lo} = v;
+      };
+      n1' = n1 // {
+        ${p.hi} = n2';
+      };
+      n0' = n0 // {
+        ${a1} = n1';
+      };
+    in
+    seq v (seq n2' (seq n1' (seq n0' (m // { ${a0} = n0'; }))));
+
+  # Store the aligned word v at the byte address a.
+  storeAligned =
     m: a: v:
     let
-      w = div a 4;
+      p = elemAt byteTable (bitAnd a 16383);
+      a0 = rootKey a;
+      a1 = midKey a;
+      n0 = m.${a0} or { };
+      n1 = n0.${a1} or { };
+      n2' = (n1.${p.hi} or { }) // {
+        ${p.lo} = v;
+      };
+      n1' = n1 // {
+        ${p.hi} = n2';
+      };
+      n0' = n0 // {
+        ${a1} = n1';
+      };
     in
-    storeWordAt m w (replaceField (loadWordAt m w) (8 * bitAnd a 3) 255 v);
+    seq v (seq n2' (seq n1' (seq n0' (m // { ${a0} = n0'; }))));
+
+  storeByte =
+    m: a: v:
+    storeWordWith m a (p: old: bitOr (bitAnd old p.keep) (bitAnd v 255 * p.d));
 
   storeHalf =
     m: a: v:
@@ -100,9 +189,129 @@ let
   storeWord =
     m: a: v:
     if bitAnd a 3 == 0 then
-      storeWordAt m (div a 4) v
+      storeAligned m a v
     else
       storeHalf (storeHalf m a v) (B.add a 2) (div v 65536);
+
+  leafAt =
+    m: a: ((m.${rootKey a} or { }).${midKey a} or { }).${elemAt keyList (bitAnd (div a 256) 63)} or { };
+
+  nodeAt = m: a: (m.${rootKey a} or { }).${midKey a} or { };
+
+  # Install a leaf (256 B) or a level-2 node (16 KiB) at the address a, forcing
+  # the path like the other stores do.
+  putLeaf =
+    m: a: leaf:
+    let
+      a0 = rootKey a;
+      a1 = midKey a;
+      n0 = m.${a0} or { };
+      n1 = n0.${a1} or { };
+      n1' = n1 // {
+        ${elemAt keyList (bitAnd (div a 256) 63)} = leaf;
+      };
+      n0' = n0 // {
+        ${a1} = n1';
+      };
+    in
+    seq leaf (seq n1' (seq n0' (m // { ${a0} = n0'; })));
+
+  putNode =
+    m: a: node:
+    let
+      a0 = rootKey a;
+      n0 = m.${a0} or { };
+      n0' = n0 // {
+        ${midKey a} = node;
+      };
+    in
+    seq node (seq n0' (m // { ${a0} = n0'; }));
+
+  forceAll = s: foldl' (acc: x: seq x acc) 0 (attrValues s);
+
+  # nw whole words starting at the word-aligned byte address wa; the word k comes
+  # from vals[i0 + 4k .. i0 + 4k + 3]. One `//` per leaf.
+  storeWords =
+    m: wa: nw: vals: i0:
+    if nw <= 0 then
+      m
+    else
+      let
+        w0 = bitAnd (div wa 4) 63;
+        cnt = if nw < 64 - w0 then nw else 64 - w0;
+        byteAt = i: bitAnd (elemAt vals i) 255;
+        part = listToAttrs (
+          genList (j: {
+            name = elemAt keyList (w0 + j);
+            value =
+              let
+                i = i0 + 4 * j;
+              in
+              byteAt i + 256 * byteAt (i + 1) + 65536 * byteAt (i + 2) + 16777216 * byteAt (i + 3);
+          }) cnt
+        );
+        m' = putLeaf m wa (leafAt m wa // part);
+      in
+      seq (forceAll part) (seq m' (storeWords m' (wa + 4 * cnt) (nw - cnt) vals (i0 + 4 * cnt)));
+
+  # The low 8 bits of vals[i] are written to address a + i for i = 0 .. n-1.
+  # The caller guarantees n >= 0 and, for n >= 1, 0 <= a and a + n <= 2^32. Only
+  # the first n elements of vals are forced.
+  storeRun =
+    m: a: n: vals:
+    let
+      h0 = bitAnd (4 - bitAnd a 3) 3;
+      head = if h0 > n then n else h0;
+      nw = div (n - head) 4;
+      tailStart = head + 4 * nw;
+      bytes =
+        m0: from: to:
+        foldl' (mm: i: storeByte mm (a + i) (elemAt vals i)) m0 (genList (i: from + i) (to - from));
+    in
+    bytes (storeWords (bytes m 0 head) (a + head) nw vals head) tailStart n;
+
+  # The low 8 bits of vals[i] are written to address a + i * stride for
+  # i = 0 .. n-1. The caller guarantees n >= 0, stride >= 1 and, for n >= 1,
+  # 0 <= a and a + (n-1) * stride < 2^32. Only the first n elements of vals are forced.
+  # For stride >= 256 every byte lies in its own leaf, so one `//` per touched leaf
+  # and one per 16 KiB node suffice.
+  storeStride =
+    m: a: stride: n: vals:
+    let
+      go =
+        m0: i:
+        if i >= n then
+          m0
+        else
+          let
+            ai = a + i * stride;
+            inNode = div ((div ai 16384 + 1) * 16384 - ai + stride - 1) stride;
+            cnt = if inNode < n - i then inNode else n - i;
+            node = nodeAt m0 ai;
+            part = listToAttrs (
+              genList (
+                j:
+                let
+                  p = elemAt byteTable (bitAnd (ai + j * stride) 16383);
+                  leaf = node.${p.hi} or { };
+                  nv = bitOr (bitAnd (leaf.${p.lo} or 0) p.keep) (bitAnd (elemAt vals (i + j)) 255 * p.d);
+                in
+                {
+                  name = p.hi;
+                  value = seq nv (leaf // { ${p.lo} = nv; });
+                }
+              ) cnt
+            );
+            m' = putNode m0 ai (node // part);
+          in
+          seq (forceAll part) (seq m' (go m' (i + cnt)));
+    in
+    if stride == 1 then
+      storeRun m a n vals
+    else if stride < 256 then
+      foldl' (mm: i: storeByte mm (a + i * stride) (elemAt vals i)) m (genList (i: i) n)
+    else
+      go m 0;
 in
 {
   inherit
@@ -115,5 +324,7 @@ in
     storeByte
     storeHalf
     storeWord
+    storeRun
+    storeStride
     ;
 }
