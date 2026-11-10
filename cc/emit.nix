@@ -45,7 +45,12 @@
 #         declaration runs), and st' when a section may complete abruptly.
 #       - A non-void function that reaches its end returns 0.
 #   - Side effects in expressions (assignments, ++ and --, calls, stores) become let
-#     bindings in C evaluation order; pure expressions stay nested.
+#     bindings in C evaluation order; pure expressions stay nested. Operands are evaluated
+#     left to right. An assignment to an object in memory (=, op=, ++ and --) evaluates,
+#     as clang does, first the assigned value, then the address of the target in the
+#     memory the value leaves, and op=, ++ and -- then read the old value at that address
+#     in that memory: `g += h()` adds to the g that h leaves, and in `a[i()] = k()` k runs
+#     before i. An assignment to a local variable evaluates only the value.
 #   - Conditions are Nix booleans; a comparison is 0 or 1 only where its value is used.
 #   - File-scope variables live in memory at fixed addresses, written as integer literals;
 #     they are read and written like any memory through a pointer.
@@ -322,11 +327,24 @@ let
     else
       "M.storeWord";
 
-  # A value of type from stored as type t: storeByte and storeHalf keep the low bits
-  # themselves (a 2-byte object is 2-aligned), and a word is stored in its unsigned form.
+  # A value of type from stored as type t: storeByte keeps the low bits itself, a signed
+  # value is cut to 16 bits for storeHalf (which takes the high byte of a half at an
+  # address 3 mod 4 by division, so it needs a non-negative value), and a word is stored
+  # in its unsigned form.
   encode =
     t: from: c:
-    if T.sizeOf t < 4 || T.isUnsigned from then c else app "B.u32" [ c ];
+    let
+      size = T.sizeOf t;
+    in
+    if size == 1 || T.isUnsigned from then
+      c
+    else if size == 2 then
+      app "bitAnd" [
+        c
+        (num 65535)
+      ]
+    else
+      app "B.u32" [ c ];
 
   # ---- Expressions ----
   # expr s e -> { s; binds; c; } with binds the let bindings of the side effects of e
@@ -548,8 +566,8 @@ let
     e: T.isS32 e.type && (e.op == "/" || e.op == "%") && !(e.rhs.kind == "lit" && e.rhs.value != -1);
 
   # Shift amount of e when it is a constant the shift can be inlined for, otherwise null.
-  # 2^63 is not a Nix integer: `long long << 63` is left to R.shlLL, and `>> 63` has its
-  # own case in arith.
+  # 2^63 is not a Nix integer: `long long << 63` (rejected by cc/check.nix when the amount
+  # is a constant) is left to R.shlLL, and `>> 63` has its own case in arith.
   constShift =
     e:
     let
@@ -760,11 +778,21 @@ let
       c = if e.post then old else atom b.s.vars.${var.key};
     };
 
+  # The value is emitted first, then the address of the target in the memory the value
+  # leaves, then the old value is read there (see the header). The value reads the old
+  # value through s.old, whose code refers to the address and memory emitted after it;
+  # only its strength (prec) is used while the value is emitted, so the lazy reference
+  # does not loop.
   assignMem =
     s: e: want:
     let
       t = e.target.type;
-      a = expr s e.target.expr;
+      # The expression yields the new value (needed besides the store).
+      newUsed = want && !e.post;
+      # Unless the new value is used, the conversion to the target type is left to encode.
+      node = if !newUsed && e.value.kind == "cast" then e.value.expr else e.value;
+      v = expr (s // { old = oldC; }) node;
+      a = expr (v.s // { inherit (s) old; }) e.target.expr;
       # The address is used twice when the value reads the target.
       ad =
         if hasOld e.value then
@@ -784,17 +812,14 @@ let
             c = oldLoad;
             binds = [ ];
           };
-      # The expression yields the new value (needed besides the store).
-      newUsed = want && !e.post;
-      # Unless the new value is used, the conversion to the target type is left to encode.
-      node = if !newUsed && e.value.kind == "cast" then e.value.expr else e.value;
-      v = expr (o.s // { old = o.c; }) node;
+      oldC = o.c;
       vb =
         if newUsed then
-          share v.s "t" v.c
+          share o.s "t" v.c
         else
           {
-            inherit (v) s c;
+            inherit (o) s;
+            inherit (v) c;
             binds = [ ];
           };
       m = fresh vb.s "mem";
@@ -810,10 +835,10 @@ let
         inherit (s) old;
       };
       binds =
-        a.binds
+        v.binds
+        ++ a.binds
         ++ ad.binds
         ++ o.binds
-        ++ v.binds
         ++ vb.binds
         ++ [
           {
@@ -1465,7 +1490,9 @@ let
       code = ifCode (atom "${l.name}.done'") h o;
     };
 
-  # A switch that only its own break can leave early.
+  # A switch that a return or a continue (to an enclosing loop) can leave: after its
+  # sections, which consume its own break, dispatch passes these on. A switch that only its
+  # own break can leave early completes normally and is a plain statement (switchChain).
   switchK =
     handlers: s: n: k:
     let

@@ -182,7 +182,7 @@ in
 
   report =
     if statsDir == "" then
-      throw "set SPIKE_STATS_DIR to the directory of <variant>-n<k>-<r>.json stats files (see bench/spike/default.nix)"
+      missingStats
     else
       mkReport {
         costs = {
@@ -194,7 +194,7 @@ in
 
   ccReport =
     if statsDir == "" then
-      throw "set SPIKE_STATS_DIR to the directory of <variant>-n<k>-<r>.json stats files (see bench/spike/default.nix)"
+      missingStats
     else
       mkCcReport {
         costs = {

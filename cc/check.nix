@@ -24,7 +24,8 @@
 # constants (unary, binary, comparisons, !, &&, || and ?:) are folded into a "lit" with
 # the value the generated code would compute (signed int and long wrap to 32 bits), except
 # a division by zero. A constant shift of a 32-bit value by a negative amount or by 32 or
-# more is unsupported. The address of a file-scope variable is a pointer "lit", and so is
+# more, and of a long long by a negative amount, by 64 or more, or left by 63, is
+# unsupported. The address of a file-scope variable is a pointer "lit", and so is
 # a constant pointer plus or minus a constant (member offsets and constant indices).
 #   { kind = "lit"; value; }                     integer constant in the range of type, or
 #                                                a constant address (pointer type)
@@ -625,17 +626,27 @@ let
     else
       fail at "incompatible conversion from '${showType x.type}' to '${showType t}'";
 
+  # The operand of sizeof is not evaluated, so its side effects do not count.
   hasSideEffects =
     e:
-    collect (
-      x:
-      elem (kindOf x) [
-        "assign"
-        "prefix"
-        "postfix"
-        "call"
-      ]
-    ) (_: false) e != [ ];
+    collect
+      (
+        x:
+        elem (kindOf x) [
+          "assign"
+          "prefix"
+          "postfix"
+          "call"
+        ]
+      )
+      (
+        x:
+        elem (kindOf x) [
+          "sizeof"
+          "sizeoftype"
+        ]
+      )
+      e != [ ];
 
   oldOf = target: node target "old" target.type { };
 
@@ -970,6 +981,11 @@ let
         in
         if amount.kind == "lit" && sizeOf t == 4 && (amount.value < 0 || amount.value >= 32) then
           unsupported at "shift of a 32-bit value by ${toString amount.value}"
+        else if amount.kind == "lit" && sizeOf t == 8 && (amount.value < 0 || amount.value >= 64) then
+          unsupported at "shift of a 64-bit value by ${toString amount.value}"
+        else if amount.kind == "lit" && sizeOf t == 8 && op == "<<" && amount.value == 63 then
+          # 2^63 is not a Nix integer.
+          unsupported at "left shift of a 64-bit value by 63"
         else
           foldBinop (
             node at "binop" t {
@@ -1904,6 +1920,8 @@ let
           objects = acc.objects ++ [
             {
               inherit name addr;
+              end = addr + sizeOfT acc.ctx t;
+              at = { inherit (g) line col; };
               # The initializer sees the variable itself.
               writes = if g.init == null then [ ] else initWrites (fileEnv acc') t addr g.init;
             }
@@ -2085,6 +2103,8 @@ let
         collect (x: kindOf x == "call") (_: false) r.defs
       );
       externs = filter (n: !r.ctx.globals.${n}.defined) (attrNames r.ctx.globals);
+      # The first variable that ends above 2^32.
+      overflow = head (filter (o: o.end > B.mask32 + 1) r.objects);
       extern = r.ctx.globals.${head externs};
       result = {
         funcs = r.defs;
@@ -2101,7 +2121,7 @@ let
     else if externs != [ ] then
       unsupported extern.at "extern variable '${head externs}' without a definition"
     else if dataBase + r.size > B.mask32 + 1 then
-      throw "cc: the data does not fit below 2^32 from dataBase"
+      fail overflow.at "the data does not fit below 2^32 from dataBase (variable '${overflow.name}')"
     else if undefinedCalls != [ ] then
       unsupported (head undefinedCalls) "call to function '${(head undefinedCalls).name}' that is declared but not defined"
     else

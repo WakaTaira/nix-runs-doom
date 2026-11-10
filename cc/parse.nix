@@ -632,6 +632,21 @@ let
             inherit i;
           };
 
+      # Index after the `)` that closes the `(` at i, called with d = 0 (d counts the open
+      # parentheses); the index of the eof token when it is not closed.
+      afterParens =
+        i: d:
+        if (tok i).kind == "eof" then
+          i
+        else if isP i "(" then
+          afterParens (i + 1) (d + 1)
+        else if !isP i ")" then
+          afterParens (i + 1) d
+        else if d == 1 then
+          i + 1
+        else
+          afterParens (i + 1) (d - 1);
+
       # Declarator at i. mode: "named" (name required), "optional" (parameters) or
       # "abstract" (type names, no name). -> { name; nameTok; ptrs; dims; params; i; } where
       # dims are the array lengths (outermost first; an expression, or null for `[]`) and
@@ -653,7 +668,9 @@ let
           arr = arrayDims tn i1;
         in
         if !hasName && isP p.i "(" then
-          if isP (p.i + 1) "*" then
+          if isP (p.i + 1) "*" && isP (afterParens p.i 0) "[" then
+            unsupported t "pointer to array declarator"
+          else if isP (p.i + 1) "*" then
             unsupported t "function pointer"
           else if mode != "named" && (isP (p.i + 1) ")" || startsDecl tn (p.i + 1)) then
             unsupported t "function type"

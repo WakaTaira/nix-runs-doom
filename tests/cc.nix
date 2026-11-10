@@ -666,6 +666,67 @@ let
   # Number of occurrences of needle in s.
   countIn = needle: s: length (filter isList (builtins.split needle s));
 
+  # ---- Review fixes ----
+
+  # Order of an assignment to memory: the value, then the target's address, then its old
+  # value (clang 21, riscv32).
+  orderSrc = ''
+    int g; int arr[4]; int i;
+    int h(void) { g = 10; return 1; }
+    int k(void) { i = 2; return 7; }
+    int idx(void) { return i; }
+    int f1(void) { g = 1; g += h(); return g; }
+    int f2(void) { i = 0; arr[idx()] = k(); return arr[0]; }
+    int f2at(void) { i = 0; arr[idx()] = k(); return arr[2]; }
+    int f3(void) { i = 0; arr[2] = 5; arr[idx()] += k(); return arr[2] * 100 + arr[0]; }
+    int f4(void) { i = 0; arr[i] = k(); return arr[0]; }
+    int f5(void) { g = 1; g = g + h(); return g; }
+    int used(void) { g = 1; int r = (g += h()); return r * 100 + g; }
+    int postUsed(void) { g = 1; int r = g++ + h(); return r * 100 + g; }
+    int postTarget(void) { int *p = arr; arr[0] = 0; *p++ = k(); return (p - arr) * 100 + arr[0]; }
+    int local(void) { int x = 1; x += h(); return x; }
+  '';
+  orderRet = fn: dret orderSrc fn [ ];
+
+  # The bytes at a and a + 1 after storing the int v through a short pointer at a.
+  halfBytes =
+    a: v:
+    let
+      m = callWith M.empty "void f(short *p, int v) { *p = v; }" "f" [
+        a
+        v
+      ];
+    in
+    [
+      (M.loadByte m a)
+      (M.loadByte m (a + 1))
+    ];
+
+  lexThrows = src: !(tryEval (Lx.lex src)).success;
+
+  switchKindsSrc = ''
+    int onlyBreak(int x) { int r = 0; switch (x) { case 1: r = 1; break; default: r = 2; } return r; }
+    int withReturn(int x) { switch (x) { case 1: return 5; default: break; } return 0; }
+    int withContinue(int n) {
+      int s = 0;
+      for (int i = 0; i < n; i++) { switch (i) { case 1: continue; default: break; } s += i; }
+      return s;
+    }
+  '';
+  # The source of the generated function fn of switchKindsSrc.
+  switchKindsCode =
+    fn:
+    let
+      parts = builtins.split "\n  [A-Za-z]+_fn =\n" (Cc.compile switchKindsSrc);
+      names = [
+        "onlyBreak"
+        "withReturn"
+        "withContinue"
+      ];
+      at = n: if elemAt names n == fn then n else at (n + 1);
+    in
+    elemAt parts (2 * (at 0 + 1));
+
   fixmulSrc = import ../cc/examples/spike.nix;
   fixmul =
     a: b:
@@ -2652,5 +2713,215 @@ in
   (t "cc compile: int to pointer without a cast throws"
     (compileThrows "void f(int x) { int *p = x; }")
     true
+  )
+  # Review fixes
+  (t "cc order: g += h() reads g after h" (orderRet "f1") 11)
+  (t "cc order: arr[idx()] = k() calls k before idx"
+    [
+      (orderRet "f2")
+      (orderRet "f2at")
+    ]
+    [ 0 7 ]
+  )
+  (t "cc order: arr[idx()] += k() reads the element k selects" (orderRet "f3") 1200)
+  (t "cc order: arr[i] = k() indexes with the i k leaves" (orderRet "f4") 0)
+  (t "cc order: g = g + h() reads g before h" (orderRet "f5") 2)
+  (t "cc order: used results of g += h() and g++ + h()"
+    [
+      (orderRet "used")
+      (orderRet "postUsed")
+    ]
+    [ 1111 210 ]
+  )
+  (t "cc order: *p++ = k() stores k() at the old p" (orderRet "postTarget") 107)
+  (t "cc order: compound assignment to a local" (orderRet "local") 2)
+  (t "cc store: a signed value through a short pointer is cut to 16 bits"
+    [
+      (halfBytes 4099 (-300))
+      (halfBytes 4099 (-2))
+      (halfBytes 4098 (-300))
+      (halfBytes 4099 65535)
+    ]
+    [
+      [
+        212
+        254
+      ]
+      [
+        254
+        255
+      ]
+      [
+        212
+        254
+      ]
+      [
+        255
+        255
+      ]
+    ]
+  )
+  (t "cc compile: long long constant shifts out of range throw"
+    (map compileThrows [
+      "long long f(long long x) { return x << 64; }"
+      "long long f(long long x) { return x >> 64; }"
+      "long long f(long long x) { return x << -1; }"
+      "long long f(long long x) { return x >> -1; }"
+      "long long f(long long x) { return x << 63; }"
+      "long long f(long long x) { x <<= 63; return x; }"
+      "long long f(void) { return 1LL << 63; }"
+    ])
+    [
+      true
+      true
+      true
+      true
+      true
+      true
+      true
+    ]
+  )
+  (t "cc run: long long constant shifts in range"
+    (
+      let
+        f = Cc.load "long long l(long long x) { return x << 62; } long long r(long long x) { return x >> 63; } long long m(long long x) { return x << 32; }";
+      in
+      [
+        (f.l M.empty 1).ret
+        (f.r M.empty (-5)).ret
+        (f.m M.empty 3).ret
+      ]
+    )
+    [
+      4611686018427387904
+      (-1)
+      12884901888
+    ]
+  )
+  (t "cc run: the operand of sizeof is not a side effect in ?:, && and ||"
+    (
+      let
+        src = ''
+          int c(int x) { int r = x ? sizeof(x++) : 0; return r * 10 + x; }
+          int a(int x, int y) { return x && sizeof(y++); }
+          int o(int x, int y) { return x || sizeof(y--); }
+        '';
+      in
+      [
+        (ret src "c" [ 3 ])
+        (ret src "c" [ 0 ])
+        (ret src "a" [
+          1
+          2
+        ])
+        (ret src "a" [
+          0
+          2
+        ])
+        (ret src "o" [
+          0
+          2
+        ])
+      ]
+    )
+    [
+      43
+      0
+      1
+      0
+      1
+    ]
+  )
+  (t "cc lex: prefixed character literals throw"
+    (map lexThrows [
+      "x = L'a';"
+      "x = u'a';"
+      "x = U'\\n';"
+    ])
+    [
+      true
+      true
+      true
+    ]
+  )
+  (t "cc lex: L, u and U alone stay identifiers" (texts "L + u * U - 'a' xL") [
+    "L"
+    "+"
+    "u"
+    "*"
+    "U"
+    "-"
+    "'a'"
+    "xL"
+    ""
+  ])
+  (t "cc compile: data that ends above 2^32 throws, data that ends at 2^32 does not"
+    [
+      (compileThrows "int a; int b;")
+      (!(tryEval (Cc.compileWith { dataBase = 4294967288; } "int a; int b;")).success)
+      (!(tryEval (Cc.compileWith { dataBase = 4294967288; } "int a; int b; int c;")).success)
+      (!(tryEval (Cc.compileWith { dataBase = 4294967292; } "char a[5];")).success)
+    ]
+    [
+      false
+      false
+      true
+      true
+    ]
+  )
+  (t "cc emit: a switch passes on only the return and continue that leave it"
+    (map
+      (fn: [
+        (contains "st' == 1" (switchKindsCode fn))
+        (contains "st' == 3" (switchKindsCode fn))
+      ])
+      [
+        "onlyBreak"
+        "withReturn"
+        "withContinue"
+      ]
+    )
+    [
+      [
+        false
+        false
+      ]
+      [
+        true
+        false
+      ]
+      [
+        false
+        true
+      ]
+    ]
+  )
+  (t "cc run: switches that break, return and continue"
+    [
+      (ret switchKindsSrc "onlyBreak" [ 1 ])
+      (ret switchKindsSrc "onlyBreak" [ 3 ])
+      (ret switchKindsSrc "withReturn" [ 1 ])
+      (ret switchKindsSrc "withReturn" [ 2 ])
+      (ret switchKindsSrc "withContinue" [ 4 ])
+    ]
+    [
+      1
+      2
+      5
+      0
+      5
+    ]
+  )
+  (t "cc parse: pointer to array declarators throw"
+    (map throws [
+      "int (*p)[4];"
+      "int (**q)[2][3];"
+      "int f(void) { return sizeof(int (*)[4]); }"
+    ])
+    [
+      true
+      true
+      true
+    ]
   )
 ]

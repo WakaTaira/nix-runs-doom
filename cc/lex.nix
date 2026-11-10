@@ -21,9 +21,10 @@
 # shallow.
 #
 # Rejected here: preprocessor directives, string literals, character literals other than
-# the ones above (multi-character, octal and hex escapes, prefixes such as L), floating-point
-# and octal literals, and characters that start no C token. Errors are thrown as
-# "cc: <line>:<col>: <message>" ("unsupported: ..." for valid C outside the subset).
+# the ones above (multi-character, octal and hex escapes, and the prefixes L, u and U, which
+# are recognized with the literal), floating-point and octal literals, and characters that
+# start no C token. Errors are thrown as "cc: <line>:<col>: <message>" ("unsupported: ..."
+# for valid C outside the subset).
 let
   A = import ../lib/ascii.nix;
   inherit (builtins)
@@ -59,6 +60,7 @@ let
     + "|//[^\n]*" # line comment
     + "|/\\*" # unterminated block comment
     + "|'([^'\\\n]|\\\\[^\n])*'" # character literal
+    + "|[LuU]'([^'\\\n]|\\\\[^\n])*'" # prefixed character literal
     + "|[0-9][0-9A-Za-z_.]*" # preprocessing number
     + "|[A-Za-z_][0-9A-Za-z_]*" # identifier or keyword
     + "|>>=|<<=|\\.\\.\\.|->|\\+\\+|--|<<|>>|&&|\\|\\||[-*/%+&^|<>=!]="
@@ -282,6 +284,8 @@ let
     in
     if hasAttr c digits then
       intToken line col text
+    else if match "[LuU]'.*" text != null then
+      unsupported line col "prefixed character literal ${text}"
     else if hasAttr c identStart then
       {
         kind = if hasAttr text keywords then "keyword" else "ident";
