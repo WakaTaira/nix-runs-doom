@@ -27,7 +27,7 @@
 #   mkdir -p /tmp/spike && for r in 1 2 3; do for v in nix cc; do for k in 1 5; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 #   SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport
 #
-# The draw gate (draw/nix <= 0.75) needs the nix and draw variants, with 1 and 5 frames.
+# The draw gate (draw/nix <= 0.65) needs the nix and draw variants, with 1 and 5 frames.
 #
 #   mkdir -p /tmp/spike && for r in 1 2 3; do for v in nix draw; do for k in 1 5; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 #   SPIKE_STATS_DIR=/tmp/spike nice -n 19 taskset -c 0-15 nix eval --raw -f . bench.spike.drawReport
@@ -162,7 +162,7 @@ let
     if ratio <= limit then "${label} GATE: pass" else "${label} GATE: fail";
 
   ccGate = gate "CC" 1.25;
-  drawGate = gate "DRAW" 0.75;
+  drawGate = gate "DRAW" 0.65;
 
   # Report of the variant `name` against the hand-written Nix; `costs` holds { nix; <name>; }
   # in seconds per frame.

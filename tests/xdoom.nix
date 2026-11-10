@@ -200,13 +200,13 @@ let
       (drawSpanRowCase 62)
       (drawSpanRowCase 63)
       {
-        name = "xdoom: draw gate at exactly 0.75 passes";
-        got = Spike.drawGate 0.75;
+        name = "xdoom: draw gate at exactly 0.65 passes";
+        got = Spike.drawGate 0.65;
         expected = "DRAW GATE: pass";
       }
       {
-        name = "xdoom: draw gate at 0.76 fails";
-        got = Spike.drawGate 0.76;
+        name = "xdoom: draw gate at 0.66 fails";
+        got = Spike.drawGate 0.66;
         expected = "DRAW GATE: fail";
       }
       {

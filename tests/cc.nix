@@ -12,6 +12,8 @@ let
   inherit (builtins)
     all
     attrNames
+    bitAnd
+    bitXor
     concatMap
     concatStringsSep
     elem
@@ -1135,6 +1137,126 @@ let
     3
     255
   ];
+
+  # ---- Page reads of bulk loops ----
+  # Expected values follow the C semantics: each function writes byte k (k < N) from the
+  # table values below, worked out per iteration. fill and copy have no table read.
+  pageSrc = ''
+    int colmap(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[i & 63]; i++; } return i; }
+    int dbl(unsigned char *d, unsigned char *t, unsigned char *c, int n) { int i = 0; while (n--) { *d++ = c[t[i & 63]]; i++; } return 0; }
+    int big(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[u & 0xfff]; u += 37; } return 0; }
+    int sgn(unsigned char *d, signed char *t, int n) { int i = 0; while (n--) { *d++ = (t[i & 7] >> 1) + 64; i++; } return 0; }
+    int twice(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[i & 63] + t[(i + 5) & 63]; i++; } return 0; }
+    int two(unsigned char *d, unsigned char *t, unsigned char *c, int n) { int i = 0; while (n--) { *d++ = t[i & 63] ^ c[i & 127]; i++; } return 0; }
+    int branch(unsigned char *d, unsigned char *t, int n, int c) { int x; while (n--) { x = 7; if (c) x = t[n & 63]; *d++ = x; } return x; }
+    int tern(unsigned char *d, unsigned char *t, int n, int c) { int i = 0; while (n--) { *d++ = c ? t[i & 63] : 5; i++; } return 0; }
+    int huge(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[u & 0x7fff]; u += 1000; } return 0; }
+    int wide(unsigned char *d, short *t, int n) { int i = 0; while (n--) { *d++ = t[i & 7] + 3; i++; } return 0; }
+    int zero(unsigned char *d, unsigned char *t, int n) { while (n--) *d++ = t[n & 63]; return n; }
+    int fill(unsigned char *d, int n) { while (n--) *d++ = 42; return 0; }
+    int copy(unsigned char *d, unsigned char *s, int n) { while (n--) *d++ = *s++; return 0; }
+  '';
+  pageCode = fnCode pageSrc;
+  # The functions of pageSrc with the marked bulk stores (see bulkFns), and with a
+  # M.readPages that fails when it is called.
+  pageFnsWith =
+    m:
+    import (builtins.toFile "cc-page.nix" (Cc.compile pageSrc)) {
+      M = m;
+      inherit B;
+      R = import ../cc/runtime.nix;
+    };
+  pageFns = pageFnsWith markedM;
+  unpagedFns = pageFnsWith (
+    markedM
+    // {
+      readPages =
+        _: _: _:
+        throw "readPages was called";
+    }
+  );
+  # fn of pageSrc called with args on mem: [ <return value> <the n bytes from a on>
+  # <whether the bulk form wrote> ] (see bulkOn).
+  pageOnWith =
+    fns: mem: fn: args: a: n:
+    let
+      r = foldl' (f: x: f x) (fns.${fn} mem) args;
+    in
+    [
+      r.ret
+      (genList (i: M.loadByte r.mem (B.u32 (a + i))) n)
+      (M.loadWord r.mem bulkMark == 1)
+    ];
+  pageOn = pageOnWith pageFns;
+  # Whether fn of pageSrc runs with the failing M.readPages.
+  runsUnpaged =
+    mem: fn: args:
+    let
+      r = pageOnWith unpagedFns mem fn args 0 0;
+    in
+    (tryEval (builtins.deepSeq r r)).success;
+  # The write buffer of the page tests, apart from the tables.
+  pbuf = 40960;
+  # The tables: f (64 bytes) at 0x10f0, crossing the leaf at 0x1100; h (256 bytes) at
+  # 0x2080 and g (128 bytes) at 0x2080, crossing the leaf at 0x2100; q (4096 bytes) at
+  # 0x3010; p (32768 bytes) at 0x10000; the signed bytes sb (8) at 0x10fc and the shorts
+  # sh (8) at 0x10f0.
+  tf = 4336;
+  tc = 8320;
+  tq = 12304;
+  tp = 65536;
+  tfOf = j: bitAnd (j * 7 + 3) 255;
+  thOf = j: bitAnd (j * 5 + 11) 255;
+  tgOf = j: bitAnd (j * 13 + 1) 255;
+  tqOf = j: bitAnd (j * 31 + j / 64) 255;
+  tpOf = j: bitAnd (j * 3 + j / 256) 255;
+  fMem = withBytes M.empty tf (genList tfOf 64);
+  fhMem = withBytes fMem tc (genList thOf 256);
+  fgMem = withBytes fMem tc (genList tgOf 128);
+  qMem = M.storeRun M.empty tq 4096 (genList tqOf 4096);
+  pMem = M.storeRun M.empty tp 32768 (genList tpOf 32768);
+  sbMem = withBytes M.empty 4348 [
+    200
+    10
+    255
+    128
+    127
+    0
+    1
+    129
+  ];
+  shMem = foldl' (m: j: M.storeHalf m (tf + 2 * j) (bitAnd (elemAt shorts j) 65535)) M.empty (
+    genList (j: j) 8
+  );
+  shorts = [
+    (-2)
+    300
+    1000
+    (-300)
+    5
+    32767
+    (-32768)
+    0
+  ];
+  # The counts of the value tests: around the threshold 32, and a long loop.
+  pageCounts = [
+    1
+    31
+    32
+    33
+    300
+  ];
+  # [ ret bytes wrote ] for each count n, with args n of fn.
+  pageRuns =
+    mem: fn: args:
+    map (n: pageOn mem fn (args n) pbuf n) pageCounts;
+  pageWant =
+    ret: byte:
+    map (n: [
+      (ret n)
+      (genList (byte n) n)
+      true
+    ]) pageCounts;
 
   fixmulSrc = import ../cc/examples/spike.nix;
   fixmul =
@@ -5501,6 +5623,324 @@ in
         ]
         false
       ]
+    ]
+  )
+
+  # Page reads of bulk loops: where they are emitted
+  (t "cc page: the draw loops read their tables by pages, from 32 and 136 iterations on"
+    (map
+      (
+        fn:
+        let
+          code = fnCode Cc.examples.draw.src fn;
+        in
+        [
+          (countIn "M\\.readPages mem" code)
+          (countIn " >= 32 then" code)
+          (countIn " >= 136 then" code)
+        ]
+      )
+      [
+        "R_DrawColumn"
+        "R_DrawSpan"
+      ]
+    )
+    [
+      [
+        2
+        1
+        0
+      ]
+      [
+        2
+        0
+        1
+      ]
+    ]
+  )
+  (t "cc page: reads of one table share their pages, other tables and wide or long ones do not"
+    (map (fn: countIn "M\\.readPages" (pageCode fn)) [
+      "colmap"
+      "dbl"
+      "big"
+      "sgn"
+      "twice"
+      "two"
+      "branch"
+      "tern"
+      "huge"
+      "wide"
+      "zero"
+      "fill"
+      "copy"
+    ])
+    [
+      1
+      2
+      1
+      1
+      1
+      2
+      1
+      1
+      0
+      0
+      1
+      0
+      0
+    ]
+  )
+  (t "cc page: a 4096-byte table sets the threshold to 136, a 64-byte one to 32"
+    [
+      (contains " >= 136 then" (pageCode "big"))
+      (contains " >= 32 then" (pageCode "colmap"))
+    ]
+    [
+      true
+      true
+    ]
+  )
+
+  # Page reads of bulk loops: values
+  (t "cc page: a table at 0x10f0 that crosses a leaf, and one at 0x1001"
+    [
+      (pageRuns fMem "colmap" (n: [
+        pbuf
+        tf
+        n
+      ]))
+      (pageRuns (withBytes M.empty 4097 (genList tfOf 64)) "colmap" (n: [
+        pbuf
+        4097
+        n
+      ]))
+    ]
+    [
+      (pageWant (n: n) (_: k: tfOf (bitAnd k 63)))
+      (pageWant (n: n) (_: k: tfOf (bitAnd k 63)))
+    ]
+  )
+  (t "cc page: a table indexed by a byte read from another table (U = 255)" (pageRuns fhMem "dbl"
+    (n: [
+      pbuf
+      tf
+      tc
+      n
+    ])
+  ) (pageWant (_: 0) (_: k: thOf (tfOf (bitAnd k 63)))))
+  (t "cc page: a 4096-byte table (U = 4095) around its threshold of 136"
+    (map (n: pageOn qMem "big" [ pbuf tq n ] pbuf n) (
+      pageCounts
+      ++ [
+        135
+        136
+        137
+      ]
+    ))
+    (
+      map
+        (n: [
+          0
+          (genList (k: tqOf (bitAnd (37 * k) 4095)) n)
+          true
+        ])
+        (
+          pageCounts
+          ++ [
+            135
+            136
+            137
+          ]
+        )
+    )
+  )
+  (t "cc page: signed char values are sign-extended"
+    (pageRuns sbMem "sgn" (n: [
+      pbuf
+      4348
+      n
+    ]))
+    (
+      pageWant (_: 0) (
+        _: k:
+        elemAt [
+          36
+          69
+          63
+          0
+          127
+          64
+          64
+          0
+        ] (bitAnd k 7)
+      )
+    )
+  )
+  (t "cc page: one table read twice in an iteration, and two tables"
+    [
+      (pageRuns fMem "twice" (n: [
+        pbuf
+        tf
+        n
+      ]))
+      (pageRuns fgMem "two" (n: [
+        pbuf
+        tf
+        tc
+        n
+      ]))
+    ]
+    [
+      (pageWant (_: 0) (_: k: bitAnd (tfOf (bitAnd k 63) + tfOf (bitAnd (k + 5) 63)) 255))
+      (pageWant (_: 0) (_: k: bitXor (tfOf (bitAnd k 63)) (tgOf (bitAnd k 127))))
+    ]
+  )
+  (t "cc page: table reads in a branch of if and of ?:"
+    [
+      (pageRuns fMem "branch" (n: [
+        pbuf
+        tf
+        n
+        1
+      ]))
+      (pageRuns fMem "branch" (n: [
+        pbuf
+        tf
+        n
+        0
+      ]))
+      (pageRuns fMem "tern" (n: [
+        pbuf
+        tf
+        n
+        1
+      ]))
+      (pageRuns fMem "tern" (n: [
+        pbuf
+        tf
+        n
+        0
+      ]))
+    ]
+    [
+      (pageWant (_: 3) (n: k: tfOf (bitAnd (n - 1 - k) 63)))
+      (pageWant (_: 7) (_: _: 7))
+      (pageWant (_: 0) (_: k: tfOf (bitAnd k 63)))
+      (pageWant (_: 0) (_: _: 5))
+    ]
+  )
+  (t "cc page: a table longer than 16384 bytes and a table of shorts are read as before"
+    [
+      (pageRuns pMem "huge" (n: [
+        pbuf
+        tp
+        n
+      ]))
+      (pageRuns shMem "wide" (n: [
+        pbuf
+        tf
+        n
+      ]))
+    ]
+    [
+      (pageWant (_: 0) (_: k: tpOf (bitAnd (1000 * k) 32767)))
+      (pageWant (_: 0) (
+        _: k:
+        elemAt [
+          1
+          47
+          235
+          215
+          8
+          2
+          3
+          3
+        ] (bitAnd k 7)
+      ))
+    ]
+  )
+  (t "cc page: a table ending at 2^32 - 1 runs in bulk, one byte later the loop wraps"
+    [
+      (pageOn (withBytes M.empty 4294967232 (genList tfOf 64)) "colmap" [ pbuf 4294967232 40 ] pbuf 40)
+      (pageOn (withBytes M.empty 4294967233 (genList tfOf 64)) "colmap" [ pbuf 4294967233 40 ] pbuf 40)
+    ]
+    [
+      [
+        40
+        (genList (k: tfOf k) 40)
+        true
+      ]
+      [
+        40
+        (genList (k: tfOf k) 40)
+        false
+      ]
+    ]
+  )
+  (t "cc page: a write range over the table runs the loop, which reads the stored bytes"
+    (pageOn fMem "colmap" [
+      (tf + 10)
+      tf
+      40
+    ] (tf + 10) 40)
+    [
+      40
+      (genList (k: tfOf (k - 10 * (k / 10))) 40)
+      false
+    ]
+  )
+  (t "cc page: N = 0 with a table across 2^32 neither reads nor writes"
+    (pageOn M.empty "zero" [
+      pbuf
+      4294967280
+      0
+    ] pbuf 1)
+    [
+      (-1)
+      [ 0 ]
+      false
+    ]
+  )
+  (t "cc page: the pages are read only from the threshold on, in bulk, and for N >= 1"
+    [
+      (runsUnpaged fMem "colmap" [
+        pbuf
+        tf
+        31
+      ])
+      (runsUnpaged fMem "colmap" [
+        pbuf
+        tf
+        32
+      ])
+      (runsUnpaged qMem "big" [
+        pbuf
+        tq
+        135
+      ])
+      (runsUnpaged qMem "big" [
+        pbuf
+        tq
+        136
+      ])
+      (runsUnpaged fMem "colmap" [
+        (tf + 10)
+        tf
+        40
+      ])
+      (runsUnpaged M.empty "zero" [
+        pbuf
+        4294967280
+        0
+      ])
+    ]
+    [
+      true
+      false
+      true
+      false
+      true
+      true
     ]
   )
 ]

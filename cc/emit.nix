@@ -84,6 +84,25 @@
 #     form, the address of a load at an invariant pointer plus an index in [0, U] is
 #     `base + index * size` without wrapping, since the entry test has checked that it
 #     stays below 2^32; other addresses wrap as in the loop.
+#       Such a load of one byte with an element size of 1 (a table of char, signed char
+#       or unsigned char) and a read range of U + 1 <= 16384 bytes is a page read. A
+#       bulk form with page reads computes the values as
+#       `if N >= T then builtins.genList <paged> N else builtins.genList <plain> N`, two
+#       copies of the iteration: <plain> as above, and <paged> with every page read as
+#       `builtins.elemAt (builtins.elemAt pg (div p 256)) (bitAnd p 255)`, p = off + index
+#       (bound by an inline let), followed by the same conversion as the load. For each
+#       read range, `pg = M.readPages <mem on entry> <base> <U + 1>` (the leaves of 256
+#       bytes that the range touches, as lazy lists of bytes) and `off = bitAnd <base> 255`
+#       are bound once, by a let around the genList of <paged> (so a loop below T does not
+#       allocate them), with base the name or constant bound for the entry test; reads
+#       whose base and length are both the same share them. Only <paged> refers to them,
+#       so they are evaluated only when the entry test holds and N >= T >= 32, where
+#       base + U < 2^32 holds. T = max(32, 8 * L) with L the largest div U 256 + 2 (the
+#       leaves a read range may touch) among the page reads: a leaf costs 256 lazy
+#       elements, so a large table read a few times stays with <plain>.
+#       Every other load, the store, the values after the loop and the loop when the
+#       entry test fails are emitted as without page reads, and so is a bulk form
+#       without them.
 #   - if/else becomes an attribute set of mem and the variables either branch changes,
 #     which the following code reads.
 #   - A statement completes normally or abruptly by return, break (to the innermost loop
@@ -237,14 +256,15 @@ let
 
   # ---- Emitter state ----
   # s = { n; mem; vars; names; old; retVoid; cached; bulk; bulkLoads; bulkStore;
-  # bulkForms; }: n numbers the next generated name; mem is the current memory; vars maps
-  # a variable key to the code of its current value (a name or a constant); names maps a
-  # key to the C name; old is the code of the target's value while an assignment's value
-  # is emitted; retVoid tells that the function returns void; cached lists the cached
-  # reads of the enclosing loop (see "Cached reads"); bulk tells that the iteration of a
-  # bulk loop is emitted, which records its loads in bulkLoads and its store in
-  # bulkStore, with bulkForms the forms of the read ranges of its loads in order (see
-  # "Bulk loops").
+  # bulkForms; bulkPages; }: n numbers the next generated name; mem is the current memory;
+  # vars maps a variable key to the code of its current value (a name or a constant);
+  # names maps a key to the C name; old is the code of the target's value while an
+  # assignment's value is emitted; retVoid tells that the function returns void; cached
+  # lists the cached reads of the enclosing loop (see "Cached reads"); bulk tells that the
+  # iteration of a bulk loop is emitted, which records its loads in bulkLoads and its
+  # store in bulkStore, with bulkForms the forms of the read ranges of its loads in order
+  # and bulkPages, when its body reads pages, the names of the pages of each load or null
+  # (see "Bulk loops").
   fresh = s: base: {
     name = "${base}_${toString s.n}";
     s = s // {
@@ -546,7 +566,13 @@ let
       if key != null && s.vars ? ${key} then
         readCached s key
       else if s.bulk then
-        bulkLoad (if bulkIndexed s e then indexAddr s e.expr else a) e
+        let
+          pg = bulkPage s e;
+        in
+        if pg != null then
+          pagedLoad s e pg
+        else
+          bulkLoad (if bulkIndexed s e then indexAddr s e.expr else a) e
       else
         a // { c = load a.s.mem e.type a.c; }
     else if k == "call" then
@@ -1117,13 +1143,69 @@ let
   bulkIndexed =
     s: e:
     let
-      inner = length (Ch.collect (x: kindOf x == "deref" && x.expr.kind != "lit") (_: false) e.expr);
-      at = length s.bulkLoads + inner;
+      at = bulkAt s e;
     in
     e.expr.kind == "ptradd"
     && e.expr.op == "+"
     && at < length s.bulkForms
     && elemAt s.bulkForms at == "index";
+
+  # The position of the load e among the recorded loads of the iteration (see bulkIndexed).
+  bulkAt =
+    s: e:
+    length s.bulkLoads
+    + length (Ch.collect (x: kindOf x == "deref" && x.expr.kind != "lit") (_: false) e.expr);
+
+  # The names { pages; off; } of the page read of the load e in the iteration of a bulk
+  # loop, or null when it is not one (see "Bulk loops").
+  bulkPage =
+    s: e:
+    let
+      at = bulkAt s e;
+    in
+    if bulkIndexed s e && at < length s.bulkPages then elemAt s.bulkPages at else null;
+
+  # The load e of one byte at an invariant pointer plus an index, read from the leaves pg
+  # (see bulkPage): byte p = off + index of the read range is element bitAnd p 255 of leaf
+  # div p 256. The pointer is emitted as well, so that the loads recorded in it keep their
+  # order, but its value is not used: pg holds the same invariant, bound on entry. The
+  # load is recorded like bulkLoad does. -> { s; binds; c; }
+  pagedLoad =
+    s: e: pg:
+    let
+      r = exprs s [
+        e.expr.ptr
+        e.expr.index
+      ];
+      q = shareInline r.s [ (add (atom pg.off) (elemAt r.cs 1)) ] (
+        ps:
+        app "builtins.elemAt" [
+          (app "builtins.elemAt" [
+            (atom pg.pages)
+            (app "div" [
+              (head ps)
+              (num 256)
+            ])
+          ])
+          (app "bitAnd" [
+            (head ps)
+            (num 255)
+          ])
+        ]
+      );
+    in
+    {
+      s = q.s // {
+        bulkLoads = q.s.bulkLoads ++ [
+          {
+            node = e;
+            addr = null;
+          }
+        ];
+      };
+      inherit (r) binds;
+      c = if T.isS8 e.type then app "R.toS8" [ q.c ] else q.c;
+    };
 
   # The address p (a "ptradd" node) of such a load as `base + index * size`, without
   # wrapping: the base is a pointer (unsigned form, below 2^32), the index lies in [0, U],
@@ -2366,6 +2448,89 @@ let
     else
       bindIn db "cnt" upTotal // { req = upReq; };
 
+  # Page reads (see the header). The longest read range read by pages, and the constants of
+  # the threshold T = max(pageMinCount, pageLeafCost * L) on the count: below it the
+  # setup of the pages costs more than it saves.
+  pageMaxLen = 16384;
+  pageMinCount = 32;
+  pageLeafCost = 8;
+
+  # Whether the read range r of the plan is read by pages: an invariant pointer plus an
+  # index (form "index") of one byte at an element size of 1, at most pageMaxLen bytes
+  # long. Its length is then U + 1 = span + 1.
+  pageable =
+    r:
+    r.form == "index" && T.sizeOf r.node.type == 1 && r.node.expr.size == 1 && r.span + 1 <= pageMaxLen;
+
+  # The page reads of the plan p of a loop entered in state s, bound after `after`
+  # (= { s; binds; }), with bases the code of the base bound for the entry test of each
+  # read range (null for "linear"). The reads with the same base and length share their
+  # bindings `pg = M.readPages <mem> <base> <length>` and `off = bitAnd <base> 255`.
+  # -> { s; binds; names; leaves; } with names the { pages; off; } of each read range, or
+  # null when it is not read by pages, and leaves the largest L = div U 256 + 2.
+  pageReads =
+    s: p: bases: after:
+    foldl'
+      (
+        acc: i:
+        let
+          r = elemAt p.regions i;
+          base = elemAt bases i;
+          len = r.span + 1;
+          key = "${base.code} ${toString len}";
+          pf = fresh acc.s "pg";
+          of = fresh pf.s "off";
+          own = {
+            pages = pf.name;
+            off = of.name;
+          };
+          leaves = div r.span 256 + 2;
+        in
+        if !pageable r then
+          acc // { names = acc.names ++ [ null ]; }
+        else if acc.groups ? ${key} then
+          acc // { names = acc.names ++ [ acc.groups.${key} ]; }
+        else
+          {
+            inherit (of) s;
+            binds = acc.binds ++ [
+              {
+                name = pf.name;
+                inherit
+                  (app "M.readPages" [
+                    (atom s.mem)
+                    base
+                    (num len)
+                  ])
+                  code
+                  ;
+              }
+              {
+                name = of.name;
+                inherit
+                  (app "bitAnd" [
+                    base
+                    (num 255)
+                  ])
+                  code
+                  ;
+              }
+            ];
+            groups = acc.groups // {
+              ${key} = own;
+            };
+            names = acc.names ++ [ own ];
+            leaves = if leaves > acc.leaves then leaves else acc.leaves;
+          }
+      )
+      {
+        inherit (after) s binds;
+        groups = { };
+        names = [ ];
+        leaves = 0;
+      }
+      (genList (i: i) (length p.regions));
+
   # The bulk form of the loop l entered in state s (see the header) from the plan p, with
   # names numbered from st0 (a state like s). -> { s; binds; ok; set; } with ok the name of
   # the entry test and set the code of the result: mem and the carried variables, as the
@@ -2519,17 +2684,22 @@ let
       condPart = st: if l.cond == null then none st else cond st l.cond false;
       bodyPart = st: stmt st l.body;
       stepPart = st: if l.step == null then none st else effect st l.step;
-      iter = if l.isDo then seq2 bodyPart condPart sb else seq2 (seq2 condPart bodyPart) stepPart sb;
+      iterFrom =
+        st: if l.isDo then seq2 bodyPart condPart st else seq2 (seq2 condPart bodyPart) stepPart st;
+      iter = iterFrom sb;
       store = iter.s.bulkStore;
       loads = iter.s.bulkLoads;
       indices = genList (i: i) (length p.regions);
       sameNode = a: b: a.line == b.line && a.col == b.col;
-      recorded =
-        store != null
-        && length loads == length p.regions
-        && all (i: sameNode (elemAt loads i).node (elemAt p.regions i).node) indices;
-      # A function of k with the bindings of iteration k around result.
-      atK = result: "${kf.name}:\n${renderLet (start.binds ++ iter.binds) result}";
+      matches =
+        it:
+        it.s.bulkStore != null
+        && length it.s.bulkLoads == length p.regions
+        && all (i: sameNode (elemAt it.s.bulkLoads i).node (elemAt p.regions i).node) indices;
+      recorded = matches iter;
+      # A function of k with the bindings of the iteration it around result.
+      atKOf = it: result: "${kf.name}:\n${renderLet (start.binds ++ it.binds) result}";
+      atK = atKOf iter;
       attrOf = key: attrName s.names.${key};
       linear = filter (i: (elemAt p.regions i).form == "linear") indices;
       bkSet =
@@ -2565,14 +2735,23 @@ let
               hi = add lo (add (mul last (num r.coef)) (num (r.size - 1)));
             in
             if r.form == "index" then
-              lb // { tests = acc.tests ++ [ (rangeTest lb.c (add lb.c (num r.span))) ]; }
+              lb
+              // {
+                tests = acc.tests ++ [ (rangeTest lb.c (add lb.c (num r.span))) ];
+                bases = acc.bases ++ [ lb.c ];
+              }
             else
-              acc // { tests = acc.tests ++ [ (rangeTest lo hi) ]; }
+              acc
+              // {
+                tests = acc.tests ++ [ (rangeTest lo hi) ];
+                bases = acc.bases ++ [ null ];
+              }
           )
           (
             wb
             // {
               tests = map (r: rangeTest (num r.addr) (num (r.addr + r.size - 1))) (cacheRanges p.cached);
+              bases = [ ];
             }
           )
           indices;
@@ -2586,9 +2765,39 @@ let
         ]
       );
       ok = bindIn regions "ok" (low okCode);
-      vals = bindIn ok "vals" (
-        low "builtins.genList (\n  ${indent (atK store.value.code)}\n) ${total.code}"
+      # The pages are bound in the branch that reads them, so that a loop below the
+      # threshold does not allocate them.
+      pages = pageReads s p regions.bases {
+        inherit (ok) s;
+        binds = [ ];
+      };
+      paged = any (x: x != null) pages.names;
+      # The iteration again, with the page reads, numbered after the pages.
+      iterP = iterFrom (
+        sb
+        // {
+          inherit (pages.s) n;
+          bulkPages = pages.names;
+        }
       );
+      genOf = it: "builtins.genList (\n  ${indent (atKOf it it.s.bulkStore.value.code)}\n) ${total.code}";
+      threshold =
+        if pageLeafCost * pages.leaves > pageMinCount then pageLeafCost * pages.leaves else pageMinCount;
+      vals =
+        if paged then
+          bindIn
+            {
+              s = st0 // {
+                inherit (iterP.s) n;
+              };
+              inherit (ok) binds;
+            }
+            "vals"
+            (
+              low "if ${total.code} >= ${toString threshold} then\n  ${indent (renderLet pages.binds (genOf iterP))}\nelse\n  ${indent (genOf iter)}"
+            )
+        else
+          bindIn ok "vals" (low (genOf iter));
       write =
         if p.coef == 1 then
           app "M.storeRun" [
@@ -2621,7 +2830,7 @@ let
         )
         + " }";
     in
-    if !recorded then
+    if !recorded || paged && !matches iterP then
       throw "cc: internal error: the bulk iteration does not match its plan"
     else
       {
@@ -3054,6 +3263,7 @@ let
         bulkLoads = [ ];
         bulkStore = null;
         bulkForms = [ ];
+        bulkPages = [ ];
       };
       result =
         mem: c:
