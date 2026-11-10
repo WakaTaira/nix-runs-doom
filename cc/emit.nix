@@ -35,6 +35,52 @@
 #     hits since the start of the iteration joined by ||. The cached values are versioned
 #     like mem: the join sets of if/else and switch carry them wherever mem may change,
 #     every way out of an iteration passes them on, and they are dropped after the loop.
+#   - Such a loop runs in bulk, `if <entry test> then <bulk form> else <loop>`, when its
+#     typed tree shows all of the following (otherwise it is emitted as above). Invariants
+#     are constants, variables declared before the loop that it does not assign, and the
+#     cached reads, combined without side effects; invariants that only the entry test or
+#     the values after the loop may evaluate must be safe (no / or % but by a constant
+#     other than 0, no shift but by a constant).
+#       A. No break, continue, return or switch.
+#       B. A count form, giving the number N of iterations and a requirement: with n an
+#          int variable assigned nowhere else in the loop, `do B while (n--)` (N = n0 + 1,
+#          n0 >= 0), `while (n--)` or `for (...; n--; ...)` (N = n0, n0 >= 0),
+#          `do B while (--n)` (N = n0, n0 >= 1), `while (--n)` or `for (...; --n; ...)`
+#          (N = n0 - 1, n0 >= 1); with i an int induction variable stepping by +1 and e an
+#          int invariant, `i < e` (N = max(0, e - i0)) or `i <= e` (N = max(0, e - i0 + 1),
+#          e < 2^31 - 1), by -1, `i > e` or `i >= e` likewise, in a while or for loop
+#          (e op i is turned around). Every form requires N <= 2^24.
+#       C. Every other variable declared before the loop and assigned in it is an
+#          induction variable or a temporary. An induction variable (int, unsigned or a
+#          pointer) is assigned exactly once, on every iteration (not in a branch of if or
+#          ?:, nor on the right of && or ||), by ++, --, += c, -= c, v = v + c or
+#          v = v - c, with c invariant of type int, unsigned or narrower (scaled by the
+#          element size for a pointer); its value at the start of iteration k is
+#          v0 + k * step, wrapped to its type. A temporary is assigned on every iteration
+#          before any read of it in the iteration.
+#       D. Exactly one store: a plain 1-byte `=` in the body, run on every iteration, at
+#          an address a0 + k * d (modulo 2^32) with d >= 1 a constant: the address is
+#          built from induction variables with constant steps, safe invariants, + and -,
+#          pointer arithmetic and casts between 32-bit integers and pointers.
+#       E. Every load is at a constant address (the cached reads), at an invariant
+#          pointer plus an index known to lie in [0, U] (constants; unsigned char and
+#          short values; & with a constant or two known operands; | and ^; >> of unsigned
+#          by a constant; + below 2^31; widening casts; int and unsigned variables whose
+#          only assignment in the loop is a plain one or an initializer in the body, run
+#          on every iteration before the load), or at a0' + k * d' with d' >= 0 a constant
+#          (as in D).
+#     One iteration is walked in evaluation order for C to E (`while` and `for`:
+#     condition, body, step; `do`: body, condition). The entry test is the requirement
+#     of B and N <= 2^24 and, when N >= 1, that the write range [a0, a0 + (N - 1) * d] and
+#     every read range lie below 2^32 and do not overlap; a read range is the merged range
+#     of the cached reads, [b, b + U * size + s - 1] for an index, or
+#     [a0', a0' + (N - 1) * d' + s - 1], with s the size read. The bulk form computes the
+#     stored values with `builtins.genList` over k from one iteration emitted with the
+#     variables at the start of iteration k (n is n0 - k) and every read from the memory on
+#     entry, writes them with M.storeRun (d = 1) or M.storeStride, and yields the
+#     variables after the loop: induction variables v0 + N * step, n -1 after n-- and 0
+#     after --n, and temporaries their value at the end of iteration N - 1 (their value on
+#     entry when N is 0). The same iteration at k = 0 gives a0 and a0'.
 #   - if/else becomes an attribute set of mem and the variables either branch changes,
 #     which the following code reads.
 #   - A statement completes normally or abruptly by return, break (to the innermost loop
@@ -108,6 +154,7 @@ let
     concatLists
     concatMap
     concatStringsSep
+    div
     elem
     elemAt
     filter
@@ -186,11 +233,14 @@ let
   attrName = name: if name == "mem" || name == "exit" then "${name}'" else quoteAttr name;
 
   # ---- Emitter state ----
-  # s = { n; mem; vars; names; old; retVoid; cached; }: n numbers the next generated name;
-  # mem is the current memory; vars maps a variable key to the code of its current value
-  # (a name or a constant); names maps a key to the C name; old is the code of the
-  # target's value while an assignment's value is emitted; retVoid tells that the function
-  # returns void; cached lists the cached reads of the enclosing loop (see "Cached reads").
+  # s = { n; mem; vars; names; old; retVoid; cached; bulk; bulkLoads; bulkStore; }: n
+  # numbers the next generated name; mem is the current memory; vars maps a variable key
+  # to the code of its current value (a name or a constant); names maps a key to the C
+  # name; old is the code of the target's value while an assignment's value is emitted;
+  # retVoid tells that the function returns void; cached lists the cached reads of the
+  # enclosing loop (see "Cached reads"); bulk tells that the iteration of a bulk loop is
+  # emitted, which records its loads in bulkLoads and its store in bulkStore (see "Bulk
+  # loops").
   fresh = s: base: {
     name = "${base}_${toString s.n}";
     s = s // {
@@ -489,7 +539,12 @@ let
         a = expr s e.expr;
         key = readKey e;
       in
-      if key != null && s.vars ? ${key} then readCached s key else a // { c = load a.s.mem e.type a.c; }
+      if key != null && s.vars ? ${key} then
+        readCached s key
+      else if s.bulk then
+        bulkLoad a e
+      else
+        a // { c = load a.s.mem e.type a.c; }
     else if k == "call" then
       call s e
     else if k == "assign" then
@@ -862,23 +917,36 @@ let
         }
       ) e.target ad.c;
     in
-    {
-      inherit (r) s;
-      binds =
-        v.binds
-        ++ a.binds
-        ++ ad.binds
-        ++ o.binds
-        ++ vb.binds
-        ++ [
-          {
-            inherit (m) name;
-            inherit (store) code;
-          }
-        ]
-        ++ r.binds;
-      c = if e.post then o.c else vb.c;
-    };
+    if s.bulk then
+      # The iteration of a bulk loop records its store instead (see "Bulk loops").
+      {
+        s = vb.s // {
+          bulkStore = {
+            addr = ad.c;
+            value = encode t node.type vb.c;
+          };
+        };
+        binds = v.binds ++ a.binds ++ ad.binds ++ o.binds ++ vb.binds;
+        c = if e.post then o.c else vb.c;
+      }
+    else
+      {
+        inherit (r) s;
+        binds =
+          v.binds
+          ++ a.binds
+          ++ ad.binds
+          ++ o.binds
+          ++ vb.binds
+          ++ [
+            {
+              inherit (m) name;
+              inherit (store) code;
+            }
+          ]
+          ++ r.binds;
+        c = if e.post then o.c else vb.c;
+      };
 
   flipped = {
     "<" = ">=";
@@ -1020,6 +1088,23 @@ let
 
   # The value of the entry c read from mem.
   loadEntry = mem: c: load mem c.type (num c.addr);
+
+  # The load e at the address a (emitted) in the iteration of a bulk loop: read from the
+  # memory as usual, and recorded with its address (see "Bulk loops").
+  bulkLoad =
+    a: e:
+    a
+    // {
+      s = a.s // {
+        bulkLoads = a.s.bulkLoads ++ [
+          {
+            node = e;
+            addr = a.c;
+          }
+        ];
+      };
+      c = load a.s.mem e.type a.c;
+    };
 
   entryOf = s: key: head (filter (c: c.key == key) s.cached);
 
@@ -1506,10 +1591,13 @@ let
         ++ map (c: "${c.attr} = ${(loadEntry s.mem c).code};") cached
         ++ (if !returns then [ ] else [ "done' = false;" ] ++ (if s.retVoid then [ ] else [ "ret' = 0;" ]))
       );
+      code = "${gen.driver} (\n  ${indent "${v}:\n${gen.body}"}\n) { ${init} }";
+      plan = bulkPlan s l carried cached;
+      bulk = bulkCode s l carried plan res.s;
     in
     {
       inherit (res) name;
-      s = res.s // {
+      s = (if plan == null then res.s else bulk.s) // {
         mem = "${res.name}.mem";
         vars =
           s.vars
@@ -1520,13 +1608,982 @@ let
             }) carried
           );
       };
-      binds = [
+      binds =
+        if plan == null then
+          [
+            {
+              inherit (res) name;
+              inherit code;
+            }
+          ]
+        else
+          bulk.binds
+          ++ [
+            {
+              inherit (res) name;
+              code = "if ${bulk.ok} then\n  ${indent bulk.set}\nelse\n  ${indent code}";
+            }
+          ];
+    };
+
+  # ---- Bulk loops (see the header) ----
+  # bulkPlan checks the conditions on the typed tree of a loop, walking one iteration in
+  # the evaluation order of the emitter (iterEvents); bulkCode emits the entry test and
+  # the bulk form.
+
+  int32Tags = [
+    "int"
+    "uint"
+    "long"
+    "ulong"
+  ];
+  word32Tags = int32Tags ++ [ "ptr" ];
+  inductionTags = [
+    "int"
+    "uint"
+    "ptr"
+  ];
+  # The types of the amount of an induction step: int, unsigned and the narrower integers.
+  amountTags = [
+    "int"
+    "uint"
+    "char"
+    "schar"
+    "uchar"
+    "short"
+    "ushort"
+  ];
+  tagIn = tags: t: elem t.tag tags;
+  # The largest count of a bulk loop: it keeps the products of the entry test and of the
+  # induction values below 2^62.
+  bulkMax = 16777216;
+  pow31 = 2147483648;
+  pow32 = 4294967296;
+
+  # Whether e is loop invariant: without side effects, it reads only constants, variables
+  # of s (declared before the loop) that the loop does not assign (assigned), and memory at
+  # constant addresses (cached reads; a bulk loop stores to no constant address).
+  isInvariant =
+    s: assigned: e:
+    Ch.collect (
+      x:
+      let
+        k = kindOf x;
+      in
+      elem k [
+        "assign"
+        "call"
+        "old"
+      ]
+      || k == "var" && (!(s.vars ? ${x.var.key}) || elem x.var.key assigned)
+      || k == "deref" && x.expr.kind != "lit"
+    ) (_: false) e == [ ];
+
+  # Whether evaluating e cannot fail: no / or % by anything but a constant other than 0,
+  # and no shift by anything but a constant. The entry test and the values after the loop
+  # evaluate such invariants even where the loop would not.
+  isSafe =
+    e:
+    Ch.collect (
+      x:
+      kindOf x == "binop"
+      && (
+        elem x.op [
+          "/"
+          "%"
+        ]
+        && !(x.rhs.kind == "lit" && x.rhs.value != 0)
+        ||
+          elem x.op [
+            "<<"
+            ">>"
+          ]
+          && x.rhs.kind != "lit"
+      )
+    ) (_: false) e == [ ];
+
+  # The events of the expression e in the evaluation order of the emitter, each
+  # { ev; must; part; }: ev is "read" (key) or "assign" (key, node) of a variable, "load"
+  # (node) or "store" (node) of memory, or "other" (a call). must tells that the event
+  # happens whenever its part (cond, body or step) runs: it is not in a branch of ?: or on
+  # the right of && or ||. old is the key of the variable that an "old" node reads, null
+  # when the target is in memory.
+  exprEvents =
+    must: part: old: e:
+    let
+      k = kindOf e;
+      go = exprEvents must part old;
+      maybe = exprEvents false part old;
+      ev = x: [ (x // { inherit must part; }) ];
+    in
+    if k == "lit" then
+      [ ]
+    else if k == "var" then
+      ev {
+        ev = "read";
+        key = e.var.key;
+      }
+    else if k == "old" then
+      (
+        if old == null then
+          [ ]
+        else
+          ev {
+            ev = "read";
+            key = old;
+          }
+      )
+    else if
+      elem k [
+        "cast"
+        "neg"
+        "bnot"
+        "not"
+      ]
+    then
+      go e.expr
+    else if
+      elem k [
+        "binop"
+        "cmp"
+        "ptrdiff"
+      ]
+    then
+      go e.lhs ++ go e.rhs
+    else if k == "logand" || k == "logor" then
+      go e.lhs ++ maybe e.rhs
+    else if k == "cond" then
+      go e.cond ++ maybe e.thenExpr ++ maybe e.elseExpr
+    else if k == "ptradd" then
+      go e.ptr ++ go e.index
+    else if k == "deref" then
+      go e.expr
+      ++ ev {
+        ev = "load";
+        node = e;
+      }
+    else if k == "assign" && e.target.kind == "var" then
+      exprEvents must part e.target.var.key e.value
+      ++ ev {
+        ev = "assign";
+        key = e.target.var.key;
+        node = e;
+      }
+    else if k == "assign" then
+      exprEvents must part null e.value
+      ++ go e.target.expr
+      ++ ev {
+        ev = "store";
+        node = e;
+      }
+    else
+      ev { ev = "other"; };
+
+  # The events of the statement n of a loop body (see exprEvents). A declaration with an
+  # initializer adds "decl" (key, node = { var; init; }) after the initializer; any
+  # statement but a block, a declaration, an expression or an if is "other".
+  stmtEvents =
+    must: n:
+    let
+      k = n.kind;
+      ex = exprEvents must "body" null;
+      other = [
         {
-          inherit (res) name;
-          code = "${gen.driver} (\n  ${indent "${v}:\n${gen.body}"}\n) { ${init} }";
+          ev = "other";
+          inherit must;
+          part = "body";
         }
       ];
-    };
+      decl =
+        d:
+        if d.init == null then
+          [ ]
+        else
+          ex d.init
+          ++ [
+            {
+              ev = "decl";
+              key = d.var.key;
+              node = d;
+              inherit must;
+              part = "body";
+            }
+          ];
+    in
+    if k == "block" then
+      concatMap (stmtEvents must) n.items
+    else if k == "decl" then
+      concatMap decl n.vars
+    else if k == "expr" then
+      ex n.expr
+    else if k == "if" then
+      ex n.cond
+      ++ stmtEvents false n.thenStmt
+      ++ (if n.elseStmt == null then [ ] else stmtEvents false n.elseStmt)
+    else
+      other;
+
+  # The events of one iteration of the loop l: condition, body and step, or body and
+  # condition for do/while.
+  iterEvents =
+    l:
+    let
+      c = if l.cond == null then [ ] else exprEvents true "cond" null l.cond;
+      b = stmtEvents true l.body;
+      st = if l.step == null then [ ] else exprEvents true "step" null l.step;
+    in
+    if l.isDo then b ++ c else c ++ b ++ st;
+
+  # The count form of the loop l, or null:
+  #   { kind = "down"; key; post; }   the condition n-- (post) or --n of an int n
+  #   { kind = "up"; key; op; e; }    the condition i op e of a while or for loop, with op
+  #                                   one of < <= > >=, i an int variable and e an int
+  #                                   invariant (e op i is turned around)
+  countForm =
+    invariant: l:
+    let
+      c = l.cond;
+      v = c.value;
+      flip = {
+        "<" = ">";
+        ">" = "<";
+        "<=" = ">=";
+        ">=" = "<=";
+      };
+      intVar = x: x.kind == "var" && x.type.tag == "int";
+      bound = x: x.type.tag == "int" && invariant x;
+      up = i: op: e: {
+        kind = "up";
+        key = i.var.key;
+        inherit op e;
+      };
+    in
+    if c == null then
+      null
+    else if
+      c.kind == "assign"
+      && c.target.kind == "var"
+      && c.type.tag == "int"
+      && v.kind == "binop"
+      && v.op == "-"
+      && v.lhs.kind == "old"
+      && v.rhs.kind == "lit"
+      && v.rhs.value == 1
+    then
+      {
+        kind = "down";
+        key = c.target.var.key;
+        inherit (c) post;
+      }
+    else if l.isDo || c.kind != "cmp" || !(flip ? ${c.op}) then
+      null
+    else if intVar c.lhs && bound c.rhs then
+      up c.lhs c.op c.rhs
+    else if intVar c.rhs && bound c.lhs then
+      up c.rhs flip.${c.op} c.lhs
+    else
+      null;
+
+  # The assignment a to the variable key as an induction step, or null:
+  # { type; sign; amount; scale; coef; } adds sign * amount * scale to the variable of
+  # type, modulo 2^32; coef is that increment (|coef| < 2^32) when amount is a constant,
+  # otherwise null. The forms are ++, --, += and -= (with an int or unsigned variable, a
+  # step of int, unsigned or a narrower type; with a pointer, an int or unsigned index),
+  # and v = v + c and v = v - c.
+  inductionStep =
+    invariant: key: a:
+    let
+      self = x: x.kind == "old" || x.kind == "var" && x.var.key == key;
+      selfIn = x: self x || x.kind == "cast" && tagIn word32Tags x.type && self x.expr;
+      amountOk = x: invariant x && tagIn amountTags (if x.kind == "cast" then x.expr.type else x.type);
+      signOf = op: if op == "+" then 1 else -1;
+      v = if a.value.kind == "cast" then a.value.expr else a.value;
+      p = a.value;
+      step =
+        sign: amount: scale:
+        let
+          raw = sign * amount.value * scale;
+        in
+        if amount.kind != "lit" && !isSafe amount then
+          null
+        else
+          {
+            inherit (a) type;
+            inherit sign amount scale;
+            coef =
+              if amount.kind != "lit" then
+                null
+              else if raw > -pow32 && raw < pow32 then
+                raw
+              else
+                bitAnd raw B.mask32;
+          };
+    in
+    if T.isPtr a.type then
+      (
+        if
+          p.kind == "ptradd"
+          && self p.ptr
+          && tagIn [
+            "int"
+            "uint"
+          ] p.index.type
+          && amountOk p.index
+        then
+          step (signOf p.op) p.index p.size
+        else
+          null
+      )
+    else if
+      v.kind == "binop"
+      && elem v.op [
+        "+"
+        "-"
+      ]
+      && tagIn [
+        "int"
+        "uint"
+      ] v.type
+      && selfIn v.lhs
+      && amountOk v.rhs
+    then
+      step (signOf v.op) v.rhs 1
+    else
+      null;
+
+  # The constant d with e = e0 + k * d (modulo 2^32) in iteration k, or null: e is built
+  # from induction variables with constant steps (ind), safe invariants, + and - on 32-bit
+  # integers, pointer arithmetic with a 32-bit index, and casts between 32-bit integers and
+  # pointers.
+  linCoef =
+    invariant: ind: e:
+    let
+      k = kindOf e;
+      sub = linCoef invariant ind;
+      both =
+        x: y: f:
+        if x == null || y == null then null else f x y;
+      stepCoef = key: if ind ? ${key} then ind.${key}.coef else null;
+    in
+    if invariant e then
+      (if isSafe e then 0 else null)
+    else if k == "var" then
+      stepCoef e.var.key
+    else if k == "assign" && e.target.kind == "var" then
+      stepCoef e.target.var.key
+    else if k == "cast" && tagIn word32Tags e.type && tagIn word32Tags e.expr.type then
+      sub e.expr
+    else if
+      k == "binop"
+      && elem e.op [
+        "+"
+        "-"
+      ]
+      && tagIn int32Tags e.type
+    then
+      both (sub e.lhs) (sub e.rhs) (x: y: if e.op == "+" then x + y else x - y)
+    else if k == "ptradd" && tagIn int32Tags e.index.type then
+      both (sub e.ptr) (sub e.index) (x: y: if e.op == "+" then x + y * e.size else x - y * e.size)
+    else
+      null;
+
+  # The smallest 2^k - 1 that is at least x >= 0.
+  lowMask =
+    x:
+    let
+      go = m: if m >= x then m else go (m * 2 + 1);
+    in
+    go 0;
+
+  # The bound U of an index e that lies in [0, U], or null. env maps the variables with a
+  # known range at this point; pure tells that the index has no side effects (otherwise its
+  # variables have no range).
+  idxRange =
+    env: pure: e:
+    let
+      k = kindOf e;
+      sub = idxRange env pure;
+    in
+    if k == "lit" then
+      (if e.value >= 0 then e.value else null)
+    else if (k == "deref" || k == "cast") && T.isU8 e.type then
+      255
+    else if (k == "deref" || k == "cast") && T.isU16 e.type then
+      65535
+    else if
+      k == "cast" && T.isInteger e.type && T.isInteger e.expr.type && T.fits e.expr.type e.type
+    then
+      sub e.expr
+    else if k == "var" then
+      (if pure && env ? ${e.var.key} then env.${e.var.key} else null)
+    else if k == "binop" then
+      binopRange e (sub e.lhs) (sub e.rhs)
+    else
+      null;
+
+  # The bound of the binop e with the bounds l and r (or null) of its operands.
+  binopRange =
+    e: l: r:
+    let
+      op = e.op;
+      known = l != null && r != null;
+      litOk = x: x.kind == "lit" && x.value >= 0;
+      c = e.rhs.value;
+    in
+    if op == "&" then
+      (
+        if known then
+          (if l < r then l else r)
+        else if litOk e.rhs then
+          r
+        else if litOk e.lhs then
+          l
+        else
+          null
+      )
+    else if op == "|" || op == "^" then
+      (if known then lowMask (if l > r then l else r) else null)
+    else if op == ">>" then
+      (
+        if
+          tagIn [
+            "uint"
+            "ulong"
+          ] e.type
+          && e.rhs.kind == "lit"
+          && c >= 0
+          && c <= 31
+        then
+          (if l != null then div l (B.pow2 c) else div pow32 (B.pow2 c) - 1)
+        else
+          null
+      )
+    else if op == "+" then
+      (if known && l + r < pow31 then l + r else null)
+    else
+      null;
+
+  # The read range of the load e (a "deref" node at an address other than a constant) at
+  # a point where env holds the variable ranges, or null:
+  #   { form = "index"; node; base; span; }      [base, base + span] with base invariant
+  #   { form = "linear"; node; coef; size; }     [a0, a0 + (N - 1) * coef + size - 1] with
+  #                                              a0 the address in iteration 0
+  loadRegion =
+    invariant: ind: env: e:
+    let
+      a = e.expr;
+      size = T.sizeOf e.type;
+      u =
+        if a.kind == "ptradd" && a.op == "+" && invariant a.ptr && isSafe a.ptr then
+          idxRange env (!hasEffects a.index) a.index
+        else
+          null;
+      d = linCoef invariant ind a;
+    in
+    if u != null then
+      {
+        form = "index";
+        node = e;
+        base = a.ptr;
+        span = u * a.size + size - 1;
+      }
+    else if d != null && d >= 0 then
+      {
+        form = "linear";
+        node = e;
+        coef = d;
+        inherit size;
+      }
+    else
+      null;
+
+  # The variable range that the assignment or declaration event x sets in env, as a set:
+  # the range of its value (below 2^31) when x is the only one to an int or unsigned
+  # variable in the loop, a plain assignment or an initializer, in the body and run on
+  # every iteration.
+  rangeAfter =
+    events: env: x:
+    let
+      isAssign = x.ev == "assign";
+      t = if isAssign then x.node.type else x.node.var.type;
+      value = if isAssign then x.node.value else x.node.init;
+      plain = !isAssign || !x.node.post && !hasOld x.node.value;
+      sets = filter (y: (y.ev == "assign" || y.ev == "decl") && y.key == x.key) events;
+      u = idxRange env (!hasEffects value) value;
+    in
+    if
+      x.must
+      && x.part == "body"
+      && tagIn [
+        "int"
+        "uint"
+      ] t
+      && plain
+      && length sets == 1
+      && u != null
+      && u < pow31
+    then
+      { ${x.key} = u; }
+    else
+      { };
+
+  # The read ranges (loadRegion) of the loads at addresses other than constants among
+  # events, in order.
+  loadRegions =
+    invariant: ind: events:
+    (foldl'
+      (
+        acc: x:
+        if x.ev == "load" && x.node.expr.kind != "lit" then
+          acc // { regions = acc.regions ++ [ (loadRegion invariant ind acc.env x.node) ]; }
+        else if x.ev == "assign" || x.ev == "decl" then
+          acc // { env = acc.env // rangeAfter events acc.env x; }
+        else
+          acc
+      )
+      {
+        env = { };
+        regions = [ ];
+      }
+      events
+    ).regions;
+
+  # The plan of the bulk form of the loop l entered in state s with the carried variables
+  # and cached reads of `loop`, or null when the loop does not qualify:
+  # { count; ind; temps; coef; regions; cached; } with count the count form, ind the
+  # induction steps by key, temps the keys of the temporaries, coef the constant step of
+  # the store address and regions the read ranges (loadRegions).
+  bulkPlan =
+    s: l: carried: cached:
+    let
+      parts = [
+        l.cond
+        l.body
+        l.step
+      ];
+      invariant = isInvariant s (assignedKeys parts);
+      events = iterEvents l;
+      count = countForm invariant l;
+      assignsOf = key: filter (x: x.ev == "assign" && x.key == key) events;
+      others = filter (key: count.kind != "down" || key != count.key) carried;
+      stepOf =
+        key:
+        let
+          as = assignsOf key;
+          a = head as;
+        in
+        if length as == 1 && a.must && tagIn inductionTags a.node.type then
+          inductionStep invariant key a.node
+        else
+          null;
+      ind = listToAttrs (
+        concatMap (
+          key:
+          let
+            st = stepOf key;
+          in
+          if st == null then [ ] else [ (nameValue key st) ]
+        ) others
+      );
+      temps = filter (key: !(ind ? ${key})) others;
+      isTemp =
+        key:
+        let
+          uses = filter (x: (x.ev == "read" || x.ev == "assign") && x.key == key) events;
+        in
+        uses != [ ] && (head uses).ev == "assign" && (head uses).must;
+      countOk =
+        if count.kind == "down" then
+          length (assignsOf count.key) == 1
+        else
+          (ind.${count.key}.coef or null) == (
+            if
+              elem count.op [
+                "<"
+                "<="
+              ]
+            then
+              1
+            else
+              -1
+          );
+      stores = filter (x: x.ev == "store") events;
+      store = head stores;
+      target = store.node.target;
+      coef = linCoef invariant ind target.expr;
+      storeOk =
+        length stores == 1
+        && store.must
+        && store.part == "body"
+        && !store.node.post
+        && !hasOld store.node.value
+        && T.sizeOf target.type == 1
+        && target.expr.kind != "lit"
+        && coef != null
+        && coef >= 1;
+      regions = loadRegions invariant ind events;
+    in
+    if
+      cachesReads parts
+      && count != null
+      && !any (x: x.ev == "other") events
+      && countOk
+      && all isTemp temps
+      && storeOk
+      && all (r: r != null) regions
+    then
+      {
+        inherit
+          count
+          ind
+          temps
+          coef
+          regions
+          cached
+          ;
+      }
+    else
+      null;
+
+  # c bound to a fresh name of base after the bindings of acc = { s; binds; }, unless it
+  # is an atom. -> { s; binds; c; }
+  bindIn =
+    acc: base: c:
+    let
+      f = fresh acc.s base;
+    in
+    if isAtom c then
+      acc // { inherit c; }
+    else
+      {
+        inherit (f) s;
+        binds = acc.binds ++ [
+          {
+            inherit (f) name;
+            inherit (c) code;
+          }
+        ];
+        c = atom f.name;
+      };
+
+  # The invariant e emitted in the state sE and bound after acc (see bindIn).
+  emitIn =
+    sE: acc: base: e:
+    let
+      r = expr (sE // { inherit (acc.s) n; }) e;
+    in
+    bindIn {
+      s = acc.s // {
+        inherit (r.s) n;
+      };
+      binds = acc.binds ++ r.binds;
+    } base r.c;
+
+  # The count N of the bulk loop (the count form p.count) and the requirement of its form,
+  # bound after acc. -> acc // { req; } with c the code of N and req that of the
+  # requirement (null when there is none).
+  countCode =
+    s: l: sE: p: acc:
+    let
+      cf = p.count;
+      v0 = atom s.vars.${cf.key};
+      down =
+        if l.isDo && cf.post then
+          add v0 (num 1)
+        else if !l.isDo && !cf.post then
+          sub v0 (num 1)
+        else
+          v0;
+      eb = emitIn sE acc "e" cf.e;
+      e = eb.c;
+      diff =
+        {
+          "<" = sub e v0;
+          "<=" = add (sub e v0) (num 1);
+          ">" = sub v0 e;
+          ">=" = add (sub v0 e) (num 1);
+        }
+        .${cf.op};
+      db = bindIn eb "d" diff;
+      upTotal = low "if ${db.c.code} > 0 then ${db.c.code} else 0";
+      upReq =
+        if cf.op == "<=" then
+          infixN 6 "<" e (num 2147483647)
+        else if cf.op == ">=" then
+          infixN 6 ">" e (num (-2147483648))
+        else
+          null;
+    in
+    if cf.kind == "down" then
+      bindIn acc "cnt" down // { req = infixN 6 ">=" v0 (num (if cf.post then 0 else 1)); }
+    else
+      bindIn db "cnt" upTotal // { req = upReq; };
+
+  # The bulk form of the loop l entered in state s (see the header) from the plan p, with
+  # names numbered from st0 (a state like s). -> { s; binds; ok; set; } with ok the name of
+  # the entry test and set the code of the result: mem and the carried variables, as the
+  # loop yields them.
+  bulkCode =
+    s: l: carried: p: st0:
+    let
+      mask = num B.mask32;
+      wrapTo =
+        t: c:
+        if t.tag == "int" then
+          wrapCode c
+        else
+          app "bitAnd" [
+            c
+            mask
+          ];
+      isN = key: p.count.kind == "down" && key == p.count.key;
+      # The cached reads, loaded once from the memory on entry.
+      cache =
+        foldl'
+          (
+            acc: c:
+            let
+              b = bindIn acc "g" (loadEntry s.mem c);
+            in
+            b
+            // {
+              vars = acc.vars // {
+                ${c.key} = b.c.code;
+              };
+            }
+          )
+          {
+            s = st0;
+            binds = [ ];
+            vars = { };
+          }
+          p.cached;
+      sE = s // {
+        vars = s.vars // cache.vars;
+      };
+      # The step of each induction variable modulo 2^32, a constant or bound on entry.
+      steps =
+        foldl'
+          (
+            acc: key:
+            let
+              x = p.ind.${key};
+              r = expr (sE // { inherit (acc.s) n; }) x.amount;
+              scaled = if x.scale == 1 then r.c else mul r.c (num x.scale);
+              b =
+                bindIn
+                  {
+                    s = acc.s // {
+                      inherit (r.s) n;
+                    };
+                    binds = acc.binds ++ r.binds;
+                  }
+                  "inc"
+                  (
+                    app "bitAnd" [
+                      (if x.sign < 0 then neg scaled else scaled)
+                      mask
+                    ]
+                  );
+            in
+            if x.coef != null then
+              acc
+              // {
+                codes = acc.codes // {
+                  ${key} = num x.coef;
+                };
+              }
+            else
+              b
+              // {
+                codes = acc.codes // {
+                  ${key} = b.c;
+                };
+              }
+          )
+          {
+            inherit (cache) s binds;
+            codes = { };
+          }
+          (attrNames p.ind);
+      cnt = countCode s l sE p steps;
+      total = cnt.c;
+      # The variables at the start of iteration k: the induction variables v0 + k * step
+      # and n0 - k; a temporary keeps its value on entry, which the iteration never reads.
+      kf = fresh cnt.s "k";
+      k = atom kf.name;
+      start =
+        foldl'
+          (
+            acc: key:
+            let
+              v0 = atom s.vars.${key};
+              code = if isN key then sub v0 k else wrapTo p.ind.${key}.type (add v0 (mul k steps.codes.${key}));
+              f = fresh acc.s s.names.${key};
+            in
+            if elem key p.temps then
+              acc
+            else
+              {
+                inherit (f) s;
+                binds = acc.binds ++ [
+                  {
+                    inherit (f) name;
+                    inherit (code) code;
+                  }
+                ];
+                vars = acc.vars // {
+                  ${key} = f.name;
+                };
+              }
+          )
+          {
+            inherit (kf) s;
+            binds = [ ];
+            vars = { };
+          }
+          carried;
+      # One iteration in evaluation order, every read from the memory on entry; the store
+      # and the loads are recorded instead of emitted.
+      sb = start.s // {
+        inherit (s) mem;
+        vars = s.vars // cache.vars // start.vars;
+        cached = [ ];
+        hits = [ ];
+        bulk = true;
+        bulkLoads = [ ];
+        bulkStore = null;
+      };
+      seq2 =
+        f: g: st:
+        let
+          x = f st;
+          y = g x.s;
+        in
+        {
+          inherit (y) s;
+          binds = x.binds ++ y.binds;
+        };
+      none = st: {
+        s = st;
+        binds = [ ];
+      };
+      condPart = st: if l.cond == null then none st else cond st l.cond false;
+      bodyPart = st: stmt st l.body;
+      stepPart = st: if l.step == null then none st else effect st l.step;
+      iter = if l.isDo then seq2 bodyPart condPart sb else seq2 (seq2 condPart bodyPart) stepPart sb;
+      store = iter.s.bulkStore;
+      loads = iter.s.bulkLoads;
+      indices = genList (i: i) (length p.regions);
+      sameNode = a: b: a.line == b.line && a.col == b.col;
+      recorded =
+        store != null
+        && length loads == length p.regions
+        && all (i: sameNode (elemAt loads i).node (elemAt p.regions i).node) indices;
+      # A function of k with the bindings of iteration k around result.
+      atK = result: "${kf.name}:\n${renderLet (start.binds ++ iter.binds) result}";
+      attrOf = key: attrName s.names.${key};
+      linear = filter (i: (elemAt p.regions i).form == "linear") indices;
+      bkSet =
+        "{ "
+        + concatStringsSep " " (
+          [ "a' = ${store.addr.code};" ]
+          ++ map (i: "r'${toString i} = ${(elemAt loads i).addr.code};") linear
+          ++ map (key: "${attrOf key} = ${iter.s.vars.${key}};") p.temps
+        )
+        + " }";
+      bk = bindIn {
+        s = st0 // {
+          inherit (iter.s) n;
+        };
+        inherit (cnt) binds;
+      } "bk" (low (atK bkSet));
+      b0 = bindIn bk "b0" (app bk.c.code [ (num 0) ]);
+      a0 = atom "${b0.c.code}.a'";
+      last = sub total (num 1);
+      wb = bindIn b0 "whi" (add a0 (mul last (num p.coef)));
+      whi = wb.c;
+      below = c: infixN 6 "<" c (num pow32);
+      rangeTest =
+        lo: hi: "${(below hi).code} && (${(infixN 6 "<" whi lo).code} || ${(infixN 6 ">" a0 hi).code})";
+      regions =
+        foldl'
+          (
+            acc: i:
+            let
+              r = elemAt p.regions i;
+              lb = emitIn sE acc "lo" r.base;
+              lo = atom "${b0.c.code}.r'${toString i}";
+              hi = add lo (add (mul last (num r.coef)) (num (r.size - 1)));
+            in
+            if r.form == "index" then
+              lb // { tests = acc.tests ++ [ (rangeTest lb.c (add lb.c (num r.span))) ]; }
+            else
+              acc // { tests = acc.tests ++ [ (rangeTest lo hi) ]; }
+          )
+          (
+            wb
+            // {
+              tests = map (r: rangeTest (num r.addr) (num (r.addr + r.size - 1))) (cacheRanges p.cached);
+            }
+          )
+          indices;
+      okCode = concatStringsSep " && " (
+        (if cnt.req == null then [ ] else [ cnt.req.code ])
+        ++ [
+          "${total.code} <= ${toString bulkMax}"
+          "(${total.code} == 0 || ${(below whi).code}${
+            concatStringsSep "" (map (x: " && (${x})") regions.tests)
+          })"
+        ]
+      );
+      ok = bindIn regions "ok" (low okCode);
+      vals = bindIn ok "vals" (
+        low "builtins.genList (\n  ${indent (atK store.value.code)}\n) ${total.code}"
+      );
+      write =
+        if p.coef == 1 then
+          app "M.storeRun" [
+            (atom s.mem)
+            a0
+            total
+            vals.c
+          ]
+        else
+          app "M.storeStride" [
+            (atom s.mem)
+            a0
+            (num p.coef)
+            total
+            vals.c
+          ];
+      final =
+        key:
+        if isN key then
+          num (if p.count.post then -1 else 0)
+        else if elem key p.temps then
+          low "if ${total.code} == 0 then ${s.vars.${key}} else (${bk.c.code} (${(sub total (num 1)).code})).${attrOf key}"
+        else
+          wrapTo p.ind.${key}.type (add (atom s.vars.${key}) (mul total steps.codes.${key}));
+      set =
+        "{ "
+        + concatStringsSep " " (
+          [ "mem = if ${total.code} == 0 then ${s.mem} else ${write.code};" ]
+          ++ map (key: "${attrOf key} = ${(final key).code};") carried
+        )
+        + " }";
+    in
+    if !recorded then
+      throw "cc: internal error: the bulk iteration does not match its plan"
+    else
+      {
+        s = st0 // {
+          inherit (vals.s) n;
+        };
+        inherit (vals) binds;
+        ok = ok.c.code;
+        inherit set;
+      };
 
   # ---- Abrupt completion (see the header) ----
   # A region is emitted by stmtK handlers s n k -> { s; binds; code; }, the code of the
@@ -1945,6 +3002,9 @@ let
         retVoid = T.isVoid f.ret;
         cached = [ ];
         hits = [ ];
+        bulk = false;
+        bulkLoads = [ ];
+        bulkStore = null;
       };
       result =
         mem: c:

@@ -880,7 +880,7 @@ let
   # In the draw input, the loop of fn reads the pointer at the address of the global name
   # through its cached value, and loads it only for the initial value (from mem, the
   # memory at the call) and in the set added to the update when the store hits; no
-  # re-read is bound per entry.
+  # re-read is bound per entry. The bulk form of the loop loads it once more on entry.
   drawCacheCase =
     fn: name:
     let
@@ -894,13 +894,15 @@ let
         (countIn "// \\(if hit_[0-9]+ then \\{[^}]* g'${k}'ptr = M\\.loadWord mem_[0-9]+ ${k};[^}]*} else \\{ }\\)" code)
         (countIn "B\\.add [A-Za-z0-9_]+\\.g'${k}'ptr " code)
         (countIn "g_[0-9]+ = if" code)
+        (countIn "g_[0-9]+ = M\\.loadWord mem ${k};" code)
       ]
       [
-        2
+        3
         true
         1
         1
         0
+        1
       ];
 
   # The right-hand sides of the overlap tests (`hit_<n> = <test>;`) in code.
@@ -918,6 +920,180 @@ let
   '';
   rangeRet = fn: args: dret rangeSrc fn args;
   rangeHits = fn: hitTests (fnCode rangeSrc fn);
+
+  # ---- Bulk loops ----
+  # Expected values follow the C semantics, worked out by hand. Each function writes
+  # bytes from d on and returns the loop variables in a form that tells them apart. The
+  # functions starting with x are outside the conditions of the bulk form.
+  bulkSrc = ''
+    int g = 16;
+    int id(int x) { return x; }
+    int doPost(unsigned char *d, int n) { unsigned char *p = d; do { *p++ = n; } while (n--); return n * 1000 + (p - d); }
+    int whilePost(unsigned char *d, int n) { unsigned char *p = d; while (n--) *p++ = n; return n * 1000 + (p - d); }
+    int forPost(unsigned char *d, int n) { unsigned char *p = d; for (; n--; p++) *p = n + 1; return n * 1000 + (p - d); }
+    int doPre(unsigned char *d, int n) { unsigned char *p = d; do { *p++ = n; } while (--n); return n * 1000 + (p - d); }
+    int whilePre(unsigned char *d, int n) { unsigned char *p = d; while (--n) *p++ = n; return n * 1000 + (p - d); }
+    int forPre(unsigned char *d, int n) { unsigned char *p = d; for (; --n; ) *p++ = n; return n * 1000 + (p - d); }
+    int lt(unsigned char *d, int a, int e) { int i; for (i = a; i < e; i++) d[i - a] = i; return i; }
+    int le(unsigned char *d, int a, int e) { int i = a; while (i <= e) { *d++ = i; i++; } return i; }
+    int gt(unsigned char *d, int a, int e) { int i; for (i = a; e < i; i--) *d++ = i; return i; }
+    int ge(unsigned char *d, int a, int e) { int i; for (i = a; i >= e; --i) *d++ = i; return i; }
+    int steps(unsigned char *d, int n, int c, int w) {
+      int a = 5, b = 100, x = 7, y = 9, z = 1, m = 50;
+      unsigned u = 4294967294u;
+      int *q = (int *)16;
+      while (n--) { *d++ = a + b + u; a++; b -= 3; x += c; y = y - c; z = z + 2; ++u; q += 2; m--; }
+      return w == 0 ? a : w == 1 ? b : w == 2 ? x : w == 3 ? y : w == 4 ? z : w == 5 ? (int)u : w == 6 ? (int)q : m;
+    }
+    int wrapI(unsigned char *d, int n) { int x = 7; while (n--) { *d++ = x >> 24; x += 0x7fffffff; } return x; }
+    int stride4(int *q, int n) { int i = 0; while (n--) { *(unsigned char *)q = i + 1; q++; i++; } return (int)q; }
+    int temps(unsigned char *d, int n) { int t = 77, i = 10; while (n--) { t = i * 3; *d++ = t; i++; } return t; }
+    int afterCond(unsigned char *d, int n) { int t = -1; while (n--) { t = n; *d++ = t + 10; } return t * 100 + n; }
+    int doAfter(unsigned char *d, int n) { int t = -1; do { t = n; *d++ = t; } while (n--); return t * 100 + n; }
+    int lut(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[i & 7] + 1; i++; } return i; }
+    int copy(unsigned char *d, unsigned char *s, int n) { while (n--) *d++ = *s++; return 0; }
+    int glob(unsigned char *d, int n) { int i = 0; while (n--) { *d++ = g + i + 1; i++; } return g; }
+    int rShift(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[u >> 29]; u += 0x20000000u; } return 0; }
+    int rOr(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[(i & 3) | (i & 4)]; i++; } return 0; }
+    int rByte(unsigned char *d, unsigned char *t, unsigned char *s, int n) { while (n--) *d++ = t[*s++]; return 0; }
+    int rSum(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[(i & 3) + (i & 4)]; i++; } return 0; }
+    int rVar(unsigned char *d, unsigned char *t, int n) { int i = 0, k = 42; while (n--) { k = i & 7; *d++ = t[k]; i++; } return k; }
+    int rDecl(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { int k = i & 7; *d++ = t[k]; i++; } return i; }
+    int xRange(unsigned char *d, unsigned char *t, int n) { int x; while (n--) { x = n * 3; *d++ = t[x]; } return 0; }
+    int xBreak(unsigned char *d, int n) { while (n--) { if (n == 1) break; *d++ = n; } return n; }
+    int xTwo(unsigned char *d, int n) { while (n--) { *d++ = n; *d++ = n + 10; } return 0; }
+    int xIf(unsigned char *d, int n) { while (n--) { if (n & 1) *d = n; d++; } return 0; }
+    int xWide(short *d, int n) { while (n--) *d++ = n; return 0; }
+    int xCompound(unsigned char *d, int n) { while (n--) *d++ += n; return 0; }
+    int xNeg(unsigned char *d, int n) { while (n--) *d-- = n; return 0; }
+    int xZero(unsigned char *d, int n) { while (n--) { *d = n + 5; d += 0; } return 0; }
+    int xVar(unsigned char *d, int n, int s) { while (n--) { *d = n + 5; d += s; } return 0; }
+    int xIfStep(unsigned char *d, int n) { int i = 0; while (n--) { *d++ = i; if (n & 1) i++; } return i; }
+    int xPrev(unsigned char *d, int n) { int s = 0; while (n--) { s += n; *d++ = s; } return s; }
+    int xMul(unsigned char *d, int n) { for (int x = 1; n--; x *= 2) *d++ = x; return 0; }
+    int xLong(unsigned char *d, int n) { int v = 3; while (n--) { *d++ = v; v += 4611686018427387904LL; } return v; }
+    int xInStep(unsigned char *d, int n) { for (; n--; *d++ = n) {} return 0; }
+    int xCall(unsigned char *d, int n) { while (n--) *d++ = id(n); return 0; }
+    int xNest(unsigned char *d, int n) { for (int r = 0; r < 2; r++) { unsigned char *p = d + r * 8; int m = n; while (m--) *p++ = r + 1; } return 0; }
+  '';
+  # The functions of bulkSrc, loaded with M.storeRun and M.storeStride wrapped to also set
+  # the word at bulkMark (an address no test uses otherwise): it tells that the bulk form
+  # wrote (which it does only for N >= 1).
+  bulkMark = 4026531840;
+  markedM = M // {
+    storeRun =
+      m: a: n: vals:
+      M.storeWord (M.storeRun m a n vals) bulkMark 1;
+    storeStride =
+      m: a: stride: n: vals:
+      M.storeWord (M.storeStride m a stride n vals) bulkMark 1;
+  };
+  bulkFns = import (builtins.toFile "cc-bulk.nix" (Cc.compile bulkSrc)) {
+    M = markedM;
+    inherit B;
+    R = import ../cc/runtime.nix;
+  };
+  # mem with the bytes bs stored from address a on.
+  withBytes =
+    mem: a: bs:
+    foldl' (m: i: M.storeByte m (B.u32 (a + i)) (elemAt bs i)) mem (genList (i: i) (length bs));
+  # fn of bulkSrc called with args on mem: [ <return value> <the n bytes from a on, the
+  # addresses modulo 2^32> <whether the bulk form wrote> ].
+  bulkOn =
+    mem: fn: args: a: n:
+    let
+      r = foldl' (f: x: f x) (bulkFns.${fn} (bulkFns.__data.init mem)) args;
+    in
+    [
+      r.ret
+      (genList (i: M.loadByte r.mem (B.u32 (a + i))) n)
+      (M.loadWord r.mem bulkMark == 1)
+    ];
+  bulkCall = bulkOn M.empty;
+  # The write buffer and the table of the tests, and memory with 9 in the first 8 bytes of
+  # the buffer (filled) and with the table t[j] = 10 * j + 10 for j < 8 (tabled).
+  buf = 4096;
+  tab = 8192;
+  filled = withBytes M.empty buf (genList (_: 9) 8);
+  tabled = withBytes M.empty tab (genList (j: 10 * j + 10) 8);
+  bulkFilled = bulkOn filled;
+  bulkTabled = bulkOn tabled;
+  # The bulk store that the generated fn of bulkSrc contains: "run", "stride" or "none".
+  bulkWrite =
+    fn:
+    let
+      code = fnCode bulkSrc fn;
+    in
+    if contains "M.storeRun" code then
+      "run"
+    else if contains "M.storeStride" code then
+      "stride"
+    else
+      "none";
+  bulkCandidates = [
+    "doPost"
+    "whilePost"
+    "forPost"
+    "doPre"
+    "whilePre"
+    "forPre"
+    "lt"
+    "le"
+    "gt"
+    "ge"
+    "steps"
+    "wrapI"
+    "temps"
+    "afterCond"
+    "doAfter"
+    "lut"
+    "copy"
+    "glob"
+    "rShift"
+    "rOr"
+    "rByte"
+    "rSum"
+    "rVar"
+    "rDecl"
+  ];
+  bulkExcluded = [
+    "xRange"
+    "xBreak"
+    "xTwo"
+    "xIf"
+    "xWide"
+    "xCompound"
+    "xNeg"
+    "xZero"
+    "xVar"
+    "xIfStep"
+    "xPrev"
+    "xMul"
+    "xLong"
+    "xInStep"
+    "xCall"
+  ];
+  # The return values of steps for n = 3 iterations with the step c: a, b, x, y, z, u, q
+  # and m.
+  stepsRets =
+    d: n: c:
+    genList (
+      w:
+      head (
+        bulkCall "steps" [
+          d
+          n
+          c
+          w
+        ] d 0
+      )
+    ) 8;
+  # The bytes of rByte: the table with t[255] = 99, and the indices 0, 3, 255 at 12288.
+  byteMem = withBytes (withBytes tabled (tab + 255) [ 99 ]) 12288 [
+    0
+    3
+    255
+  ];
 
   fixmulSrc = import ../cc/examples/spike.nix;
   fixmul =
@@ -3469,4 +3645,1430 @@ in
   (t "cc cache: a read in a branch of ?: after a store sees the stored value" (cacheRet "ternaryAfter"
     [ 3 ]
   ) 105)
+
+  # Bulk loops: where the bulk form is emitted
+  (t "cc bulk: the column loop of draw writes with storeStride, the span loop with storeRun"
+    [
+      (contains "M.storeStride" (fnCode Cc.examples.draw.src "R_DrawColumn"))
+      (contains "M.storeRun" (fnCode Cc.examples.draw.src "R_DrawSpan"))
+    ]
+    [ true true ]
+  )
+  (t "cc bulk: loops within the conditions get a bulk store" (map bulkWrite (
+    bulkCandidates ++ [ "stride4" ]
+  )) (map (_: "run") bulkCandidates ++ [ "stride" ]))
+  (t "cc bulk: loops outside the conditions get none" (map bulkWrite bulkExcluded) (
+    map (_: "none") bulkExcluded
+  ))
+  (t "cc bulk: only the inner loop of a nest is a bulk loop"
+    [
+      (countIn "M\\.storeRun" (fnCode bulkSrc "xNest"))
+      (bulkCall "xNest" [ buf 3 ] buf 11)
+    ]
+    [
+      1
+      [
+        0
+        [
+          1
+          1
+          1
+          0
+          0
+          0
+          0
+          0
+          2
+          2
+          2
+        ]
+        true
+      ]
+    ]
+  )
+
+  # Bulk loops: the count forms (values written from the counter, n * 1000 + bytes written)
+  (t "cc bulk: do ... while (n--) runs n0 + 1 times and leaves n = -1"
+    [
+      (bulkFilled "doPost" [ buf 0 ] buf 2)
+      (bulkFilled "doPost" [ buf 3 ] buf 5)
+      (bulkCall "doPost" [ 4294967294 2 ] 4294967294 3)
+    ]
+    [
+      [
+        (-999)
+        [
+          0
+          9
+        ]
+        true
+      ]
+      [
+        (-996)
+        [
+          3
+          2
+          1
+          0
+          9
+        ]
+        true
+      ]
+      [
+        (-997)
+        [
+          2
+          1
+          0
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: while (n--) runs n0 times and leaves n = -1"
+    [
+      (bulkFilled "whilePost" [ buf 0 ] buf 2)
+      (bulkFilled "whilePost" [ buf 1 ] buf 2)
+      (bulkFilled "whilePost" [ buf 3 ] buf 4)
+    ]
+    [
+      [
+        (-1000)
+        [
+          9
+          9
+        ]
+        false
+      ]
+      [
+        (-999)
+        [
+          0
+          9
+        ]
+        true
+      ]
+      [
+        (-997)
+        [
+          2
+          1
+          0
+          9
+        ]
+        true
+      ]
+    ]
+  )
+  (t "cc bulk: for (; n--; p++) runs n0 times and leaves n = -1"
+    [
+      (bulkFilled "forPost" [ buf 0 ] buf 1)
+      (bulkFilled "forPost" [ buf 3 ] buf 4)
+    ]
+    [
+      [
+        (-1000)
+        [ 9 ]
+        false
+      ]
+      [
+        (-997)
+        [
+          3
+          2
+          1
+          9
+        ]
+        true
+      ]
+    ]
+  )
+  (t "cc bulk: do ... while (--n) runs n0 times and leaves n = 0"
+    [
+      (bulkFilled "doPre" [ buf 1 ] buf 2)
+      (bulkFilled "doPre" [ buf 3 ] buf 4)
+      (bulkCall "doPre" [ 4294967295 2 ] 4294967295 2)
+    ]
+    [
+      [
+        1
+        [
+          1
+          9
+        ]
+        true
+      ]
+      [
+        3
+        [
+          3
+          2
+          1
+          9
+        ]
+        true
+      ]
+      [
+        2
+        [
+          2
+          1
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: while (--n) and for (; --n; ) run n0 - 1 times and leave n = 0"
+    [
+      (bulkFilled "whilePre" [ buf 1 ] buf 1)
+      (bulkFilled "whilePre" [ buf 2 ] buf 2)
+      (bulkFilled "whilePre" [ buf 4 ] buf 4)
+      (bulkFilled "forPre" [ buf 4 ] buf 4)
+      (bulkCall "forPre" [ 4294967295 3 ] 4294967295 2)
+    ]
+    [
+      [
+        0
+        [ 9 ]
+        false
+      ]
+      [
+        1
+        [
+          1
+          9
+        ]
+        true
+      ]
+      [
+        3
+        [
+          3
+          2
+          1
+          9
+        ]
+        true
+      ]
+      [
+        3
+        [
+          3
+          2
+          1
+          9
+        ]
+        true
+      ]
+      [
+        2
+        [
+          2
+          1
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: i < e runs max(0, e - i0) times and leaves i = i0 + N"
+    [
+      (bulkFilled "lt" [ buf 0 3 ] buf 4)
+      (bulkFilled "lt" [ buf 5 5 ] buf 1)
+      (bulkFilled "lt" [ buf 7 2 ] buf 1)
+      (bulkFilled "lt" [ buf 4 5 ] buf 2)
+      (bulkFilled "lt" [
+        buf
+        (-2)
+        1
+      ] buf 4)
+      (bulkCall "lt" [ 4294967295 0 2 ] 4294967295 2)
+    ]
+    [
+      [
+        3
+        [
+          0
+          1
+          2
+          9
+        ]
+        true
+      ]
+      [
+        5
+        [ 9 ]
+        false
+      ]
+      [
+        7
+        [ 9 ]
+        false
+      ]
+      [
+        5
+        [
+          4
+          9
+        ]
+        true
+      ]
+      [
+        1
+        [
+          254
+          255
+          0
+          9
+        ]
+        true
+      ]
+      [
+        2
+        [
+          0
+          1
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: i <= e runs max(0, e - i0 + 1) times"
+    [
+      (bulkFilled "le" [ buf 1 3 ] buf 4)
+      (bulkFilled "le" [ buf 3 2 ] buf 1)
+      (bulkFilled "le" [
+        buf
+        (-1)
+        (-1)
+      ] buf 2)
+      (bulkCall "le" [ 4294967295 1 2 ] 4294967295 2)
+    ]
+    [
+      [
+        4
+        [
+          1
+          2
+          3
+          9
+        ]
+        true
+      ]
+      [
+        3
+        [ 9 ]
+        false
+      ]
+      [
+        0
+        [
+          255
+          9
+        ]
+        true
+      ]
+      [
+        3
+        [
+          1
+          2
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: e < i (i > e) and i >= e count down"
+    [
+      (bulkFilled "gt" [ buf 3 0 ] buf 4)
+      (bulkFilled "gt" [ buf 0 0 ] buf 1)
+      (bulkFilled "ge" [ buf 2 0 ] buf 4)
+      (bulkFilled "ge" [
+        buf
+        (-5)
+        (-4)
+      ] buf 1)
+      (bulkCall "ge" [ 4294967295 1 0 ] 4294967295 2)
+    ]
+    [
+      [
+        0
+        [
+          3
+          2
+          1
+          9
+        ]
+        true
+      ]
+      [
+        0
+        [ 9 ]
+        false
+      ]
+      [
+        (-1)
+        [
+          2
+          1
+          0
+          9
+        ]
+        true
+      ]
+      [
+        (-5)
+        [ 9 ]
+        false
+      ]
+      [
+        (-1)
+        [
+          1
+          0
+        ]
+        false
+      ]
+    ]
+  )
+
+  # Bulk loops: induction variables and temporaries
+  (t
+    "cc bulk: ++, --, += and -= (constant and variable), v = v + c, v = v - c, pointer and unsigned steps"
+    [
+      (bulkFilled "steps" [ buf 3 5 0 ] buf 4)
+      (stepsRets buf 3 5)
+      (stepsRets buf 0 5)
+    ]
+    [
+      [
+        8
+        [
+          103
+          102
+          101
+          9
+        ]
+        true
+      ]
+      [
+        8
+        91
+        22
+        (-6)
+        7
+        1
+        40
+        47
+      ]
+      [
+        5
+        100
+        7
+        9
+        1
+        (-2)
+        16
+        50
+      ]
+    ]
+  )
+  (t
+    "cc bulk: an int induction variable that wraps around keeps its value per iteration and after the loop"
+    [
+      (stepsRets buf 3 2147483647)
+      (stepsRets 4294967295 3 2147483647)
+      (bulkCall "steps" [ 4294967295 3 2147483647 0 ] 4294967295 3)
+      (bulkFilled "wrapI" [ buf 4 ] buf 5)
+      (bulkCall "wrapI" [ 4294967294 4 ] 4294967294 4)
+    ]
+    [
+      [
+        8
+        91
+        (-2147483644)
+        (-2147483636)
+        7
+        1
+        40
+        47
+      ]
+      [
+        8
+        91
+        (-2147483644)
+        (-2147483636)
+        7
+        1
+        40
+        47
+      ]
+      [
+        8
+        [
+          103
+          102
+          101
+        ]
+        false
+      ]
+      [
+        3
+        [
+          0
+          128
+          0
+          128
+          9
+        ]
+        true
+      ]
+      [
+        3
+        [
+          0
+          128
+          0
+          128
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: an int pointer step writes with a stride of 4"
+    [
+      (bulkCall "stride4" [ buf 3 ] buf 9)
+      (bulkCall "stride4" [ 4294967288 3 ] 4294967288 9)
+    ]
+    [
+      [
+        4108
+        [
+          1
+          0
+          0
+          0
+          2
+          0
+          0
+          0
+          3
+        ]
+        true
+      ]
+      [
+        4
+        [
+          1
+          0
+          0
+          0
+          2
+          0
+          0
+          0
+          3
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: a temporary keeps its last value, or its value on entry when N = 0"
+    [
+      (bulkFilled "temps" [ buf 3 ] buf 4)
+      (bulkFilled "temps" [ buf 0 ] buf 1)
+    ]
+    [
+      [
+        36
+        [
+          30
+          33
+          36
+          9
+        ]
+        true
+      ]
+      [
+        77
+        [ 9 ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: an iteration sees n after the condition's n--"
+    [
+      (bulkFilled "afterCond" [ buf 3 ] buf 4)
+      (bulkFilled "afterCond" [ buf 0 ] buf 1)
+      (bulkFilled "doAfter" [ buf 2 ] buf 4)
+      (bulkFilled "doAfter" [ buf 0 ] buf 2)
+    ]
+    [
+      [
+        (-1)
+        [
+          12
+          11
+          10
+          9
+        ]
+        true
+      ]
+      [
+        (-101)
+        [ 9 ]
+        false
+      ]
+      [
+        (-1)
+        [
+          2
+          1
+          0
+          9
+        ]
+        true
+      ]
+      [
+        (-1)
+        [
+          0
+          9
+        ]
+        true
+      ]
+    ]
+  )
+
+  # Bulk loops: overlaps of the write range with the read ranges
+  (t
+    "cc bulk: a write range on the last byte of a table runs the loop, one byte past it the bulk form"
+    [
+      (bulkTabled "lut" [
+        (tab + 7)
+        tab
+        9
+      ] (tab + 7) 9)
+      (bulkTabled "lut" [
+        (tab + 8)
+        tab
+        9
+      ] (tab + 8) 9)
+    ]
+    [
+      [
+        9
+        [
+          11
+          21
+          31
+          41
+          51
+          61
+          71
+          12
+          11
+        ]
+        false
+      ]
+      [
+        9
+        [
+          11
+          21
+          31
+          41
+          51
+          61
+          71
+          81
+          11
+        ]
+        true
+      ]
+    ]
+  )
+  (t
+    "cc bulk: a write range on the first byte of a table runs the loop, one byte before it the bulk form"
+    [
+      (bulkTabled "lut" [
+        (tab - 8)
+        tab
+        9
+      ] (tab - 8) 9)
+      (bulkTabled "lut" [
+        (tab - 9)
+        tab
+        9
+      ] (tab - 9) 9)
+    ]
+    [
+      [
+        9
+        [
+          11
+          21
+          31
+          41
+          51
+          61
+          71
+          81
+          11
+        ]
+        false
+      ]
+      [
+        9
+        [
+          11
+          21
+          31
+          41
+          51
+          61
+          71
+          81
+          11
+        ]
+        true
+      ]
+    ]
+  )
+  (t "cc bulk: an overlapping forward copy runs the loop and copies like C"
+    [
+      (bulkOn
+        (withBytes M.empty tab [
+          1
+          2
+          3
+          4
+          5
+        ])
+        "copy"
+        [
+          (tab + 1)
+          tab
+          4
+        ]
+        tab
+        5
+      )
+      (bulkOn
+        (withBytes M.empty tab [
+          1
+          2
+          3
+          4
+          5
+        ])
+        "copy"
+        [
+          (tab + 3)
+          tab
+          4
+        ]
+        tab
+        7
+      )
+      (bulkOn
+        (withBytes M.empty tab [
+          1
+          2
+          3
+          4
+          5
+        ])
+        "copy"
+        [
+          (tab + 4)
+          tab
+          4
+        ]
+        tab
+        8
+      )
+      (bulkOn
+        (withBytes M.empty tab [
+          1
+          2
+          3
+          4
+          5
+        ])
+        "copy"
+        [
+          (tab + 5)
+          tab
+          4
+        ]
+        tab
+        9
+      )
+    ]
+    [
+      [
+        0
+        [
+          1
+          1
+          1
+          1
+          1
+        ]
+        false
+      ]
+      [
+        0
+        [
+          1
+          2
+          3
+          1
+          2
+          3
+          1
+        ]
+        false
+      ]
+      [
+        0
+        [
+          1
+          2
+          3
+          4
+          1
+          2
+          3
+          4
+        ]
+        true
+      ]
+      [
+        0
+        [
+          1
+          2
+          3
+          4
+          5
+          1
+          2
+          3
+          4
+        ]
+        true
+      ]
+    ]
+  )
+  (t "cc bulk: a write range over a cached global runs the loop, which re-reads it"
+    [
+      (bulkCall "glob" [ base 3 ] base 4)
+      (bulkCall "glob" [
+        (base - 2)
+        3
+      ] (base - 2) 3)
+      (bulkCall "glob" [
+        (base - 3)
+        3
+      ] (base - 3) 3)
+      (bulkCall "glob" [
+        (base + 4)
+        3
+      ] (base + 4) 3)
+      (bulkCall "glob" [ buf 3 ] buf 3)
+    ]
+    [
+      [
+        1315601
+        [
+          17
+          19
+          20
+          0
+        ]
+        false
+      ]
+      [
+        19
+        [
+          17
+          18
+          19
+        ]
+        false
+      ]
+      [
+        16
+        [
+          17
+          18
+          19
+        ]
+        true
+      ]
+      [
+        16
+        [
+          17
+          18
+          19
+        ]
+        true
+      ]
+      [
+        16
+        [
+          17
+          18
+          19
+        ]
+        true
+      ]
+    ]
+  )
+
+  # Bulk loops: ranges that reach 2^32
+  (t "cc bulk: a write range whose last byte is at 2^32 runs the loop, one below it the bulk form"
+    [
+      (bulkCall "whilePost" [ 4294967294 3 ] 4294967294 3)
+      (bulkCall "whilePost" [ 4294967293 3 ] 4294967293 3)
+    ]
+    [
+      [
+        (-997)
+        [
+          2
+          1
+          0
+        ]
+        false
+      ]
+      [
+        (-997)
+        [
+          2
+          1
+          0
+        ]
+        true
+      ]
+    ]
+  )
+  (t "cc bulk: a read range that reaches 2^32 runs the loop, which wraps the addresses"
+    [
+      (bulkOn (withBytes M.empty 4294967294 [
+        7
+        8
+        9
+      ]) "copy" [ buf 4294967294 3 ] buf 3)
+      (bulkOn (withBytes M.empty 4294967293 [
+        6
+        7
+        8
+      ]) "copy" [ buf 4294967293 3 ] buf 3)
+      (bulkOn (withBytes M.empty 4294967292 [
+        1
+        2
+        3
+        4
+        5
+        6
+        7
+        8
+      ]) "lut" [ buf 4294967292 8 ] buf 8)
+      (bulkOn (withBytes M.empty 4294967288 [
+        1
+        2
+        3
+        4
+        5
+        6
+        7
+        8
+      ]) "lut" [ buf 4294967288 8 ] buf 8)
+    ]
+    [
+      [
+        0
+        [
+          7
+          8
+          9
+        ]
+        false
+      ]
+      [
+        0
+        [
+          6
+          7
+          8
+        ]
+        true
+      ]
+      [
+        8
+        [
+          2
+          3
+          4
+          5
+          6
+          7
+          8
+          9
+        ]
+        false
+      ]
+      [
+        8
+        [
+          2
+          3
+          4
+          5
+          6
+          7
+          8
+          9
+        ]
+        true
+      ]
+    ]
+  )
+
+  # Bulk loops: index ranges (a write range on the last byte of the table tells that the
+  # range reaches it)
+  (t "cc bulk: the range of unsigned >> c"
+    [
+      (bulkTabled "rShift" [ buf tab 9 ] buf 9)
+      (bulkTabled "rShift" [
+        (tab + 7)
+        tab
+        9
+      ] (tab + 7) 9)
+    ]
+    [
+      [
+        0
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          80
+          10
+        ]
+        true
+      ]
+      [
+        0
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          10
+          10
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: the range of | is the smallest 2^k - 1 above both operands"
+    [
+      (bulkTabled "rOr" [ buf tab 9 ] buf 9)
+      (bulkTabled "rOr" [
+        (tab + 7)
+        tab
+        9
+      ] (tab + 7) 9)
+    ]
+    [
+      [
+        0
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          80
+          10
+        ]
+        true
+      ]
+      [
+        0
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          10
+          10
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: the range of + is the sum of the operands' ranges"
+    [
+      (bulkTabled "rSum" [ buf tab 9 ] buf 9)
+      (bulkTabled "rSum" [
+        (tab + 7)
+        tab
+        9
+      ] (tab + 7) 9)
+    ]
+    [
+      [
+        0
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          80
+          10
+        ]
+        true
+      ]
+      [
+        0
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          10
+          10
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: the range of an unsigned char read is 255"
+    [
+      (bulkOn byteMem "rByte" [ buf tab 12288 3 ] buf 3)
+      (bulkOn byteMem "rByte" [
+        (tab + 255)
+        tab
+        12288
+        3
+      ] (tab + 255) 3)
+    ]
+    [
+      [
+        0
+        [
+          10
+          40
+          99
+        ]
+        true
+      ]
+      [
+        0
+        [
+          10
+          40
+          10
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: a variable assigned once before the read has the range of its value"
+    [
+      (bulkTabled "rVar" [ buf tab 10 ] buf 10)
+      (bulkTabled "rVar" [
+        (tab + 7)
+        tab
+        9
+      ] (tab + 7) 9)
+      (bulkTabled "rVar" [ buf tab 0 ] buf 1)
+      (bulkTabled "rDecl" [ buf tab 10 ] buf 10)
+      (bulkTabled "rDecl" [
+        (tab + 7)
+        tab
+        9
+      ] (tab + 7) 9)
+    ]
+    [
+      [
+        1
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          80
+          10
+          20
+        ]
+        true
+      ]
+      [
+        0
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          10
+          10
+        ]
+        false
+      ]
+      [
+        42
+        [ 0 ]
+        false
+      ]
+      [
+        10
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          80
+          10
+          20
+        ]
+        true
+      ]
+      [
+        9
+        [
+          10
+          20
+          30
+          40
+          50
+          60
+          70
+          10
+          10
+        ]
+        false
+      ]
+    ]
+  )
+
+  # Bulk loops: loops outside the conditions keep the values of C
+  (t "cc bulk: an index without a known range, break, two stores, a store in if"
+    [
+      (bulkTabled "xRange" [ buf tab 3 ] buf 3)
+      (bulkFilled "xBreak" [ buf 3 ] buf 2)
+      (bulkFilled "xTwo" [ buf 3 ] buf 6)
+      (bulkFilled "xIf" [ buf 3 ] buf 3)
+    ]
+    [
+      [
+        0
+        [
+          70
+          40
+          10
+        ]
+        false
+      ]
+      [
+        1
+        [
+          2
+          9
+        ]
+        false
+      ]
+      [
+        0
+        [
+          2
+          12
+          1
+          11
+          0
+          10
+        ]
+        false
+      ]
+      [
+        0
+        [
+          9
+          1
+          9
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: a 2-byte store, a compound store, steps -1, 0 and not constant"
+    [
+      (bulkFilled "xWide" [ buf 3 ] buf 6)
+      (bulkFilled "xCompound" [ buf 3 ] buf 3)
+      (bulkFilled "xNeg" [
+        (buf + 2)
+        3
+      ] buf 4)
+      (bulkFilled "xZero" [ buf 3 ] buf 2)
+      (bulkFilled "xVar" [ buf 3 2 ] buf 6)
+    ]
+    [
+      [
+        0
+        [
+          2
+          0
+          1
+          0
+          0
+          0
+        ]
+        false
+      ]
+      [
+        0
+        [
+          11
+          10
+          9
+        ]
+        false
+      ]
+      [
+        0
+        [
+          0
+          1
+          2
+          9
+        ]
+        false
+      ]
+      [
+        0
+        [
+          5
+          9
+        ]
+        false
+      ]
+      [
+        0
+        [
+          7
+          9
+          6
+          9
+          5
+          9
+        ]
+        false
+      ]
+    ]
+  )
+  (t
+    "cc bulk: a step in if, a variable that reads its previous value, x *= 2, a long long step, a store in the step, a call"
+    [
+      (bulkFilled "xIfStep" [ buf 3 ] buf 4)
+      (bulkFilled "xPrev" [ buf 3 ] buf 4)
+      (bulkFilled "xMul" [ buf 3 ] buf 4)
+      (bulkFilled "xLong" [ buf 3 ] buf 4)
+      (bulkFilled "xInStep" [ buf 3 ] buf 4)
+      (bulkFilled "xCall" [ buf 3 ] buf 4)
+    ]
+    [
+      [
+        1
+        [
+          0
+          0
+          1
+          9
+        ]
+        false
+      ]
+      [
+        3
+        [
+          2
+          3
+          3
+          9
+        ]
+        false
+      ]
+      [
+        0
+        [
+          1
+          2
+          4
+          9
+        ]
+        false
+      ]
+      [
+        3
+        [
+          3
+          3
+          3
+          9
+        ]
+        false
+      ]
+      [
+        0
+        [
+          2
+          1
+          0
+          9
+        ]
+        false
+      ]
+      [
+        0
+        [
+          2
+          1
+          0
+          9
+        ]
+        false
+      ]
+    ]
+  )
 ]
