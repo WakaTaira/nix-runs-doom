@@ -159,8 +159,9 @@ let
   # Value i: sometimes above 255 so that only the low 8 bits may be written.
   valueAt = i: (i + 1) * 65793 + 7 * i * i;
   valsFor = n: genList valueAt n;
-  # A list longer than n whose extra element must never be evaluated.
-  longVals = n: valsFor n ++ [ (throw "storeRun/storeStride forced an element beyond n") ];
+  # The values valAt i for i < n, followed by an element that must never be evaluated.
+  longValsWith =
+    valAt: n: genList valAt n ++ [ (throw "storeRun/storeStride forced an element beyond n") ];
 
   targets =
     a: stride: n:
@@ -174,7 +175,6 @@ let
   foldStoreWith =
     valAt: m: a: stride: n:
     foldl' (mm: i: R.storeByte mm (a + i * stride) (valAt i)) m (genList (i: i) n);
-  foldStore = foldStoreWith valueAt;
 
   # storeRun (kind "run") or storeStride of the values valAt i, on memory prefilled
   # around every target, compared with the fold of the reference storeByte: the bytes
@@ -183,7 +183,7 @@ let
     label: valAt: kind: a: stride: n:
     let
       m = prefilled a stride n;
-      vals = genList valAt n ++ [ (throw "storeRun/storeStride forced an element beyond n") ];
+      vals = longValsWith valAt n;
       got = if kind == "run" then M.storeRun m a n vals else M.storeStride m a stride n vals;
       want = foldStoreWith valAt m a stride n;
     in
@@ -199,25 +199,7 @@ let
       ];
     };
 
-  bulkCase =
-    kind: a: stride: n:
-    let
-      m = prefilled a stride n;
-      got =
-        if kind == "run" then M.storeRun m a n (longVals n) else M.storeStride m a stride n (longVals n);
-      want = foldStore m a stride n;
-    in
-    {
-      name = "mem: ${kind} a=${toString a} stride=${toString stride} n=${toString n} matches storeByte fold";
-      got = [
-        (viewAll got a stride n)
-        (got == want)
-      ];
-      expected = [
-        (viewAll want a stride n)
-        true
-      ];
-    };
+  bulkCase = bulkCaseWith "" valueAt;
 
   runStarts = [
     4096
@@ -312,14 +294,18 @@ let
   # storeRun over memory filled around every target (so every word that the run
   # touches holds a pattern): starts with the low 2 bits 0 to 3, counts that end inside
   # one word or in each position of a word, runs across a leaf, a 16 KiB node and a
-  # 1 MiB root entry, and runs whose last byte is 2^32 - 1.
-  denseCounts = genList (i: i + 1) 9 ++ [
-    13
-    255
-    256
-    257
-    600
-  ];
+  # 1 MiB root entry, and runs whose last byte is 2^32 - 1. Counts that runCases already
+  # tests at the same starts are left out.
+  denseCounts = builtins.filter (n: !builtins.elem n runCounts) (
+    genList (i: i + 1) 9
+    ++ [
+      13
+      255
+      256
+      257
+      600
+    ]
+  );
   denseRunCases =
     concatMap (a: map (bulkCaseWith " (dense)" valueAt "run" a 1) denseCounts) [
       4096
