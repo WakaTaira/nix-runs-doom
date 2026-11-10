@@ -78,17 +78,26 @@ let
       "(char ${toString e.value})"
     else if k == "initlist" then
       "{${concatStringsSep "," (map show e.items)}}"
+    else if k == "comma" then
+      "(, ${show e.lhs} ${show e.rhs})"
     else
       throw "show: ${k}";
-  # Types: pointers as a suffix `*`, arrays as a prefix `[len]` (outermost first).
+  # Types: pointers as a suffix `*`, arrays as a prefix `[len]` (outermost first),
+  # functions as `fn(<params>)<return type>`.
   showType =
     ty:
     if ty.tag == "ptr" then
       showType ty.to + "*"
     else if ty.tag == "array" then
       "[${if ty.len == null then "" else show ty.len}]${showType ty.of}"
-    else if ty.tag == "struct" || ty.tag == "enum" then
+    else if ty.tag == "struct" || ty.tag == "union" || ty.tag == "enum" then
       "${ty.tag} ${ty.name}"
+    else if ty.tag == "fn" then
+      "fn(${
+        concatStringsSep "," (
+          map (p: showType p.type) ty.params ++ (if ty.variadic then [ "..." ] else [ ])
+        )
+      })${showType ty.ret}"
     else
       ty.tag;
 
@@ -1363,6 +1372,264 @@ let
         b
       ]
     );
+  # ---- Slice 7: declarations, comma operator, static locals, && and || ----
+  # Expected values follow C, worked out by hand; layouts follow clang's riscv32 ilp32.
+
+  # The value of sizeof(ty) after the declarations decls.
+  sizeIn = decls: ty: ret "${decls} int sz(void) { return sizeof(${ty}); }" "sz" [ ];
+  # The memory and return value of fn of src called on its initialized data, with the
+  # symbols of src.
+  run7 =
+    src: fn: args:
+    dcall src fn args // { syms = (Cc.load src).__data.symbols; };
+
+  fnPtrSrc = ''
+    typedef int (*fn_t)(int);
+    typedef void (*actionf_v)();
+    struct ops { char tag; int (*cb)(int); short n; void (*hooks[2])(void); };
+    struct ops o;
+    fn_t g1, g2;
+    void (*tab[5])(void);
+    void (*(*chain)(int))(void);
+    int (*getf(void))(int) { return 0; }
+    fn_t pass(fn_t p) { return p; }
+    int apply(int g(int), int x) { return g == 0 ? x : -x; }
+    int layout(void) { o.n = 7; o.tag = 3; return sizeof(struct ops) * 100 + o.n * 10 + o.tag; }
+    int ops(void) {
+      fn_t p = 0;
+      fn_t q;
+      q = p;
+      g1 = q;
+      int (*r)(int) = ((void *)0);
+      return (p == 0) + (q != 0) * 10 + (g1 == g2) * 100 + !p * 1000 + (p ? 5 : 0) * 10000
+        + (r == ((void *)0)) * 100000;
+    }
+    int passed(void) {
+      fn_t z = (fn_t)0;
+      return (pass(0) == 0) + (getf() == 0) * 10 + apply(0, 5) * 100 + (z == 0) * 1000;
+    }
+    int sizes(void) {
+      return sizeof tab + sizeof(tab[0]) * 100 + sizeof(void (*)(void)) * 10000
+        + sizeof(actionf_v) * 100000;
+    }
+    int cleared(void) { chain = 0; return chain == 0; }
+  '';
+
+  unionSrc = ''
+    union w { unsigned u; unsigned char b[4]; unsigned short h[2]; } gw;
+    union w iw = { 16909060 };
+    struct ws { int a; union w x; int b; } wsv = { 1, { 5 }, 2 };
+    union u1 { char c; int i; };
+    struct s4 { char c; union u1 u; char d; } gs;
+    union u5 { struct { char a; int b; } s; short t; } g5;
+    int rw(void) { gw.u = 0x11223344; return gw.b[0] * 1000000 + gw.h[1]; }
+    unsigned rb(void) { gw.u = 0x11223344; gw.b[3] = 0xAA; return gw.u; }
+    int arrow(void) { union w *p = &gw; p->u = 0; p->h[0] = 0x0102; return p->b[1] * 100 + p->b[0]; }
+    int init(void) { return iw.b[0] * 100 + iw.b[3] + wsv.x.b[0] * 10000 + wsv.b * 1000000; }
+    int inner(void) { gs.d = 9; gs.u.i = 127; return gs.u.c; }
+    int nested(void) { g5.s.b = 300; g5.t = 1; return g5.s.b + g5.s.a * 1000; }
+  '';
+
+  bitSrc = ''
+    typedef unsigned int uint32_t;
+    struct rgba { uint32_t b : 8; uint32_t g : 8; uint32_t r : 8; uint32_t a : 8; };
+    union pxu { struct rgba c; unsigned w; unsigned char bytes[4]; } pu;
+    struct h2 { unsigned int lo : 16, hi : 16; } gh;
+    struct b3 { unsigned x : 32; } g3;
+    struct b4 { unsigned char a : 8; unsigned char b : 8; } g4;
+    struct b2 { unsigned short x : 16; unsigned short y : 8; unsigned short z : 8; } g2;
+    struct b9 { int pre; uint32_t lo : 16, hi : 16; char post; };
+    struct b10 { char x; struct b9 in; } g10;
+    struct b5 { char c; uint32_t a : 8, b : 8, d : 8, e : 8; char f; } gb5;
+    struct b7 { char c; unsigned short x : 8, y : 8; } g7;
+    int px(void) { pu.c.b = 1; pu.c.g = 2; pu.c.r = 3; pu.c.a = 4; return pu.w; }
+    int neighbors(void) {
+      pu.w = 0x01020304;
+      pu.c.g = 300;
+      pu.c.r++;
+      return pu.w;
+    }
+    int same(void) {
+      pu.w = 0;
+      pu.c.r = 7;
+      return pu.bytes[2] * 10 + pu.bytes[1] + sizeof(struct rgba) * 100;
+    }
+    int h16(void) { gh.lo = 0xBEEF; gh.hi = 0x1234; return gh.lo | gh.hi << 16; }
+    int w32(void) {
+      g3.x = 0xffffffffu;
+      return (g3.x > 0) + (g3.x >> 1 == 2147483647u) * 10 + (g3.x / 2 == 2147483647u) * 100
+        + sizeof g3 * 1000;
+    }
+    int prom(void) { g4.a = 200; return (g4.a - 201 < 0) + g4.b * 10 + sizeof g4 * 100; }
+    int b2f(void) { g2.x = 0xABCD; g2.y = 0x12; g2.z = 0x34; return g2.x == 0xABCD && g2.y == 0x12; }
+    int around(void) {
+      g10.in.pre = -1; g10.in.lo = 0x1122; g10.in.hi = 0x5566; g10.in.post = 7;
+      gb5.e = 0x11; gb5.f = 0x22; gb5.a = 0x33;
+      g7.y = 0x44;
+      return g10.in.hi - g10.in.lo;
+    }
+  '';
+
+  floatSrc = ''
+    typedef float real;
+    double sqrt(double);
+    float lerp(float a, float b, real t);
+    extern double scale(double);
+    struct f1 { char c; double d; int i; } sf1;
+    struct f2 { char c; float f; short s; } sf2;
+    int run(void) {
+      real *p = 0;
+      sf1.i = 77;
+      sf2.s = 5;
+      return sizeof(struct f1) * 100 + sizeof(struct f2) + sizeof(double) * 10000
+        + sizeof(real) * 100000 + (p == 0) * 1000000;
+    }
+  '';
+
+  attrSrc = ''
+    static inline int add1(register int x) { register int y = x + 1; return y; }
+    inline int twice(int x) { return 2 * x; }
+    volatile int vg;
+    int * volatile vp;
+    int * __restrict rp;
+    int * restrict rq;
+    const volatile unsigned cv = 3;
+    __attribute__((noreturn)) void halt(void);
+    void __attribute__((__noreturn__)) halt2(void);
+    void halt3(void) __attribute__((noreturn, unused));
+    int pf(const char *f, ...) __attribute__((format(printf, 1, 2)));
+    __attribute__((unused)) static int x0 __attribute__((unused)) = 3;
+    struct __attribute__((packed)) ps { char c; int i; } __attribute__((unused));
+    struct am { int a __attribute__((unused)); char b; };
+    __attribute__((always_inline)) static inline int one(void) __attribute__((const));
+    static inline int one(void) { return 1; }
+    int useAll(int a) {
+      volatile int t = a;
+      return add1(t) + twice(x0) + vg + cv + (vp == 0) + sizeof(struct am) * 100 + one();
+    }
+  '';
+
+  packedSrc = ''
+    struct __attribute__((packed)) p1 { char c; int i; } gp1;
+    struct p2 { char c; struct p1 p; short s; } gp2;
+    struct p3 { char c; short s; int i; } __attribute__((packed)) gp3;
+    struct pn { char c; struct p2 n; } __attribute__((__packed__)) gpn;
+    int sizes(void) {
+      return sizeof(struct p1) + sizeof(struct p2) * 10 + sizeof(struct p3) * 100
+        + sizeof(struct pn) * 1000;
+    }
+    int rw(void) {
+      gp3.s = -2; gp3.i = 0x01020304; gp1.i = 0x55667788; gp2.p.i = 7; gp2.s = 9;
+      gpn.n.s = 3;
+      return gp3.s * 1000 + gp1.i % 256 + gp2.p.i * 10;
+    }
+  '';
+
+  scopeDeclSrc = ''
+    int gx = 5;
+    struct s { int a; };
+    enum e { A = 1 };
+    int hid(void) { int gx = 1; { extern int gx; gx = 7; } return gx * 10; }
+    int after(void) { return gx; }
+    int useSq(void) { int sq(int); return sq(3); }
+    int sq(int x) { return x * x; }
+    int tags(void) {
+      int r;
+      {
+        struct s { int a, b, c; };
+        enum e { A = 10 };
+        struct s *p = 0;
+        r = sizeof(struct s) + A + sizeof *p;
+      }
+      return r * 100 + sizeof(struct s) + A;
+    }
+    int late(void) { extern int lv; return lv; }
+    int lv = 9;
+    int hideLocal(int v) { int r = v; { extern int lv; r = r + lv; } { int lv = 100; r = r + lv; } return r; }
+  '';
+
+  commaSrc = ''
+    int calls;
+    int tick(void) { calls = calls * 10 + 1; return calls; }
+    int id(int x) { return x; }
+    int add2(int a, int b) { return a + b; }
+    int arr2[4] = { 10, 20, 30, 40 };
+    int g;
+    int forBoth(int n) { int a, b, s = 0; for (a = 0, b = 1; a < n; a++, b *= 2) s += b; return s; }
+    int value(void) { int a; int x = (a = 1, a + 2); return x; }
+    int nest(void) { int a = 0, b = 0; int x = ((a = 1, b = 2), (a += b, a * 10)); return x + b; }
+    int arg(int k) { return add2((k++, k), 10); }
+    int whileComma(int n) { int i = 0, c = 0; while ((i++, i < n)) c++; return c * 100 + i; }
+    int retComma(int a) { return (a++, a); }
+    int order(void) { g = 1; return (g = g * 10, g + 1); }
+    int calls2(void) { calls = 0; int x = (tick(), tick() * 100); return x + calls; }
+    int mem(int *p) { return (*p = 5, *p + 1); }
+    int grammar(void) { return id(1 ? 2, 3 : 4); }
+    int sub(int i, int j) { return arr2[i, j]; }
+    int inCond(int a) { int b = 0; if ((b = a * 2, b > 4)) return b; return -b; }
+    void cpy(unsigned char *d, unsigned char *s, int n) {
+      int i;
+      unsigned char *q;
+      for (i = 0, q = d; i < n; i++, q++) *q = s[i];
+    }
+    void cpy2(unsigned char *d, unsigned char *s, int n) {
+      int i;
+      unsigned char *q;
+      for (i = 0, q = d; i < n; i++, q += 2) { *q = s[i]; *(q + 1) = 0; }
+    }
+  '';
+
+  staticSrc = ''
+    int sv = 100;
+    struct pt { int x, y; };
+    int counter(void) { static int c = 5; return ++c; }
+    int counter2(void) { static int c; c += 10; return c; }
+    int hideS(void) { static int sv = 1; sv++; return sv; }
+    int outer(void) { return sv; }
+    int nest(int k) { static int a = 1; { static int a = 10; a += k; if (k) return a; } a++; return a; }
+    int sp(void) { static struct pt p = { 3, 4 }; p.x++; return p.x * 10 + p.y; }
+    int sl(void) { static char t[] = { 1, 2, 3 }; return sizeof t + t[2] * 10; }
+    int su(void) { static int z; static int *pz; return z + (pz == 0); }
+    int *sa(void) { static int v = 8; return &v; }
+    int self(void) { static int *me = 0; static int k = 4; me = &k; return *me; }
+    void fill(unsigned char *d, int n) {
+      static unsigned char base = 3;
+      for (int i = 0; i < n; i++) d[i] = base + i;
+      base += 10;
+    }
+    int sumTo(int n) { static int acc; for (int i = 0; i < n; i++) acc += i; return acc; }
+  '';
+
+  logicSrc = ''
+    int calls;
+    int g;
+    int f(int v) { calls++; return v; }
+    int and1(int a) { calls = 0; int x = a && f(7); return x * 10 + calls; }
+    int or1(int a) { calls = 0; int x = a || f(0); return x * 10 + calls; }
+    int chain(int k) { calls = 0; int x = f(1) && f(k) && f(1); return x * 10 + calls; }
+    int nested(int a, int b) { calls = 0; return (a && (b || f(1))) * 10 + calls; }
+    int notAnd(int a) { calls = 0; return !(a && f(0)) * 10 + calls; }
+    int local(int a) { int x = 1; int y = a && (x = 5); return x * 10 + y; }
+    int postb(int b) { int a = 1; int r = a && b++; return r * 10 + b; }
+    int viaPtr(int a, int *p) { return (a || (*p = 9)) * 10 + *p; }
+    int ifCond(int a) { calls = 0; if (a && f(a > 1)) return 100 + calls; return calls; }
+    int whileCond(int n) { int i = 0; calls = 0; while (i < n && f(i) < 3) i++; return i * 10 + calls; }
+    int forCond(int n) { int s = 0; calls = 0; for (int i = 0; i < n && f(i) != 2; i++) s += i; return s * 10 + calls; }
+    int doCond(int n) { int k = 0; calls = 0; do k++; while (k < n || f(0)); return k * 10 + calls; }
+    int condCond(int a) { calls = 0; return (a && f(1) ? 5 : 6) * 10 + calls; }
+    int argRet(int a) { calls = 0; return f(a || f(3)) * 10 + calls; }
+    int cache(int n) {
+      int s = 0;
+      for (int i = 0; i < n; i++) { s += g; if (i == 1 && (g = 100)) s += 1000; s += g; }
+      return s;
+    }
+    int stop(int n) { int i = 0; while (n > 0 && (n = n - 3) > 0) i++; return i * 100 + n; }
+    void bulkTemp(unsigned char *d, int n, int c) {
+      int t;
+      for (int i = 0; i < n; i++) { t = i; c && (t = 7); d[i] = t; }
+    }
+  '';
+
 in
 [
   # Lexer
@@ -1787,15 +2054,31 @@ in
 
   # Parser: outside the subset
   (t "cc parse: goto throws" (throws "void f(void) { goto x; }") true)
-  (t "cc parse: union throws" (throws "union u { int a; };") true)
-  (t "cc parse: bit-field throws" (throws "struct s { int a : 3; };") true)
-  (t "cc parse: function pointer declarator throws" (throws "void (*fp)(int);") true)
-  (t "cc parse: variadic function throws" (throws "int f(int a, ...);") true)
-  (t "cc parse: comma operator throws" (throws "void f(int a) { a = 1, 2; }") true)
-  (t "cc parse: floating-point type throws" (throws "float x;") true)
+  (t "cc parse: union, bit-field, function pointer, variadic prototype, comma and float parse"
+    [
+      (map (i: i.kind) (items "union u { int a; };"))
+      (map (f: show f.width) (head (items "struct s { int a : 3; };")).members)
+      (showType (head (items "void (*fp)(int);")).type)
+      (head (items "int f(int a, ...);")).variadic
+      (parsed "a = 1, 2")
+      (showType (head (items "float x;")).type)
+    ]
+    [
+      [ "union" ]
+      [ "3" ]
+      "fn(int)void*"
+      true
+      "(, (= a 1) 2)"
+      "float"
+    ]
+  )
   (t "cc parse: string literal throws" (throws "int f(void) { return g(\"s\"); }") true)
   (t "cc parse: designated initializer throws" (throws "int a[2] = { [1] = 2 };") true)
-  (t "cc parse: block-scope static throws" (throws "void f(void) { static int x; }") true)
+  (t "cc parse: block-scope static" (map (d: d.storage) (bodyDecls "void f(void) { static int x; }"))
+    [
+      "static"
+    ]
+  )
   (t "cc parse: declaration without a declarator throws" (throws "int;") true)
 
   # Code generation: output shape
@@ -3271,7 +3554,10 @@ in
     true
   )
   (t "cc compile: local array throws" (compileThrows "void f(void) { int a[3]; }") true)
-  (t "cc compile: union throws" (compileThrows "union u { int a; }; int f(void) { return 0; }") true)
+  (t "cc compile: union value assignment throws"
+    (compileThrows "union u { int a; }; union u x, y; void f(void) { x = y; }")
+    true
+  )
   (t "cc compile: struct assignment throws"
     (compileThrows "struct s { int a; }; struct s x, y; void f(void) { x = y; }")
     true
@@ -3313,12 +3599,17 @@ in
     (compileThrows "struct s; int f(struct s *p) { return p->a; }")
     true
   )
-  (t "cc compile: side effect right of && throws" (compileThrows "int f(int x) { return x && x++; }")
-    true
-  )
-  (t "cc compile: call right of || throws"
-    (compileThrows "int g(void) { return 1; } int f(int x) { return x || g(); }")
-    true
+  (t "cc run: side effect right of &&, call right of ||"
+    [
+      (ret "int f(int x) { return (x && x++) * 10 + x; }" "f" [ 0 ])
+      (ret "int f(int x) { return (x && x++) * 10 + x; }" "f" [ 4 ])
+      (ret "int g(void) { return 1; } int f(int x) { return x || g(); }" "f" [ 0 ])
+    ]
+    [
+      0
+      15
+      1
+    ]
   )
   (t "cc compile: 8-byte memory access throws"
     (compileThrows "long long f(long long *p) { return *p; }")
@@ -6400,6 +6691,1001 @@ in
         )
         (n >= 1)
       ]) liveCounts)
+    ]
+  )
+  # ---- Slice 7 ----
+
+  # Octal literals
+  (t "cc lex: octal literals"
+    (map (k: k.value) (filter (k: k.kind == "int") (toks "0755 010 0 00 037777777777 0u")))
+    [
+      493
+      8
+      0
+      0
+      4294967295
+      0
+    ]
+  )
+  (t "cc lex: 08, 09 and 0129 throw"
+    (map lexThrows [
+      "x = 08;"
+      "x = 09;"
+      "x = 0129;"
+    ])
+    [
+      true
+      true
+      true
+    ]
+  )
+  (t "cc run: octal literals take the types of hexadecimal ones" (ret ''
+    int f(void) {
+      return (037777777777 > 0) + (-1 < 020000000000) * 10 + (-1 < 2147483648) * 100
+        + (017777777777 == 2147483647) * 1000 + 0755 * 10000;
+    }
+  '' "f" [ ]) 4931101)
+
+  # Function pointers
+  (t "cc parse: function pointer declarators"
+    [
+      (map (i: showType i.type) (
+        items "int (*f)(int, int); void (*p)(); int (*a[3])(void); void (*(*g)(int))(void); typedef void (*actionf_v)();"
+      ))
+      (showType (head (items "int (*getf(void))(int);")).ret)
+      (map (p: showType p.type) (head (items "void f(int g(int), int (*h)(void));")).params)
+      (map (f: showType f.type)
+        (head (items "struct s { int (*cb)(int); void (*hooks[2])(void); };")).members
+      )
+      (map (d: showType d.type) (bodyDecls "void f(void) { int (*l)(int), (*m[2])(char *); }"))
+      (head (items "int f(int (int), int (*)(int));")).kind
+      (map (p: showType p.type) (head (items "int f(int (int), int (*)(int));")).params)
+      (showType (head (items "int (x);")).type)
+    ]
+    [
+      [
+        "fn(int,int)int*"
+        "fn()void*"
+        "[3]fn()int*"
+        "fn(int)fn()void**"
+        "fn()void*"
+      ]
+      "fn(int)int*"
+      [
+        "fn(int)int"
+        "fn()int*"
+      ]
+      [
+        "fn(int)int*"
+        "[2]fn()void*"
+      ]
+      [
+        "fn(int)int*"
+        "[2]fn(char*)int*"
+      ]
+      "proto"
+      [
+        "fn(int)int"
+        "fn(int)int*"
+      ]
+      "int"
+    ]
+  )
+  (t "cc run: function pointer declarations, copies, comparisons and members"
+    (
+      let
+        r = run7 fnPtrSrc "layout" [ ];
+      in
+      [
+        r.ret
+        (M.loadHalf r.mem (r.syms.o + 8))
+        (dret fnPtrSrc "ops" [ ])
+        (dret fnPtrSrc "passed" [ ])
+        (dret fnPtrSrc "sizes" [ ])
+        (dret fnPtrSrc "cleared" [ ])
+      ]
+    )
+    [
+      2073
+      7
+      101101
+      1511
+      440420
+      1
+    ]
+  )
+  (t "cc compile: function names as values, indirect calls and function pointer conversions throw" (
+    map
+      compileThrows
+      [
+        "int f(int x) { return x; } int g(void) { int (*p)(int) = f; return p == 0; }"
+        "int f(int x) { return x; } int g(void) { int (*p)(int) = &f; return p == 0; }"
+        "int f(int x) { return x; } int (*t[1])(int) = { f };"
+        "int g(int (*p)(int)) { return p(1); }"
+        "int g(int (*p)(int)) { return (*p)(1); }"
+        "struct s { int (*cb)(int); }; int g(struct s *q) { return q->cb(1); }"
+        "int g(int (*p)(int)) { return (int)p; }"
+        "int g(int (*p)(int)) { return (void *)p == 0; }"
+        "int g(int (*p)(int)) { void (*q)(void) = (void (*)(void))p; return q == 0; }"
+        "int g(int (*p)(int)) { int x = p; return x; }"
+        "int g(int (*p)(int)) { void *v = p; return v == 0; }"
+        "int g(int (*p)(int), int (*q)(int)) { return p < q; }"
+        "int g(int (*p)(int), void (*q)(void)) { return p == q; }"
+        "int g(int (*p)(int)) { p = 1; return 0; }"
+        "int g(int (*p)(int)) { return p[0] == 0; }"
+        "int g(int (*p)(int)) { return p + 1 == 0; }"
+        "typedef int F(int);"
+      ]
+  ) (genList (_: true) 17))
+
+  # Variadic prototypes
+  (t "cc run: a variadic prototype is accepted" (ret
+    "int printf(const char *fmt, ...); int one(void) { return 1; }"
+    "one"
+    [ ]
+  ) 1)
+  (t "cc compile: calling or defining a variadic function throws"
+    (map compileThrows [
+      "int printf(const char *fmt, ...); int f(void) { return printf(0); }"
+      "int v(int a, ...) { return a; }"
+      "int bad(...);"
+    ])
+    [
+      true
+      true
+      true
+    ]
+  )
+
+  # Unions
+  (t "cc run: union sizes and alignments"
+    (
+      let
+        decls = ''
+          union u1 { char c; int i; };
+          union u2 { int *p; char *q; };
+          union u3 { char a[5]; short s; };
+          struct s4 { char c; union u1 u; char d; };
+          union u5 { struct { char a; int b; } s; short t; };
+          struct w1 { char c; union u1 x; };
+          struct w3 { char c; union u3 x; };
+          struct w5 { char c; union u5 x; };
+        '';
+      in
+      map (sizeIn decls) [
+        "union u1"
+        "union u2"
+        "union u3"
+        "struct s4"
+        "union u5"
+        "struct w1"
+        "struct w3"
+        "struct w5"
+      ]
+    )
+    [
+      4
+      4
+      6
+      12
+      8
+      8
+      8
+      12
+    ]
+  )
+  (t
+    "cc run: union members share their bytes, ->, initializers, unions in structs and structs in unions"
+    (
+      let
+        r = run7 unionSrc "inner" [ ];
+      in
+      [
+        (dret unionSrc "rw" [ ])
+        (dret unionSrc "rb" [ ])
+        (dret unionSrc "arrow" [ ])
+        (dret unionSrc "init" [ ])
+        r.ret
+        (M.loadByte r.mem (r.syms.gs + 8))
+        (M.loadWord r.mem (r.syms.gs + 4))
+        (dret unionSrc "nested" [ ])
+      ]
+    )
+    [
+      68004386
+      2854368068
+      102
+      2050401
+      127
+      9
+      127
+      1300
+    ]
+  )
+  (t "cc compile: union values, parameters and local unions throw" (map compileThrows [
+    "union u { int a; }; union u x, y; void f(void) { x = y; }"
+    "union u { int a; }; void f(union u x) { }"
+    "union u { int a; }; union u f(void);"
+    "union u { int a; }; void f(void) { union u x; }"
+    "union u { int a; }; union u g = 1;"
+    "struct s { int a; }; union s *p;"
+  ]) (genList (_: true) 6))
+
+  # Bit-fields
+  (t "cc run: bit-field layouts"
+    (
+      let
+        decls = ''
+          typedef unsigned int uint32_t;
+          struct b1 { uint32_t b : 8; uint32_t g : 8; uint32_t r : 8; uint32_t a : 8; };
+          struct b2 { unsigned int lo : 16, hi : 16; };
+          struct b3 { unsigned x : 32; };
+          struct b4 { unsigned char a : 8; unsigned char b : 8; };
+          struct b5 { unsigned short x : 16; unsigned short y : 8; unsigned short z : 8; };
+          struct b9 { int pre; uint32_t lo : 16, hi : 16; char post; };
+          struct b10 { char x; struct b9 in; };
+          struct b11 { char c; uint32_t a : 8, b : 8, d : 8, e : 8; char f; };
+          struct b12 { char c; unsigned short x : 8, y : 8; };
+          struct b13 { short s; uint32_t x : 16, y : 16; };
+        '';
+      in
+      map (n: sizeIn decls "struct b${toString n}") [
+        1
+        2
+        3
+        4
+        5
+        9
+        10
+        11
+        12
+        13
+      ]
+    )
+    [
+      4
+      4
+      4
+      2
+      4
+      12
+      16
+      8
+      4
+      8
+    ]
+  )
+  (t "cc run: bit-fields read and write their own bytes, like unsigned members"
+    (
+      let
+        r = run7 bitSrc "around" [ ];
+        h = run7 bitSrc "h16" [ ];
+        b2 = run7 bitSrc "b2f" [ ];
+      in
+      [
+        (dret bitSrc "px" [ ])
+        (dret bitSrc "neighbors" [ ])
+        (dret bitSrc "same" [ ])
+        h.ret
+        (M.loadWord h.mem h.syms.gh)
+        (dret bitSrc "w32" [ ])
+        (dret bitSrc "prom" [ ])
+        b2.ret
+        (M.loadWord b2.mem b2.syms.g2)
+        r.ret
+        (map (k: M.loadByte r.mem (r.syms.g10 + k)) (genList (k: k + 4) 9))
+        (map (k: M.loadByte r.mem (r.syms.gb5 + k)) (genList (k: k) 6))
+        (M.loadByte r.mem (r.syms.g7 + 2))
+      ]
+    )
+    [
+      67305985
+      16985092
+      470
+      305446639
+      305446639
+      4111
+      201
+      1
+      873638861
+      17476
+      [
+        255
+        255
+        255
+        255
+        34
+        17
+        102
+        85
+        7
+      ]
+      [
+        0
+        51
+        0
+        0
+        17
+        34
+      ]
+      68
+    ]
+  )
+  (t "cc compile: unsupported and invalid bit-fields throw" (map compileThrows [
+    "struct s { unsigned a : 3, b : 5; };"
+    "struct s { int a : 8, b : 8, c : 16; };"
+    "struct s { unsigned a : 8; int x; };"
+    "struct s { unsigned a : 8, b : 8, c : 8; };"
+    "struct s { unsigned : 8; unsigned a : 24; };"
+    "struct s { unsigned a : 8, b : 16, c : 8; };"
+    "struct s { unsigned a : 0; };"
+    "struct s { unsigned char a : 16; };"
+    "union u { unsigned a : 8; int b; };"
+    "struct s { unsigned a : 8, b : 8, c : 8, d : 8; } g; unsigned *f(void) { return &g.a; }"
+    "struct s { unsigned a : 8, b : 8, c : 8, d : 8; } g; int f(void) { return sizeof g.a; }"
+    "struct s { char a : 8; };"
+    "enum e { A }; struct s { enum e a : 8, b : 8, c : 8, d : 8; };"
+    "struct s { unsigned short a : 8; unsigned b : 8, c : 16; };"
+  ]) (genList (_: true) 14))
+
+  # float and double
+  (t "cc run: float and double in prototypes, typedefs and struct members"
+    (
+      let
+        r = run7 floatSrc "run" [ ];
+      in
+      [
+        r.ret
+        (M.loadWord r.mem (r.syms.sf1 + 16))
+        (M.loadHalf r.mem (r.syms.sf2 + 8))
+        (r.syms.sf2 - r.syms.sf1)
+      ]
+    )
+    [
+      1482412
+      77
+      5
+      24
+    ]
+  )
+  (t "cc compile: floating-point values, variables and functions throw" (map compileThrows [
+    "int f(void) { return 1.5; }"
+    "float x;"
+    "double a[2];"
+    "int f(void) { float y; return 0; }"
+    "extern float x; int f(void) { return 0; }"
+    "struct f1 { char c; double d; } s; int f(void) { return s.d + 1; }"
+    "struct f1 { char c; double d; } s; int f(void) { return s.d; }"
+    "struct f1 { char c; double d; } s; void f(void) { s.d = 1; }"
+    "int ff(float); int g(void) { return ff(1); }"
+    "int f(void) { return (float)1; }"
+    "float h(void) { return 0; }"
+    "int k(double x) { return 0; }"
+    "struct f1 { double d; int i; } s = { 1, 2 };"
+    "int f(float *p) { return *p; }"
+    "long double x;"
+  ]) (genList (_: true) 15))
+
+  # Qualifiers, register, inline and attributes
+  (t "cc run: register, inline, volatile, restrict and ignored attributes" (dret attrSrc "useAll" [
+    4
+  ]) 816)
+  (t "cc compile: & of a register local, register at file scope and other attributes throw" (map
+    compileThrows
+    [
+      "int f(int a) { register int x = a; int *p = &x; return *p; }"
+      "register int g;"
+      "inline int g;"
+      "struct __attribute__((aligned(8))) a { int x; };"
+      "int x __attribute__((aligned(4)));"
+      "int f(void) __attribute__((weak));"
+      "struct m { char c; int i __attribute__((packed)); };"
+      "enum __attribute__((packed)) e { A };"
+      "__attribute__((packed)) int y;"
+      "struct s { int a; }; struct __attribute__((packed)) s *p;"
+    ]
+  ) (genList (_: true) 10))
+  (t "cc run: packed structs as clang lays them out"
+    (
+      let
+        r = run7 packedSrc "rw" [ ];
+        at = name: k: r.syms.${name} + k;
+      in
+      [
+        (dret packedSrc "sizes" [ ])
+        r.ret
+        (M.loadWord r.mem (at "gp1" 1))
+        (M.loadHalf r.mem (at "gp3" 1))
+        (M.loadWord r.mem (at "gp3" 3))
+        (M.loadWord r.mem (at "gp2" 2))
+        (M.loadHalf r.mem (at "gp2" 6))
+        (M.loadHalf r.mem (at "gpn" 7))
+        (map (n: r.syms.${n} - r.syms.gp1) [
+          "gp2"
+          "gp3"
+          "gpn"
+        ])
+      ]
+    )
+    [
+      9785
+      (-1794)
+      1432778632
+      65534
+      16909060
+      7
+      9
+      3
+      [
+        6
+        14
+        21
+      ]
+    ]
+  )
+
+  # Block-scope declarations
+  (t "cc run: block-scope extern variables, function declarations and tags"
+    (
+      let
+        h = dcall scopeDeclSrc "hid" [ ];
+        f = Cc.load scopeDeclSrc;
+      in
+      [
+        h.ret
+        (f.after h.mem).ret
+        (dret scopeDeclSrc "useSq" [ ])
+        (dret scopeDeclSrc "tags" [ ])
+        (dret scopeDeclSrc "late" [ ])
+        (dret scopeDeclSrc "hideLocal" [ 1 ])
+      ]
+    )
+    [
+      10
+      7
+      9
+      3405
+      9
+      110
+    ]
+  )
+  (t "cc compile: block-scope declarations end with their block, and invalid ones throw" (map
+    compileThrows
+    [
+      "int f(void) { { int g(void); } return g(); } int g(void) { return 1; }"
+      "int f(void) { { struct t { int a; }; } return sizeof(struct t); }"
+      "int f(void) { { enum { B = 2 }; } return B; }"
+      "int f(void) { extern int nope; return nope; }"
+      "int gm; int f(void) { extern char gm; return gm; }"
+      "int f(void) { int h(int); return h(1); } char h(int x) { return x; }"
+      "void f(void) { static void g(void); }"
+      "void f(void) { extern int x = 1; }"
+      "int f(void) { for (static int i = 0; i < 1; i++) ; return 0; }"
+      "void f(void) { struct s { int a; }; struct s { int b; }; }"
+      "int g; void f(void) { int g(void); }"
+      "void f(void) { int x; extern int x; } int x;"
+      "int f(void) { int h(void); return h(); }"
+    ]
+  ) (genList (_: true) 13))
+
+  # Comma operator
+  (t "cc parse: comma operator grammar"
+    [
+      (parsed "a = 1, b = 2, c")
+      (parsed "g(a, (b, c))")
+      (parsed "a ? b, c : d")
+      (parsed "p[a, b]")
+      (map show (head (items "int x[2] = { 1, 2 };")).init.items)
+    ]
+    [
+      "(, (, (= a 1) (= b 2)) c)"
+      "(call g a (, b c))"
+      "(? a (, b c) d)"
+      "(index p (, a b))"
+      [
+        "1"
+        "2"
+      ]
+    ]
+  )
+  (t "cc run: comma operator"
+    (
+      let
+        m = dcall commaSrc "mem" [ 4096 ];
+      in
+      [
+        (dret commaSrc "forBoth" [ 4 ])
+        (dret commaSrc "value" [ ])
+        (dret commaSrc "nest" [ ])
+        (dret commaSrc "arg" [ 1 ])
+        (dret commaSrc "whileComma" [ 3 ])
+        (dret commaSrc "retComma" [ 5 ])
+        (dret commaSrc "order" [ ])
+        (dret commaSrc "calls2" [ ])
+        m.ret
+        (M.loadWord m.mem 4096)
+        (dret commaSrc "grammar" [ ])
+        (dret commaSrc "sub" [
+          1
+          2
+        ])
+        (dret commaSrc "inCond" [ 3 ])
+        (dret commaSrc "inCond" [ 1 ])
+      ]
+    )
+    [
+      15
+      3
+      32
+      12
+      203
+      6
+      11
+      1111
+      6
+      5
+      3
+      30
+      6
+      (-2)
+    ]
+  )
+  (t "cc run: loops with the comma operator, in bulk and not"
+    (
+      let
+        src = wordsAt [
+          3
+          5
+          7
+          9
+        ];
+        run =
+          fn: n:
+          let
+            m = callWith src commaSrc fn [
+              8192
+              4096
+              n
+            ];
+          in
+          genList (k: M.loadByte m (8192 + k)) 9;
+      in
+      [
+        (map (run "cpy") [
+          0
+          1
+          5
+        ])
+        (map (run "cpy2") [
+          0
+          3
+        ])
+        (countIn "builtins\\.genList" (fnCode commaSrc "cpy"))
+        (countIn "builtins\\.genList" (fnCode commaSrc "cpy2"))
+      ]
+    )
+    [
+      [
+        (genList (_: 0) 9)
+        ([ 3 ] ++ genList (_: 0) 8)
+        (
+          [
+            3
+            0
+            0
+            0
+            5
+          ]
+          ++ genList (_: 0) 4
+        )
+      ]
+      [
+        (genList (_: 0) 9)
+        (
+          [
+            3
+            0
+            0
+            0
+            0
+            0
+          ]
+          ++ genList (_: 0) 3
+        )
+      ]
+      1
+      0
+    ]
+  )
+  (t "cc compile: the comma operator in constant expressions throws" (map compileThrows [
+    "int a[(1, 2)];"
+    "int g = (1, 2);"
+    "int f(int x) { switch (x) { case (1, 2): return 1; } return 0; }"
+    "enum { A = (1, 2) };"
+    "struct s { unsigned a : (8, 8), b : 8, c : 16; };"
+  ]) (genList (_: true) 5))
+
+  # Static locals
+  (t "cc run: static locals keep their values and are distinct variables"
+    (
+      let
+        f = Cc.load staticSrc;
+        m0 = f.__data.init M.empty;
+        seq =
+          fn: args: k:
+          (foldl'
+            (acc: _: {
+              mem = (foldl' (g: a: g a) (f.${fn} acc.mem) args).mem;
+              rets = acc.rets ++ [ (foldl' (g: a: g a) (f.${fn} acc.mem) args).ret ];
+            })
+            {
+              mem = m0;
+              rets = [ ];
+            }
+            (genList (i: i) k)
+          ).rets;
+        h = f.hideS m0;
+      in
+      [
+        (seq "counter" [ ] 2)
+        (seq "counter2" [ ] 2)
+        h.ret
+        (f.outer h.mem).ret
+        (seq "nest" [ 0 ] 2)
+        (f.nest (f.nest m0 0).mem 5).ret
+        (seq "sp" [ ] 2)
+        (f.sl m0).ret
+        (f.su m0).ret
+        ((f.sa m0).ret == f.__data.symbols."sa'v'11'28")
+        (f.self m0).ret
+        (seq "sumTo" [ 4 ] 2)
+      ]
+    )
+    [
+      [
+        6
+        7
+      ]
+      [
+        10
+        20
+      ]
+      2
+      100
+      [
+        2
+        3
+      ]
+      15
+      [
+        44
+        54
+      ]
+      33
+      1
+      true
+      4
+      [
+        6
+        12
+      ]
+    ]
+  )
+  (t "cc data: static locals follow the file-scope variables in source order"
+    (
+      let
+        syms = (Cc.load staticSrc).__data.symbols;
+      in
+      [
+        (map (n: syms.${n} - base) [
+          "sv"
+          "counter'c'3'32"
+          "counter2'c'4'33"
+          "hideS'sv'5'30"
+          "nest'a'7'30"
+          "nest'a'7'50"
+          "sp'p'8'33"
+          "sl't'9'28"
+          "su'z'10'27"
+          "su'pz'10'42"
+          "sa'v'11'28"
+          "self'me'12'30"
+          "self'k'12'49"
+          "fill'base'14'24"
+          "sumTo'acc'18'31"
+        ])
+        (length (attrNames syms))
+      ]
+    )
+    [
+      [
+        0
+        4
+        8
+        12
+        16
+        20
+        24
+        32
+        36
+        40
+        44
+        48
+        52
+        56
+        60
+      ]
+      15
+    ]
+  )
+  (t "cc data: the symbols of the draw input are unchanged"
+    (Cc.load (import ../cc/examples/draw.nix)).__data.symbols
+    {
+      centery = 4196384;
+      columnofs = 4195104;
+      dc_colormap = 4196412;
+      dc_iscale = 4196400;
+      dc_source = 4196408;
+      dc_texturemid = 4196404;
+      dc_x = 4196388;
+      dc_yh = 4196396;
+      dc_yl = 4196392;
+      ds_colormap = 4196448;
+      ds_source = 4196444;
+      ds_x1 = 4196420;
+      ds_x2 = 4196424;
+      ds_xfrac = 4196428;
+      ds_xstep = 4196436;
+      ds_y = 4196416;
+      ds_yfrac = 4196432;
+      ds_ystep = 4196440;
+      ylookup = 4194304;
+    }
+  )
+  (t "cc run: a static local read in a bulk loop, and one written in a loop"
+    (
+      let
+        f = Cc.load staticSrc;
+        m0 = f.__data.init M.empty;
+        m1 = f.fill m0 8192 4;
+        m2 = f.fill m1 8196 3;
+      in
+      [
+        (genList (k: M.loadByte m2 (8192 + k)) 8)
+        (countIn "builtins\\.genList" (fnCode staticSrc "fill"))
+      ]
+    )
+    [
+      [
+        3
+        4
+        5
+        6
+        13
+        14
+        15
+        0
+      ]
+      1
+    ]
+  )
+
+  # && and || with side effects on the right
+  (t "cc run: the right of && and || runs only when needed"
+    (
+      let
+        r = fn: args: dret logicSrc fn args;
+        p = callWith (wordsAt [ 4 ]) logicSrc "viaPtr";
+        vp =
+          a:
+          (p [
+            a
+            4096
+          ]).ret;
+      in
+      [
+        (map (a: r "and1" [ a ]) [
+          0
+          1
+        ])
+        (map (a: r "or1" [ a ]) [
+          0
+          1
+        ])
+        (map (k: r "chain" [ k ]) [
+          0
+          1
+        ])
+        (map (r "nested") [
+          [
+            1
+            0
+          ]
+          [
+            1
+            1
+          ]
+          [
+            0
+            0
+          ]
+        ])
+        (map (a: r "notAnd" [ a ]) [
+          1
+          0
+        ])
+        (map (a: r "local" [ a ]) [
+          0
+          1
+        ])
+        (map (b: r "postb" [ b ]) [
+          0
+          2
+        ])
+        (map vp [
+          0
+          1
+        ])
+        (M.loadWord
+          (p [
+            0
+            4096
+          ]).mem
+          4096
+        )
+      ]
+    )
+    [
+      [
+        0
+        11
+      ]
+      [
+        1
+        10
+      ]
+      [
+        2
+        13
+      ]
+      [
+        11
+        10
+        0
+      ]
+      [
+        11
+        10
+      ]
+      [
+        10
+        51
+      ]
+      [
+        1
+        13
+      ]
+      [
+        19
+        14
+      ]
+      9
+    ]
+  )
+  (t "cc run: && and || with side effects in conditions, arguments, loops and cached reads"
+    (
+      let
+        r = fn: args: dret logicSrc fn args;
+      in
+      [
+        (map (a: r "ifCond" [ a ]) [
+          2
+          1
+          0
+        ])
+        (r "whileCond" [ 10 ])
+        (map (n: r "forCond" [ n ]) [
+          5
+          1
+        ])
+        (map (n: r "doCond" [ n ]) [
+          2
+          0
+        ])
+        (map (a: r "condCond" [ a ]) [
+          1
+          0
+        ])
+        (map (a: r "argRet" [ a ]) [
+          0
+          1
+        ])
+        (r "cache" [ 3 ])
+        (map (n: r "stop" [ n ]) [
+          10
+          0
+        ])
+      ]
+    )
+    [
+      [
+        101
+        1
+        0
+      ]
+      34
+      [
+        13
+        1
+      ]
+      [
+        21
+        11
+      ]
+      [
+        51
+        60
+      ]
+      [
+        12
+        11
+      ]
+      1300
+      [
+        298
+        0
+      ]
+    ]
+  )
+  (t "cc run: a bulk loop whose temporary is assigned on the right of &&"
+    [
+      (map
+        (
+          c:
+          let
+            m = callWith M.empty logicSrc "bulkTemp" [
+              4096
+              4
+              c
+            ];
+          in
+          genList (k: M.loadByte m (4096 + k)) 5
+        )
+        [
+          0
+          1
+        ]
+      )
+      (countIn "builtins\\.genList" (fnCode logicSrc "bulkTemp"))
+    ]
+    [
+      [
+        [
+          0
+          1
+          2
+          3
+          0
+        ]
+        [
+          7
+          7
+          7
+          7
+          0
+        ]
+      ]
+      1
+    ]
+  )
+  (t "cc compile: side effects in a branch of ?: still throw"
+    (map compileThrows [
+      "int g(void) { return 1; } int f(int x) { return x ? (x && g()) : 0; }"
+      "int f(int x, int y) { return x ? 0 : (y || x++); }"
+    ])
+    [
+      true
+      true
     ]
   )
 ]

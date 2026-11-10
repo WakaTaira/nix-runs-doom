@@ -9,12 +9,27 @@
 # expression evaluator (see there).
 #
 # Types are those of cc/parse.nix, resolved: the length of an array is an integer (or null
-# when not given), and an enum type is its compatible integer type (unsigned int when no
-# enumerator is negative, otherwise int, as in clang). A struct type stays a reference by
-# tag to the layouts of the file-scope struct definitions. Sizes, alignments and ranges
-# follow clang's ilp32 ABI (char 1; short 2; int, long and pointers 4; long long 8; a
-# struct aligns to its most aligned member and is padded to a multiple of that). Plain
-# char is unsigned, as in clang's RISC-V ABI (the scaffold's), but stays a type of its own.
+# when not given), an enum type is its compatible integer type (unsigned int when no
+# enumerator is negative, otherwise int, as in clang), and a function type has the
+# resolved types of its parameters (adjusted like those of a function: arrays and
+# functions to pointers) in params. A struct or union type stays a reference by tag to the
+# layouts of the struct and union definitions; the tag of a block-scope definition is
+# replaced by `<tag>@<line>:<col>` (of its keyword), which hides an outer one up to the end
+# of the block. Sizes, alignments and ranges follow clang's ilp32 ABI (char 1; short 2;
+# int, long, float and pointers 4; long long and double 8; a struct aligns to its most
+# aligned member and is padded to a multiple of that; a union has all its members at
+# offset 0; a packed struct or union aligns its members and itself to 1). Plain char is
+# unsigned, as in clang's RISC-V ABI (the scaffold's), but stays a type of its own.
+#
+# Bit-fields are supported in the form whose layout equals one of plain unsigned members
+# (see bitField): they are such members (unsigned char, unsigned short, or the declared
+# type for a width of 32), except that `&` and `sizeof` reject them. A function pointer is a
+# 4-byte pointer that can be copied, passed, returned, compared with == and != and tested;
+# taking a function's address, calling through a pointer and converting between a function
+# pointer and another type (but a null pointer constant) are unsupported. float and double
+# are known types with their size and alignment, but every floating-point value (and
+# variable, and the definition of or a call to a function with such a parameter or return
+# value) is unsupported, as are calls to a variadic function.
 #
 # Typed syntax tree
 # -----------------
@@ -48,7 +63,11 @@
 #                                                the result pointer type
 #   { kind = "ptrdiff"; lhs; rhs; size; }        pointer - pointer; type int
 #   { kind = "cmp"; op; lhs; rhs; }              < > <= >= == !=; type int
-#   { kind = "logand" | "logor"; lhs; rhs; }     && and ||; type int; rhs has no side effects
+#   { kind = "logand" | "logor"; lhs; rhs; }     && and ||; type int; rhs is evaluated only
+#                                                when lhs does not decide the result
+#   { kind = "comma"; lhs; rhs; }                `lhs, rhs`; lhs (any type, void included)
+#                                                is evaluated for its side effects; the
+#                                                type and value are those of rhs
 #   { kind = "cond"; cond; thenExpr; elseExpr; } ?:; cond is any scalar; both branches have
 #                                                the result type and no side effects
 #   { kind = "assign"; target; value; post; }    target is a "var" or "deref" node; value has
@@ -56,14 +75,18 @@
 #                                                expression yields the old value when post
 #                                                (postfix ++ and --), the new value otherwise
 # `x op= y`, `++x` and `x--` are "assign" nodes whose value computes from "old".
-# Arrays and structs are objects in memory: while an expression is checked they are
-# "deref" nodes of array or struct type (the address in expr), which never reach the
-# typed tree. An array used as a value decays to a pointer to its first element; a struct
-# is only used through its members, its address and sizeof.
+# Arrays, structs and unions are objects in memory: while an expression is checked they are
+# "deref" nodes of array, struct or union type (the address in expr), which never reach
+# the typed tree. An array used as a value decays to a pointer to its first element; a
+# struct or union is only used through its members, its address and sizeof.
 #
 # Statements (position of the first token):
 #   { kind = "block"; items; }
-#   { kind = "decl"; vars = [ { var; init; } ]; }    init is an expression or null
+#   { kind = "decl"; vars = [ { var; init; } ]; }    init is an expression or null; a
+#                                                     declaration of static locals and
+#                                                     block-scope extern variables also has
+#                                                     statics and externs (see declStmt),
+#                                                     which only this file uses
 #   { kind = "expr"; expr; }                          expr may have type void
 #   { kind = "if"; cond; thenStmt; elseStmt; }        elseStmt is a statement or null
 #   { kind = "while"; cond; body; }
@@ -80,8 +103,9 @@
 #       the first label, which never run (kept for their declarations, whose scope goes on
 #       into the sections). cases = [ { value; section; } ] in source order, with value
 #       converted to the type of cond; default is the index of its section or null.
-# Empty statements and block-scope typedefs leave no node. Labels anywhere but directly in
-# the body of a switch are unsupported.
+# Empty statements, block-scope typedefs, function declarations and struct, union and enum
+# definitions leave no node. Labels anywhere but directly in the body of a switch are
+# unsupported.
 #
 # Typed function (position of its name):
 #   { name; ret; params = [ var ]; body = <block>; line; col; }
@@ -89,7 +113,9 @@
 # Data
 # ----
 # File-scope variables are placed in declaration order (of their definitions), each at the
-# next offset aligned for its type, from the address dataBase (default 0x00400000):
+# next offset aligned for its type, from the address dataBase (default 0x00400000), and
+# after them the static locals in source order, each named
+# `<function>'<name>'<line>'<col>` (of its name; not a C identifier):
 #   { base; size; symbols = [ { name; addr; } ]; inits = [ { addr; size; value; } ]; }
 # size is the end of the last variable minus base. inits are the scalar stores of the
 # initializers whose value is not 0 (size 1, 2 or 4 bytes, value in the stored unsigned
@@ -119,6 +145,7 @@ let
     length
     listToAttrs
     map
+    removeAttrs
     stringLength
     substring
     ;
@@ -173,13 +200,6 @@ let
       nodes = genList (k: (elemAt items k).r.node) (n - 1);
       s = (elemAt items (n - 1)).s;
     };
-
-  # Syntax the parser accepts but the checker does not support yet, by node kind, with
-  # the description used in the error.
-  pendingDecls = {
-    struct = "block-scope struct definition";
-    enum = "block-scope enum definition";
-  };
 
   # ---- Types ----
 
@@ -355,6 +375,8 @@ let
     long = "long";
     ulong = "unsigned long";
     llong = "long long";
+    float = "float";
+    double = "double";
   };
   showType =
     t:
@@ -362,8 +384,12 @@ let
       "${showType t.to} *"
     else if t.tag == "array" then
       "${showType t.of} [${if t.len == null then "" else toString t.len}]"
-    else if t.tag == "struct" then
-      "struct ${t.name}"
+    else if t.tag == "struct" || t.tag == "union" then
+      "${t.tag} ${t.name}"
+    else if t.tag == "fn" then
+      "${showType t.ret} (${
+        builtins.concatStringsSep ", " (map showType t.params ++ (if t.variadic then [ "..." ] else [ ]))
+      })"
     else
       typeNames.${t.tag};
 
@@ -386,19 +412,30 @@ let
   };
 
   # ---- Objects: arrays, structs, sizes and alignments ----
-  # ctx (the file-scope context, see checkItems) holds the struct layouts by tag:
-  #   structs.<name> = { size; align; fields = [ { name; type; offset; } ]; byName; }
-  # byName maps a member name to its field.
+  # ctx (the context, see checkItems) holds the struct and union layouts by tag:
+  #   structs.<name> = { kind; size; align; fields = [ { name; type; offset; } ]; byName; }
+  # kind is "struct" or "union", and byName maps a member name to its field. The field of
+  # a bit-field also has bitfield = true.
 
   isArray = t: t.tag == "array";
-  isStruct = t: t.tag == "struct";
+  # Structs and unions.
+  isStruct = t: t.tag == "struct" || t.tag == "union";
   isAggregate = t: isArray t || isStruct t;
+  isFloat = t: t.tag == "float" || t.tag == "double";
+  # A floating-point object: a float or double, or an array of them.
+  hasFloat = t: isFloat t || isArray t && hasFloat t.of;
+  isFnPtr = t: isPtr t && t.to.tag == "fn";
+  # Sizes (and alignments) of the floating-point types; they are never read or written.
+  floatSizes = {
+    float = 4;
+    double = 8;
+  };
 
-  # A type whose size is known: not void, not an array of unknown length, not a struct
-  # without a definition.
+  # A type whose size is known: not void, not a function, not an array of unknown length,
+  # not a struct or union without a definition.
   isComplete =
     ctx: t:
-    if isVoid t then
+    if isVoid t || t.tag == "fn" then
       false
     else if isArray t then
       t.len != null && isComplete ctx t.of
@@ -414,6 +451,8 @@ let
       t.len * sizeOfT ctx t.of
     else if isStruct t then
       ctx.structs.${t.name}.size
+    else if isFloat t then
+      floatSizes.${t.tag}
     else
       sizeOf t;
 
@@ -423,6 +462,8 @@ let
       alignOfT ctx t.of
     else if isStruct t then
       ctx.structs.${t.name}.align
+    else if isFloat t then
+      floatSizes.${t.tag}
     else
       sizeOf t;
 
@@ -446,10 +487,8 @@ let
   litType =
     n:
     let
-      hex = elem (substring 0 2 n.text) [
-        "0x"
-        "0X"
-      ];
+      # Hexadecimal and octal literals (and 0, whose type is int either way).
+      nonDecimal = substring 0 1 n.text == "0";
       candidates =
         if n.unsigned then
           if n.long == 0 then
@@ -462,7 +501,7 @@ let
           else
             [ ]
         else if n.long == 0 then
-          if hex then
+          if nonDecimal then
             [
               tInt
               tUInt
@@ -477,7 +516,7 @@ let
               tLLong
             ]
         else if n.long == 1 then
-          if hex then
+          if nonDecimal then
             [
               tLong
               tULong
@@ -509,6 +548,8 @@ let
       node x "cast" t { expr = x; };
 
   isNullConst = x: x.kind == "lit" && x.value == 0 && isInteger x.type;
+  # A null pointer constant for a function pointer: also `(void *)0`.
+  isNullFn = x: isNullConst x || x.kind == "lit" && isPtr x.type && isVoid x.type.to && x.value == 0;
 
   # ---- Constant folding ----
   # Constants are folded with the values the generated code computes: signed int and long
@@ -618,10 +659,22 @@ let
     else
       n;
 
-  # Conversion as by assignment (also for arguments and return values).
+  # Conversion as by assignment (also for arguments and return values). A function
+  # pointer converts only from its own type and from a null pointer constant.
   assignConv =
     at: t: x:
-    if (isInteger t && isInteger x.type) || (isPtr t && isPtr x.type) || (isPtr t && isNullConst x) then
+    if isFnPtr t || isFnPtr x.type then
+      (
+        if t == x.type then
+          x
+        else if isFnPtr t && isNullFn x then
+          mkCast t x
+        else
+          unsupported at "conversion from '${showType x.type}' to '${showType t}'"
+      )
+    else if
+      (isInteger t && isInteger x.type) || (isPtr t && isPtr x.type) || (isPtr t && isNullConst x)
+    then
       mkCast t x
     else
       fail at "incompatible conversion from '${showType x.type}' to '${showType t}'";
@@ -688,11 +741,13 @@ let
       condExpr env e
     else if k == "assign" then
       assignExpr env e
+    else if k == "comma" then
+      commaExpr env e
     else
       fail e "unexpected expression '${k}'";
 
   # Expression used for its value (void included): an array decays to a pointer to its
-  # first element, and a struct value is unsupported.
+  # first element, and struct, union and floating-point values are unsupported.
   valueOf =
     env: e:
     let
@@ -702,6 +757,8 @@ let
       mkCast (ptrTo x.type.of) x.expr
     else if isStruct x.type then
       unsupported e "struct value"
+    else if isFloat x.type then
+      unsupported e "floating-point value"
     else
       x;
 
@@ -713,6 +770,14 @@ let
     in
     if isVoid x.type then fail e "void value used" else x;
 
+  # The object of type t in memory at the data symbol sym (a file-scope variable or a
+  # static local), at its address known once every variable is placed.
+  objectAt =
+    ctx: e: t: sym:
+    node e "deref" t { expr = litAt e (ptrTo t) ctx.addrs.${sym}; };
+
+  # A name in env.vars is a local variable, or a block-scope `extern` or `static` variable
+  # ({ name; type; object; } with object its data symbol).
   identExpr =
     env: e:
     let
@@ -723,18 +788,18 @@ let
       let
         v = env.vars.${name};
       in
-      node e "var" v.type { var = v; }
+      if v ? object then objectAt ctx e v.type v.object else node e "var" v.type { var = v; }
     else if hasAttr name ctx.consts then
       litAt e ctx.consts.${name}.type ctx.consts.${name}.value
     else if hasAttr name ctx.globals then
-      # The object at the variable's address (known once every variable is placed).
-      node e "deref" ctx.globals.${name}.type {
-        expr = litAt e (ptrTo ctx.globals.${name}.type) ctx.addrs.${name};
-      }
+      objectAt ctx e ctx.globals.${name}.type name
     else if hasAttr name env.funcs then
       unsupported e "function '${name}' used as a value"
     else
       fail e "use of undeclared identifier '${name}'";
+
+  # Whether the signature f has a floating-point parameter or return value.
+  sigHasFloat = f: isFloat f.ret || any isFloat f.params;
 
   callExpr =
     env: e:
@@ -748,11 +813,19 @@ let
           a = elemAt e.args i;
         in
         assignConv a (elemAt f.params i) (rv env a);
+      objType = env.vars.${e.name}.type or env.ctx.globals.${e.name}.type or null;
     in
     if hasAttr e.name env.vars || hasAttr e.name env.ctx.globals || hasAttr e.name env.ctx.consts then
-      fail e "called object '${e.name}' is not a function"
+      if objType != null && isFnPtr objType then
+        unsupported e "call through the function pointer '${e.name}'"
+      else
+        fail e "called object '${e.name}' is not a function"
     else if !hasAttr e.name env.funcs then
       fail e "call to undeclared function '${e.name}'"
+    else if f.variadic then
+      unsupported e "call to the variadic function '${e.name}'"
+    else if sigHasFloat f then
+      unsupported e "call to a function with a floating-point parameter or return value"
     else if n != m then
       fail e "function '${e.name}' takes ${toString n} argument(s) but ${toString m} were given"
     else
@@ -773,6 +846,10 @@ let
       node e "cast" t { expr = x; }
     else if isVoid x.type then
       fail e.expr "void value used"
+    else if isFloat t then
+      unsupported e "conversion to '${showType t}'"
+    else if (isFnPtr t || isFnPtr x.type) && t != x.type && !(isFnPtr t && isNullFn x) then
+      unsupported e "cast from '${showType x.type}' to '${showType t}'"
     else
       mkCast t x;
 
@@ -803,6 +880,8 @@ let
     in
     if !isPtr p.type then
       fail at "indirection requires a pointer operand ('${showType p.type}' invalid)"
+    else if t.tag == "fn" then
+      unsupported at "dereference of a function pointer"
     else if isVoid t then
       fail at "dereference of a 'void *' pointer"
     else if isScalar t && sizeOf t == 8 then
@@ -874,7 +953,12 @@ let
     else if !hasAttr name layout.byName then
       fail at "no member named '${name}' in '${showType t}'"
     else
-      node at "deref" f.type { expr = addBytes at (ptrTo f.type) x.expr f.offset; };
+      node at "deref" f.type (
+        {
+          expr = addBytes at (ptrTo f.type) x.expr f.offset;
+        }
+        // (if f ? bitfield then { bitfield = true; } else { })
+      );
 
   arrowExpr =
     env: e:
@@ -892,7 +976,9 @@ let
     let
       x = ex env e.expr;
     in
-    if x.kind == "deref" then
+    if x ? bitfield then
+      fail e "address of a bit-field requested"
+    else if x.kind == "deref" then
       mkCast (ptrTo x.type) x.expr
     else if x.kind == "var" then
       unsupported e "address of a local variable"
@@ -904,9 +990,12 @@ let
   sizeofValue =
     env: n:
     let
-      t = if n.kind == "sizeoftype" then resolveType env n n.type else (ex env n.expr).type;
+      x = ex env n.expr;
+      t = if n.kind == "sizeoftype" then resolveType env n n.type else x.type;
     in
-    if isVoid t then
+    if n.kind == "sizeof" && x ? bitfield then
+      fail n "invalid application of 'sizeof' to a bit-field"
+    else if isVoid t then
       fail n "invalid application of 'sizeof' to a void type"
     else if !isComplete env.ctx t then
       fail n "invalid application of 'sizeof' to an incomplete type '${showType t}'"
@@ -1030,6 +1119,8 @@ let
         invalid
     else if op == "<<" || op == ">>" then
       if ints then shift else invalid
+    else if isFnPtr ta || isFnPtr tb then
+      fnPtrCmp at op a b
     else if ints then
       let
         t = usual ta tb;
@@ -1044,6 +1135,32 @@ let
     else
       invalid;
 
+  # `==` and `!=` (anything else is unsupported) where an operand is a function pointer:
+  # with the same type, or with a null pointer constant.
+  fnPtrCmp =
+    at: op: a: b:
+    let
+      ta = a.type;
+      tb = b.type;
+      cmp =
+        x: y:
+        node at "cmp" tInt {
+          inherit op;
+          lhs = x;
+          rhs = y;
+        };
+    in
+    if op != "==" && op != "!=" then
+      unsupported at "relational comparison of function pointers"
+    else if ta == tb then
+      cmp a b
+    else if isFnPtr ta && isNullFn b then
+      cmp a (mkCast ta b)
+    else if isNullFn a && isFnPtr tb then
+      cmp (mkCast tb a) b
+    else
+      unsupported at "comparison of '${showType ta}' and '${showType tb}'";
+
   # Typing of && and || on the typed operands a and b.
   typeLogical =
     at: op: a: b:
@@ -1057,12 +1174,20 @@ let
   binaryExpr =
     env: e:
     if e.op == "&&" || e.op == "||" then
-      if hasSideEffects e.rhs then
-        unsupported e "side effect on the right of '${e.op}'"
-      else
-        typeLogical e e.op (rv env e.lhs) (rv env e.rhs)
+      typeLogical e e.op (rv env e.lhs) (rv env e.rhs)
     else
       typeBinary env.ctx e e.op (rv env e.lhs) (rv env e.rhs);
+
+  # `a, b`: a for its side effects, then b, whose value and type the expression has.
+  commaExpr =
+    env: e:
+    let
+      b = valueOf env e.rhs;
+    in
+    node e "comma" b.type {
+      lhs = valueOf env e.lhs;
+      rhs = b;
+    };
 
   # ---- Integer constant expressions ----
   # constExpr hooks e: the expression node e (cc/parse.nix) evaluated at compile time to a
@@ -1161,6 +1286,8 @@ let
       fail e "array type '${showType x.type}' is not assignable"
     else if isStruct x.type then
       unsupported e "struct assignment"
+    else if isFloat x.type then
+      unsupported e "floating-point value"
     else if x.kind == "var" || x.kind == "deref" then
       x
     else
@@ -1320,15 +1447,45 @@ let
     else
       r.node;
 
+  # A block-scope declaration: local variables (the typed node's vars), static locals
+  # (statics, see staticVar), block-scope extern variables (externs, see externVar),
+  # function declarations, and struct, union and enum definitions, each in scope from its
+  # declarator on.
   declStmt =
     env: n:
     let
       step =
         acc: d:
-        if d.kind == "typedef" then
+        let
+          k = d.kind;
+          storage = d.storage or null;
+        in
+        if k == "typedef" then
           acc
-        else if hasAttr d.kind pendingDecls then
-          unsupported d pendingDecls.${d.kind}
+        else if k == "struct" || k == "union" then
+          withEnv acc (defineLocalStruct acc.env d)
+        else if k == "enum" then
+          withEnv acc (defineLocalEnum acc.env d)
+        else if k == "proto" then
+          withEnv acc (declareLocalFunc acc.env d)
+        else if storage == "extern" then
+          let
+            r = externVar acc.env d;
+          in
+          acc
+          // {
+            inherit (r) env;
+            externs = acc.externs ++ [ r.extern ];
+          }
+        else if storage == "static" then
+          let
+            r = staticVar acc.env d;
+          in
+          acc
+          // {
+            inherit (r) env;
+            statics = acc.statics ++ [ r.static ];
+          }
         else
           let
             t = resolveType acc.env d d.type;
@@ -1340,8 +1497,11 @@ let
             unsupported d "local array"
           else if isStruct t then
             unsupported d "local struct variable"
+          else if isFloat t then
+            unsupported d "floating-point variable"
           else
-            {
+            acc
+            // {
               inherit (r) env;
               vars = acc.vars ++ [
                 {
@@ -1353,19 +1513,247 @@ let
       r = foldl' step {
         inherit env;
         vars = [ ];
+        statics = [ ];
+        externs = [ ];
       } n.decls;
     in
     {
       node =
-        if r.vars == [ ] then
+        if r.vars == [ ] && r.statics == [ ] && r.externs == [ ] then
           null
         else
           {
             kind = "decl";
             inherit (r) vars;
             inherit (n) line col;
-          };
+          }
+          // (if r.statics == [ ] then { } else { inherit (r) statics; })
+          // (if r.externs == [ ] then { } else { inherit (r) externs; });
       inherit (r) env;
+    };
+
+  # acc with the env e, which is forced so that its declaration is checked even when
+  # nothing reads it.
+  withEnv = acc: e: builtins.seq e (acc // { env = e; });
+
+  # Fails unless name is new in the innermost block of env.
+  checkLocal =
+    env: at: name:
+    !(hasAttr name env.local) || fail at "redefinition of '${name}'";
+
+  # env with name bound to the object of type t at the data symbol sym (see identExpr).
+  bindObject =
+    env: name: t: sym:
+    env
+    // {
+      vars = env.vars // {
+        ${name} = {
+          inherit name;
+          type = t;
+          object = sym;
+        };
+      };
+      local = env.local // {
+        ${name} = true;
+      };
+    };
+
+  # A block-scope `extern` variable: the file-scope variable of the same name, which must
+  # be defined in the input with a compatible type (checked at the end, see checkWith).
+  # -> { env; extern = { name; type; line; col; }; }
+  externVar =
+    env: d:
+    let
+      name = d.name;
+      t = resolveType env d d.type;
+      prev = env.ctx.globals.${name} or null;
+      type = if prev != null && isComplete env.ctx prev.type then prev.type else t;
+    in
+    builtins.seq (checkLocal env d name) (
+      if isVoid t then
+        fail d "variable '${name}' has type 'void'"
+      else if hasAttr name env.funcs then
+        fail d "redefinition of '${name}' as a different kind of symbol"
+      else if prev != null && !compatible prev.type t then
+        fail d "redeclaration of '${name}' with a different type"
+      else
+        builtins.deepSeq t {
+          env = bindObject env name type name;
+          extern = {
+            inherit name;
+            type = t;
+            inherit (d) line col;
+          };
+        }
+    );
+
+  # A static local: a variable at a fixed address in the data, placed after the file-scope
+  # variables (see checkItems), with the data symbol `<function>'<name>'<line>'<col>`
+  # (not a C identifier). Its type and initializer follow the rules of file-scope
+  # variables. -> { env; static = { sym; size; align; line; col; writesAt; }; } with
+  # writesAt the initial stores at a given address.
+  staticVar =
+    env: d:
+    let
+      name = d.name;
+      sym = "${env.fn}'${name}'${toString d.line}'${toString d.col}";
+      t0 = resolveType env d d.type;
+      # The initializer sees the variable itself.
+      env' = bindObject env name t sym;
+      t = sizedType env' d t0;
+    in
+    builtins.seq (checkLocal env d name) (
+      if isVoid t0 then
+        fail d "variable '${name}' has type 'void'"
+      else if hasLLong t0 then
+        unsupported d "8-byte integer in a static variable"
+      else if hasFloat t0 then
+        unsupported d "floating-point variable"
+      else if isArray t && t.len == null then
+        unsupported d "array '${name}' without a length"
+      else if !isComplete env.ctx t then
+        fail d "variable '${name}' has incomplete type '${showType t}'"
+      else
+        builtins.deepSeq t {
+          env = env';
+          static = {
+            inherit sym;
+            size = sizeOfT env.ctx t;
+            align = alignOfT env.ctx t;
+            inherit (d) line col;
+            writesAt = addr: if d.init == null then [ ] else initWrites env' t addr d.init;
+          };
+        }
+    );
+
+  # A block-scope function declaration: the function of the same name in the translation
+  # unit, in scope to the end of the block. Its calls are checked against the file-scope
+  # declarations at the end (see checkWith).
+  declareLocalFunc =
+    env: d:
+    let
+      name = d.name;
+      sig = sigOf env d;
+      prev = env.funcs.${name} or null;
+    in
+    if env.local.${name} or "function" != "function" || hasAttr name env.ctx.globals then
+      fail d "redefinition of '${name}' as a different kind of symbol"
+    else if prev != null && !sameSig prev sig then
+      fail d "conflicting types for '${name}'"
+    else
+      builtins.deepSeq sig (
+        env
+        // {
+          funcs = env.funcs // {
+            ${name} = sig // {
+              defined = prev != null && prev.defined;
+            };
+          };
+          vars = removeAttrs env.vars [ name ];
+          local = env.local // {
+            ${name} = "function";
+          };
+          ctx = env.ctx // {
+            consts = removeAttrs env.ctx.consts [ name ];
+          };
+        }
+      );
+
+  # The tag key in env.local of a block-scope struct, union or enum tag (not an
+  # identifier, so it does not clash with ordinary names).
+  tagKey = name: "tag ${name}";
+
+  # The internal name of a block-scope tag defined at the node n: the tag with its
+  # position, unique in the translation unit.
+  localTagName = n: "${n.name}@${toString n.line}:${toString n.col}";
+
+  # env with the tag of the definition n bound to the internal name.
+  bindTag =
+    env: n: internal:
+    if hasAttr (tagKey n.name) env.local then
+      fail n "redefinition of '${n.kind} ${n.name}'"
+    else
+      env
+      // {
+        local = env.local // {
+          ${tagKey n.name} = true;
+        };
+        ctx = env.ctx // {
+          tags = env.ctx.tags // {
+            ${n.name} = internal;
+          };
+        };
+      };
+
+  # A block-scope struct or union definition: its tag hides an outer one up to the end of
+  # the block. The tag is in scope in its own members.
+  defineLocalStruct =
+    env: n:
+    let
+      internal = localTagName n;
+      env1 = bindTag env n internal;
+      layout = structLayout env1 n;
+    in
+    builtins.deepSeq layout (
+      env1
+      // {
+        ctx = env1.ctx // {
+          structs = env1.ctx.structs // {
+            ${internal} = layout;
+          };
+        };
+      }
+    );
+
+  # A block-scope enum definition: its enumerators (int constants, as at file scope) and
+  # its tag hide outer ones up to the end of the block.
+  defineLocalEnum =
+    env: n:
+    let
+      internal = localTagName n;
+      step =
+        st: c:
+        let
+          e = st.env;
+          v = if c.value == null then st.next else (constExpr (hooksOf e) c.value).value;
+        in
+        builtins.seq (checkLocal e c c.name) (
+          if v < s32.lo || v > s32.hi then
+            unsupported c "enumerator value ${toString v} outside the range of int"
+          else
+            {
+              env = e // {
+                vars = removeAttrs e.vars [ c.name ];
+                local = e.local // {
+                  ${c.name} = true;
+                };
+                ctx = e.ctx // {
+                  consts = e.ctx.consts // {
+                    ${c.name} = {
+                      type = tInt;
+                      value = v;
+                    };
+                  };
+                };
+              };
+              next = v + 1;
+              negative = st.negative || v < 0;
+            }
+        );
+      r = foldl' step {
+        inherit env;
+        next = 0;
+        negative = false;
+      } n.consts;
+      env1 = bindTag r.env n internal;
+    in
+    env1
+    // {
+      ctx = env1.ctx // {
+        enums = env1.ctx.enums // {
+          ${internal} = if r.negative then tInt else tUInt;
+        };
+      };
     };
 
   forStmt =
@@ -1379,7 +1767,10 @@ let
             env = fenv;
           }
         else if n.init.kind == "decl" then
-          declStmt fenv n.init
+          if any (d: d.kind == "proto" || (d.storage or null) != null) n.init.decls then
+            fail n.init "declaration of a non-local variable in a 'for' loop"
+          else
+            declStmt fenv n.init
         else
           {
             node = {
@@ -1542,7 +1933,8 @@ let
   # ---- Type resolution ----
 
   # The parsed type t resolved in env (see the header): array lengths evaluated, enum types
-  # replaced by their compatible integer type.
+  # replaced by their compatible integer type, the tags of block-scope definitions by their
+  # internal names, and function types resolved with their parameters adjusted.
   resolveType =
     env: at: t:
     if t.tag == "ptr" then
@@ -1550,7 +1942,43 @@ let
     else if t.tag == "array" then
       resolveArray env at t
     else if t.tag == "enum" then
-      env.ctx.enums.${t.name} or (fail at "incomplete enum type 'enum ${t.name}'")
+      env.ctx.enums.${tagName env t} or (fail at "incomplete enum type 'enum ${t.name}'")
+    else if isStruct t then
+      resolveRecord env at t
+    else if t.tag == "fn" then
+      {
+        tag = "fn";
+        ret = resolveType env at t.ret;
+        params = map (p: adjustParam (resolveType env p p.type)) t.params;
+        inherit (t) variadic;
+      }
+    else
+      t;
+
+  # The name a struct, union or enum tag stands for in env.
+  tagName = env: t: env.ctx.tags.${t.name} or t.name;
+
+  resolveRecord =
+    env: at: t:
+    let
+      name = tagName env t;
+      layout = env.ctx.structs.${name} or null;
+    in
+    if layout != null && layout.kind != t.tag then
+      fail at "use of '${t.name}' with tag type that does not match previous declaration"
+    else if name == t.name then
+      t
+    else
+      t // { inherit name; };
+
+  # A parameter of array type is a pointer to its element, and one of function type a
+  # pointer to the function.
+  adjustParam =
+    t:
+    if isArray t then
+      ptrTo t.of
+    else if t.tag == "fn" then
+      ptrTo t
     else
       t;
 
@@ -1583,7 +2011,7 @@ let
   # ---- Functions ----
 
   # Signature of a proto or func: the resolved return and parameter types, with parameter
-  # arrays adjusted to pointers.
+  # arrays and functions adjusted to pointers (adjustParam), and whether it is variadic.
   sigOf =
     env: item:
     let
@@ -1593,12 +2021,7 @@ let
         let
           t = resolveType env p p.type;
         in
-        if isArray t then
-          ptrTo t.of
-        else if isStruct t then
-          unsupported p "struct parameter passed by value"
-        else
-          t;
+        if isStruct t then unsupported p "struct parameter passed by value" else adjustParam t;
     in
     if isArray ret then
       fail item "function cannot return array type '${showType ret}'"
@@ -1608,7 +2031,10 @@ let
       {
         inherit ret;
         params = map param item.params;
+        variadic = item.variadic or false;
       };
+
+  sameSig = a: b: a.ret == b.ret && a.params == b.params && a.variadic == b.variadic;
 
   funcDef =
     env: sig: f:
@@ -1626,25 +2052,29 @@ let
       ps = foldl' step {
         env = env // {
           inherit (sig) ret;
+          fn = f.name;
         };
         vars = [ ];
       } (genList (i: i) (length f.params));
       items = blockItems ps.env f.body.items;
     in
-    {
-      inherit (f)
-        name
-        line
-        col
-        ;
-      inherit (sig) ret;
-      params = ps.vars;
-      body = {
-        kind = "block";
-        inherit items;
-        inherit (f.body) line col;
+    if sigHasFloat sig then
+      unsupported f "definition of a function with a floating-point parameter or return value"
+    else
+      {
+        inherit (f)
+          name
+          line
+          col
+          ;
+        inherit (sig) ret;
+        params = ps.vars;
+        body = {
+          kind = "block";
+          inherit items;
+          inherit (f.body) line col;
+        };
       };
-    };
 
   # ---- File scope ----
   # The items are checked in order with the accumulator
@@ -1662,6 +2092,7 @@ let
     vars = { };
     local = { };
     ret = null;
+    fn = null;
     jumps = {
       break = false;
       continue = false;
@@ -1698,7 +2129,7 @@ let
     in
     if k == "typedef" then
       acc
-    else if k == "struct" then
+    else if k == "struct" || k == "union" then
       defineStruct acc item
     else if k == "enum" then
       defineEnum acc item
@@ -1721,7 +2152,7 @@ let
       };
     in
     builtins.seq (checkKind acc item item.name "function") (
-      if prev != null && (prev.ret != sig.ret || prev.params != sig.params) then
+      if prev != null && !sameSig prev sig then
         fail item "conflicting types for '${item.name}'"
       else if isDef && prev != null && prev.defined then
         fail item "redefinition of '${item.name}'"
@@ -1743,7 +2174,7 @@ let
       layout = structLayout (fileEnv acc) n;
     in
     if hasAttr n.name acc.ctx.structs then
-      fail n "redefinition of 'struct ${n.name}'"
+      fail n "redefinition of '${n.kind} ${n.name}'"
     else
       builtins.deepSeq layout (
         withCtx acc {
@@ -1753,22 +2184,38 @@ let
         }
       );
 
-  # Members at increasing offsets, each aligned for its type; the struct aligns to its most
-  # aligned member and its size is padded to a multiple of that.
+  # The layout of the struct or union definition n, as clang's ilp32 ABI lays it out. A
+  # struct has its members at increasing offsets, each aligned for its type; a union has
+  # every member at offset 0. Either aligns to its most aligned member and its size is
+  # padded to a multiple of that. A packed one aligns every member, and itself, to 1.
+  # Bit-fields: see bitField.
   structLayout =
     env: n:
     let
       inherit (env) ctx;
+      isUnion = n.kind == "union";
+      packed = n.packed or false;
       step =
         acc: f:
         let
           t = resolveType env f f.type;
-          a = alignOfT ctx t;
+          isBit = (f.width or null) != null;
+          bit = bitField env acc f t;
+          a = if packed then 1 else alignOfT ctx t;
+          type = if isBit then bit.type else t;
+          offset =
+            if isUnion then
+              0
+            else if isBit then
+              acc.size
+            else
+              alignUp acc.size a;
           field = {
             inherit (f) name;
-            type = t;
-            offset = alignUp acc.size a;
-          };
+            inherit type offset;
+          }
+          // (if isBit then { bitfield = true; } else { });
+          end = offset + sizeOfT ctx type;
         in
         if hasAttr f.name acc.byName then
           fail f "duplicate member '${f.name}'"
@@ -1778,23 +2225,103 @@ let
           fail f "field '${f.name}' has incomplete type '${showType t}'"
         else if hasLLong t then
           unsupported f "8-byte integer in a struct"
+        else if isBit && isUnion then
+          unsupported f "bit-field in a union"
+        else if !isBit && acc.run != 0 then
+          unsupported acc.runAt "bit-fields that do not fill their declared type"
         else
           {
-            size = field.offset + sizeOfT ctx t;
+            size = if isUnion && acc.size > end then acc.size else end;
             align = if a > acc.align then a else acc.align;
             fields = acc.fields ++ [ field ];
             byName = acc.byName // {
               ${f.name} = field;
             };
+            run = if isBit then bit.run else 0;
+            runType = if isBit then t else null;
+            runAt = f;
           };
       r = foldl' step {
         size = 0;
         align = 1;
         fields = [ ];
         byName = { };
+        run = 0;
+        runType = null;
+        runAt = null;
       } n.members;
     in
-    r // { size = alignUp r.size r.align; };
+    if r.run != 0 then
+      unsupported r.runAt "bit-fields that do not fill their declared type"
+    else
+      {
+        inherit (n) kind;
+        inherit (r) align fields byName;
+        size = alignUp r.size r.align;
+      };
+
+  # The bit-field f of the declared type t (resolved), placed after the members in acc (see
+  # structLayout). Only named bit-fields of an unsigned type (not plain char, not an enum)
+  # whose width w is 8, 16 or 32 are supported, each starting at a multiple of w bits, where
+  # consecutive bit-fields of the same declared type fill it exactly (acc.run counts the
+  # bits filled so far). Such a bit-field lies where clang places it, and it is read and
+  # written as an unsigned member of w bits (as t when w is 32); its declared type gives the
+  # alignment of the struct. -> { type; run; }
+  bitField =
+    env: acc: f: t:
+    let
+      w = (constExpr (hooksOf env) f.width).value;
+      bits = 8 * sizeOf t;
+      prev = if acc.runType == t then acc.run else 0;
+      used = prev + w;
+    in
+    if f.type.tag == "enum" then
+      unsupported f "bit-field of enum type"
+    else if !isInteger t then
+      fail f "bit-field '${f.name}' has non-integral type '${showType t}'"
+    else
+      builtins.seq w (
+        if
+          !elem t.tag [
+            "uchar"
+            "ushort"
+            "uint"
+            "ulong"
+          ]
+        then
+          unsupported f "bit-field of type '${showType t}'"
+        else if w < 0 then
+          fail f.width "bit-field '${f.name}' has negative width"
+        else if w > bits then
+          fail f.width "width of bit-field '${f.name}' exceeds its type"
+        else if w == 0 then
+          fail f.width "named bit-field '${f.name}' has zero width"
+        else if
+          !elem w [
+            8
+            16
+            32
+          ]
+        then
+          unsupported f.width "bit-field of width ${toString w}"
+        else if acc.run != 0 && acc.runType != t then
+          unsupported acc.runAt "bit-fields that do not fill their declared type"
+        else if bitAnd acc.size (div w 8 - 1) != 0 then
+          unsupported f "bit-field that does not start at a multiple of its width"
+        else if used > bits then
+          unsupported f "bit-fields that do not fill their declared type"
+        else
+          {
+            type =
+              if w == 32 then
+                t
+              else if w == 16 then
+                ty "ushort"
+              else
+                ty "uchar";
+            run = if used == bits then 0 else used;
+          }
+      );
 
   # Enumerators are int constants: the given value, or one more than the previous one (0
   # for the first). Each is in scope from the next one on.
@@ -1869,6 +2396,8 @@ let
         fail g "variable '${name}' has type 'void'"
       else if hasLLong t then
         unsupported g "8-byte integer in a global variable"
+      else if isDef && hasFloat t then
+        unsupported g "floating-point variable"
       else if prev != null && !compatible prev.type t then
         fail g "redefinition of '${name}' with a different type"
       else if !isDef then
@@ -1991,7 +2520,18 @@ let
       };
 
   # Number of slots of the aggregate type t; null for an array without a length.
-  slotCount = ctx: t: if isArray t then t.len else length ctx.structs.${t.name}.fields;
+  # A union takes one initializer, for its first member.
+  slotCount =
+    ctx: t:
+    let
+      layout = ctx.structs.${t.name};
+    in
+    if isArray t then
+      t.len
+    else if layout.kind == "union" then
+      1
+    else
+      length layout.fields;
 
   # The items from index i0 assigned to the slots of t at address a in order. A nested
   # aggregate takes a braced list, or without braces as many items as it has slots.
@@ -2052,11 +2592,14 @@ let
       size = sizeOf t;
       v = if isInteger t then (mkCast t (constExpr (hooksOf env) x)).value else constAddress env t x;
     in
-    {
-      addr = a;
-      inherit size;
-      value = bitAnd v (B.pow2 (8 * size) - 1);
-    };
+    if isFloat t then
+      unsupported x "floating-point initializer"
+    else
+      {
+        addr = a;
+        inherit size;
+        value = bitAnd v (B.pow2 (8 * size) - 1);
+      };
 
   constAddress =
     env: t: x:
@@ -2069,6 +2612,54 @@ let
 
   defaultDataBase = 4194304; # 0x00400000
 
+  # The field (statics or externs) of the block-scope declarations in the statement n
+  # and the statements in it, in source order. Only statements are walked: their structure
+  # does not depend on the addresses of the data, which the statics determine.
+  declsIn =
+    field: n:
+    let
+      k = kindOf n;
+      sub = declsIn field;
+    in
+    if k == "block" then
+      concatMap sub n.items
+    else if k == "decl" then
+      n.${field} or [ ]
+    else if k == "if" then
+      sub n.thenStmt ++ sub n.elseStmt
+    else if k == "while" || k == "do" then
+      sub n.body
+    else if k == "for" then
+      sub n.init ++ sub n.body
+    else if k == "switch" then
+      concatMap sub (n.skipped ++ concatLists n.sections)
+    else
+      [ ];
+
+  # The objects acc.objects followed by the static locals of the functions defs in source
+  # order, each at the next offset aligned for it. -> { size; objects; }
+  placeStatics =
+    dataBase: acc: defs:
+    foldl' (
+      st: o:
+      let
+        offset = alignUp st.size o.align;
+        addr = dataBase + offset;
+      in
+      {
+        size = offset + o.size;
+        objects = st.objects ++ [
+          {
+            name = o.sym;
+            inherit addr;
+            end = addr + o.size;
+            at = { inherit (o) line col; };
+            writes = o.writesAt addr;
+          }
+        ];
+      }
+    ) { inherit (acc) size objects; } (concatMap (f: declsIn "statics" f.body) defs);
+
   checkItems =
     dataBase: items:
     let
@@ -2080,29 +2671,50 @@ let
           enums = { };
           consts = { };
           globals = { };
+          tags = { };
           inherit addrs;
         };
         size = 0;
         objects = [ ];
       } items;
+      placed = placeStatics dataBase r r.defs;
       addrs = listToAttrs (
         map (o: {
           inherit (o) name;
           value = o.addr;
-        }) r.objects
+        }) placed.objects
       );
     in
-    r;
+    r // { inherit (placed) size objects; };
+
+  # Whether the block-scope extern x refers to a defined file-scope variable of the
+  # compatible type in the final context ctx: true, null when there is no definition, or
+  # false for another type.
+  externOk =
+    ctx: x:
+    let
+      g = ctx.globals.${x.name} or null;
+    in
+    if g == null || !g.defined then null else compatible g.type x.type;
 
   checkWith =
     { dataBase }:
     unit:
     let
       r = checkItems dataBase unit.items;
-      undefinedCalls = filter (c: !r.funcs.${c.name}.defined) (
-        collect (x: kindOf x == "call") (_: false) r.defs
-      );
+      calls = collect (x: kindOf x == "call") (_: false) r.defs;
+      undefinedCalls = filter (c: !(hasAttr c.name r.funcs) || !r.funcs.${c.name}.defined) calls;
+      # A call through a block-scope declaration that the file-scope one contradicts.
+      conflicts = filter (
+        c:
+        hasAttr c.name r.funcs
+        && (r.funcs.${c.name}.ret != c.type || r.funcs.${c.name}.params != map (a: a.type) c.args)
+      ) calls;
       externs = filter (n: !r.ctx.globals.${n}.defined) (attrNames r.ctx.globals);
+      blockExterns = filter (x: externOk r.ctx x != true) (
+        concatMap (f: declsIn "externs" f.body) r.defs
+      );
+      blockExtern = head blockExterns;
       # The first variable that ends above 2^32.
       overflow = head (filter (o: o.end > B.mask32 + 1) r.objects);
       extern = r.ctx.globals.${head externs};
@@ -2120,8 +2732,14 @@ let
       throw "cc: dataBase must be a multiple of 4 in 0..2^32-1"
     else if externs != [ ] then
       unsupported extern.at "extern variable '${head externs}' without a definition"
+    else if blockExterns != [ ] && externOk r.ctx blockExtern == null then
+      unsupported blockExtern "extern variable '${blockExtern.name}' without a definition"
+    else if blockExterns != [ ] then
+      fail blockExtern "redeclaration of '${blockExtern.name}' with a different type"
     else if dataBase + r.size > B.mask32 + 1 then
       fail overflow.at "the data does not fit below 2^32 from dataBase (variable '${overflow.name}')"
+    else if conflicts != [ ] then
+      fail (head conflicts) "conflicting types for '${(head conflicts).name}'"
     else if undefinedCalls != [ ] then
       unsupported (head undefinedCalls) "call to function '${(head undefinedCalls).name}' that is declared but not defined"
     else

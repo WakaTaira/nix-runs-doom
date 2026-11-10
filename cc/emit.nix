@@ -110,7 +110,10 @@
 #       entry test fails are emitted as without page reads, and so is a bulk form
 #       without them.
 #   - if/else becomes an attribute set of mem and the variables either branch changes,
-#     which the following code reads.
+#     which the following code reads. So does `a && b` or `a || b` whose b has side
+#     effects, with its result (a Nix boolean) in the field v' (`<sc>.v'`): b runs in the
+#     branch where a does not decide the result.
+#   - `a, b` emits a for its side effects, then b.
 #   - A statement completes normally or abruptly by return, break (to the innermost loop
 #     or switch) or continue (to the innermost loop). Functions, loops and if/else without
 #     return, break or continue in them are translated as above. Otherwise the code of a
@@ -166,7 +169,7 @@
 # with M, B, R, mem, wrapInt and the builtins the output uses. The attribute __data
 # cannot clash with a C function, since identifiers starting with `__` are reserved in C.
 # In the loop, join and switch sets a variable is its C name, with ' appended to mem and
-# exit; the generated fields st', ret' and done' contain a ', so they cannot clash. A
+# exit; the generated fields st', ret', done' and v' contain a ', so they cannot clash. A
 # variable declared in a switch body that hides one the sections assign is `<C name>'<n>`,
 # and a cached read is `g'<address>'<type tag>`.
 let
@@ -585,6 +588,12 @@ let
       call s e
     else if k == "assign" then
       assign s e true
+    else if k == "comma" then
+      let
+        l = effect s e.lhs;
+        r = expr l.s e.rhs;
+      in
+      r // { binds = l.binds ++ r.binds; }
     else
       throw "cc: internal error: unexpected expression '${k}'";
 
@@ -1013,6 +1022,8 @@ let
       )
     else if k == "not" then
       cond s e.expr (!negated)
+    else if (k == "logand" || k == "logor") && hasEffects e.rhs then
+      shortCircuit s e negated
     else if k == "logand" || k == "logor" then
       let
         l = cond s e.lhs negated;
@@ -1024,8 +1035,55 @@ let
         binds = l.binds ++ r.binds;
         c = if isAnd then infixL 8 "&&" l.c r.c else infixL 9 "||" l.c r.c;
       }
+    else if k == "comma" then
+      let
+        l = effect s e.lhs;
+        r = cond l.s e.rhs negated;
+      in
+      r // { binds = l.binds ++ r.binds; }
     else
       mapC (expr s e) (c: infixN 7 (if negated then "==" else "!=") c (num 0));
+
+  # `a && b` or `a || b` (the node e, negated when negated) whose right operand has side
+  # effects: b runs only when a does not decide the result. Like an if statement, the two
+  # ways end in a join set of mem, the variables and cached reads that b may change, and
+  # the result `v'` (a Nix boolean), which the code after it reads. -> { s; binds; c; }
+  shortCircuit =
+    s: e: negated:
+    let
+      l = cond s e.lhs negated;
+      s1 = l.s;
+      isAnd = (e.kind == "logand") != negated;
+      r = cond s1 e.rhs negated;
+      # Where the left operand alone decides: the result is its value.
+      decided = {
+        s = s1 // {
+          inherit (r.s) n bulkLoads;
+        };
+        binds = [ ];
+        c = atom (if isAnd then "false" else "true");
+      };
+      th = if isAnd then r else decided;
+      el = if isAnd then decided else r;
+      keys = joinKeys s1 (k: varCode r.s k != varCode s1 k);
+      memChanged = r.s.mem != s1.mem;
+      at = k: attrName s1.names.${k};
+      fields =
+        st:
+        (if memChanged then [ "mem = ${st.mem};" ] else [ ]) ++ map (k: "${at k} = ${varCode st k};") keys;
+      branch = x: renderLet x.binds "{ ${concatStringsSep " " (fields x.s ++ [ "v' = ${x.c.code};" ])} }";
+      f = fresh (s1 // { inherit (r.s) n bulkLoads; }) "sc";
+    in
+    {
+      s = joined f.s f.name memChanged keys at;
+      binds = l.binds ++ [
+        {
+          inherit (f) name;
+          code = "if ${l.c.code} then\n  ${indent (branch th)}\nelse\n  ${indent (branch el)}";
+        }
+      ];
+      c = atom "${f.name}.v'";
+    };
 
   # `c ? a : b`. The branches have no side effects (cc/check.nix), so they leave no
   # bindings and only the chosen one is evaluated.
@@ -1059,6 +1117,12 @@ let
           assign s e false
         else if e.kind == "cast" && T.isVoid e.type then
           effect s e.expr
+        else if e.kind == "comma" then
+          let
+            l = effect s e.lhs;
+            x = effect l.s e.rhs;
+          in
+          x // { binds = l.binds ++ x.binds; }
         else
           expr s e;
     in
@@ -1546,12 +1610,7 @@ let
           }
         else
           stmt (s1 // { inherit (th.s) n bulkLoads; }) n.elseStmt;
-      changed = k: varCode th.s k != varCode s1 k || varCode el.s k != varCode s1 k;
-      # The entries share their hits, so they join all together or not at all.
-      cacheKeys = map (c: c.key) s1.cached;
-      keys =
-        filter (k: !isCacheKey k && changed k) (attrNames s1.vars)
-        ++ (if any changed cacheKeys then cacheKeys else [ ]);
+      keys = joinKeys s1 (k: varCode th.s k != varCode s1 k || varCode el.s k != varCode s1 k);
       memChanged = th.s.mem != s1.mem || el.s.mem != s1.mem;
       at = k: attrName s1.names.${k};
       fields =
@@ -1590,6 +1649,16 @@ let
           }
         ];
       };
+
+  # The keys of the variables of s1 and of its cached reads that changed (a test on a key)
+  # tells to join. The entries share their hits, so they join all together or not at all.
+  joinKeys =
+    s1: changed:
+    let
+      cacheKeys = map (c: c.key) s1.cached;
+    in
+    filter (k: !isCacheKey k && changed k) (attrNames s1.vars)
+    ++ (if any changed cacheKeys then cacheKeys else [ ]);
 
   assignedKeys =
     x:
@@ -1893,6 +1962,8 @@ let
       go e.lhs ++ go e.rhs
     else if k == "logand" || k == "logor" then
       go e.lhs ++ maybe e.rhs
+    else if k == "comma" then
+      go e.lhs ++ go e.rhs
     else if k == "cond" then
       go e.cond ++ maybe e.thenExpr ++ maybe e.elseExpr
     else if k == "ptradd" then

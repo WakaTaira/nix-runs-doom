@@ -20,10 +20,13 @@
 # refers to element i - 1; the list is forced in order by foldl', so the recursion stays
 # shallow.
 #
+# An integer literal is decimal, hexadecimal (0x) or octal (a leading 0; `08` and `09` are
+# errors).
+#
 # Rejected here: preprocessor directives, string literals, character literals other than
 # the ones above (multi-character, octal and hex escapes, and the prefixes L, u and U, which
-# are recognized with the literal), floating-point and octal literals, and characters that
-# start no C token. Errors are thrown as "cc: <line>:<col>: <message>" ("unsupported: ..."
+# are recognized with the literal), floating-point literals, and characters that start no C
+# token. Errors are thrown as "cc: <line>:<col>: <message>" ("unsupported: ..."
 # for valid C outside the subset).
 let
   A = import ../lib/ascii.nix;
@@ -160,6 +163,8 @@ let
 
   # Value of a string of hex digits (at most 16, the first below 8 if 16).
   hexValue = s: foldl' (acc: c: acc * 16 + hexValues.${c}) 0 (chars s);
+  # Value of a string of octal digits (at most 21, so below 2^63).
+  octValue = s: foldl' (acc: c: acc * 8 + hexValues.${c}) 0 (chars s);
 
   stripZeros =
     s:
@@ -196,16 +201,32 @@ let
     line: col: text:
     let
       hex = match "0[xX]([0-9A-Fa-f]+)([0-9A-Za-z_]*)" text;
+      oct = match "0([0-7]+)([0-9A-Za-z_]*)" text;
       dec = match "(0|[1-9][0-9]*)([0-9A-Za-z_]*)" text;
-      parts = if hex != null then hex else dec;
+      parts =
+        if hex != null then
+          hex
+        else if oct != null then
+          oct
+        else
+          dec;
       body = if parts == null then "" else elemAt parts 0;
       suffix = if parts == null then null else parseSuffix (elemAt parts 1);
       sig = stripZeros body;
       tooLarge =
         if hex != null then
           stringLength sig > 16 || (stringLength sig == 16 && hexValues.${substring 0 1 sig} >= 8)
+        else if oct != null then
+          stringLength sig > 21
         else
           stringLength body > 19 || (stringLength body == 19 && body > maxInt64);
+      value =
+        if hex != null then
+          hexValue body
+        else if oct != null then
+          octValue sig
+        else
+          fromJSON body;
       isFloat =
         match ".*[.].*" text != null
         || (hex == null && match "[0-9]+[eE].*" text != null)
@@ -213,8 +234,8 @@ let
     in
     if isFloat then
       unsupported line col "floating-point literal '${text}'"
-    else if match "0[0-9]+.*" text != null then
-      unsupported line col "octal literal '${text}'"
+    else if hex == null && match "0[0-7]*[89].*" text != null then
+      fail line col "invalid digit in octal literal '${text}'"
     else if parts == null || suffix == null then
       fail line col "invalid integer literal '${text}'"
     else if tooLarge then
@@ -222,8 +243,12 @@ let
     else
       {
         kind = "int";
-        inherit text line col;
-        value = if hex != null then hexValue body else fromJSON body;
+        inherit
+          text
+          line
+          col
+          value
+          ;
         inherit (suffix) unsigned long;
       };
 
