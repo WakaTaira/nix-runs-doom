@@ -35,6 +35,10 @@ let
     in
     if b >= 128 then b - 256 else b;
 
+  # Signed 32-bit wrap of an int or long result: x modulo 2^32, in [-2^31, 2^31). The
+  # generated code keeps |x| <= 2^62, so x + 2^31 does not overflow.
+  wrapInt = x: bitAnd (x + 2147483648) 4294967295 - 2147483648;
+
   # Loop driver, shaped like `run` in lib/cpu.nix. `vars` holds every variable the
   # loop carries (always including mem). Each iteration runs `body` while `cond`
   # holds; `body` may set `exit = true` to leave after the current iteration.
@@ -71,5 +75,6 @@ in
     shlLL
     sraLL
     toS8
+    wrapInt
     ;
 }

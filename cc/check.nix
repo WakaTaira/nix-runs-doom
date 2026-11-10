@@ -3,7 +3,8 @@
 # Entry point: check : unit node -> { funcs = [ <typed function> ]; }, the function
 # definitions in source order. Errors are thrown as "cc: <line>:<col>: <message>", and as
 # "cc: <line>:<col>: unsupported: <what>" for valid C outside the supported subset.
-# `types` holds the type helpers shared with the emitter, and `collect` the tree walker.
+# `types` holds the type helpers shared with the emitter, `collect` the tree walker, and
+# `constExpr` / `noConstHooks` the integer constant expression evaluator (see there).
 #
 # Types are those of cc/parse.nix. Sizes and ranges follow clang's ilp32 ABI (char 1; int,
 # long and pointers 4; long long 8). Plain char is unsigned, as in clang's RISC-V ABI
@@ -13,7 +14,11 @@
 # -----------------
 # Every expression node has `kind`, `type`, `line` and `col`. Implicit conversions are
 # explicit "cast" nodes, a "cast" is present only where the types differ, and the
-# conversion of an integer constant is folded into the constant.
+# conversion of an integer constant is folded into the constant. Operators on integer
+# constants (unary, binary, comparisons, !, && and ||) are folded into a "lit" with the
+# value the generated code would compute (signed int and long wrap to 32 bits), except a
+# division by zero. A constant shift of a 32-bit value by a negative amount or by 32 or
+# more is unsupported.
 #   { kind = "lit"; value; }                     integer constant in the range of type
 #   { kind = "var"; var; }                       var = { key; name; type; }; key is unique
 #                                                per declaration
@@ -60,7 +65,10 @@ let
     any
     attrNames
     bitAnd
+    bitOr
+    bitXor
     concatMap
+    div
     elem
     elemAt
     filter
@@ -372,6 +380,114 @@ let
 
   isNullConst = x: x.kind == "lit" && x.value == 0 && isInteger x.type;
 
+  # ---- Constant folding ----
+  # Constants are folded with the values the generated code computes: signed int and long
+  # wrap to 32 bits, long long does not wrap (its overflow is undefined in C, and it fails
+  # the evaluation like in the generated code).
+
+  isIntLit = x: x.kind == "lit" && isInteger x.type;
+
+  litAt =
+    at: t: value:
+    node at "lit" t { inherit value; };
+
+  # x << k for a value x of the integer type t, or null when it is not folded (long long
+  # by 63 or more, whose product is not a Nix integer).
+  foldShl =
+    t: x: k:
+    if t.tag == "llong" then
+      (if k <= 62 then x * B.pow2 k else null)
+    else if isU32 t then
+      # Only the bits that stay below 2^32 are shifted, so the product fits.
+      bitAnd x (B.pow2 (32 - k) - 1) * B.pow2 k
+    else
+      wrapTo t (x * B.pow2 k);
+
+  # x >> k for a value x of the integer type t (arithmetic, floor, when t is signed).
+  foldShr =
+    t: x: k:
+    let
+      p = B.pow2 k;
+    in
+    if isUnsigned t then
+      div x p
+    else if k == 63 then
+      (if x < 0 then -1 else 0)
+    else
+      div (x - bitAnd x (p - 1)) p;
+
+  # Value of `a op b` for the constants a and b, where t is the type of the result (and of
+  # a and b, except the rhs of a shift), or null when it is not folded (division by zero,
+  # long long shifts outside 0..63, long long << 63).
+  foldBinary =
+    t: op: a: b:
+    let
+      d = div a b;
+    in
+    if op == "+" then
+      wrapTo t (a + b)
+    else if op == "-" then
+      wrapTo t (a - b)
+    else if op == "*" then
+      (if isU32 t then B.mul a b else wrapTo t (a * b))
+    else if op == "/" || op == "%" then
+      (if b == 0 then null else wrapTo t (if op == "/" then d else a - b * d))
+    else if op == "&" then
+      bitAnd a b
+    else if op == "|" then
+      bitOr a b
+    else if op == "^" then
+      bitXor a b
+    else if b < 0 || b > 63 then
+      null
+    else if op == "<<" then
+      foldShl t a b
+    else
+      foldShr t a b;
+
+  # The "binop" node n folded to a constant when both operands are constants.
+  foldBinop =
+    n:
+    let
+      v = foldBinary n.type n.op n.lhs.value n.rhs.value;
+    in
+    if isIntLit n.lhs && isIntLit n.rhs && v != null then litAt n n.type v else n;
+
+  cmpOps = {
+    "<" = a: b: a < b;
+    ">" = a: b: a > b;
+    "<=" = a: b: a <= b;
+    ">=" = a: b: a >= b;
+    "==" = a: b: a == b;
+    "!=" = a: b: a != b;
+  };
+  boolValue = b: if b then 1 else 0;
+
+  # The "cmp" node n folded when both operands are integer constants.
+  foldCmp =
+    n:
+    if isIntLit n.lhs && isIntLit n.rhs then
+      litAt n tInt (boolValue (cmpOps.${n.op} n.lhs.value n.rhs.value))
+    else
+      n;
+
+  # The "not", "logand" and "logor" node n folded when its operands are integer constants.
+  foldLogic =
+    n:
+    if n.kind == "not" then
+      (if isIntLit n.expr then litAt n tInt (boolValue (n.expr.value == 0)) else n)
+    else if isIntLit n.lhs && isIntLit n.rhs then
+      litAt n tInt (
+        boolValue (
+          if n.kind == "logand" then
+            n.lhs.value != 0 && n.rhs.value != 0
+          else
+            n.lhs.value != 0 || n.rhs.value != 0
+        )
+      )
+    else
+      n;
+
   # Conversion as by assignment (also for arguments and return values).
   assignConv =
     at: t: x:
@@ -484,22 +600,24 @@ let
     else
       mkCast e.type x;
 
-  unaryExpr =
-    env: e:
+  unaryExpr = env: e: typeUnary e e.op (rv env e.expr);
+
+  # Typing of the unary operator op (- ~ !) on the typed operand x.
+  typeUnary =
+    at: op: x:
     let
-      x = rv env e.expr;
       t = promote x.type;
       v = mkCast t x;
       folded = f: v // { value = wrapTo t (f v.value); };
     in
-    if e.op == "!" then
-      node e "not" tInt { expr = x; }
+    if op == "!" then
+      foldLogic (node at "not" tInt { expr = x; })
     else if !isInteger x.type then
-      fail e "invalid argument type '${showType x.type}' to unary '${e.op}'"
+      fail at "invalid argument type '${showType x.type}' to unary '${op}'"
     else if v.kind == "lit" then
-      folded (if e.op == "-" then (n: -n) else (n: -n - 1))
+      folded (if op == "-" then (n: -n) else (n: -n - 1))
     else
-      node e (if e.op == "-" then "neg" else "bnot") t { expr = v; };
+      node at (if op == "-" then "neg" else "bnot") t { expr = v; };
 
   derefOf =
     at: p:
@@ -550,18 +668,37 @@ let
       invalid = fail at "invalid operands to binary '${op}' ('${showType ta}' and '${showType tb}')";
       arith =
         t:
-        node at "binop" t {
-          inherit op;
-          lhs = mkCast t a;
-          rhs = mkCast t b;
-        };
+        foldBinop (
+          node at "binop" t {
+            inherit op;
+            lhs = mkCast t a;
+            rhs = mkCast t b;
+          }
+        );
       cmp =
         x: y:
-        node at "cmp" tInt {
-          inherit op;
-          lhs = x;
-          rhs = y;
-        };
+        foldCmp (
+          node at "cmp" tInt {
+            inherit op;
+            lhs = x;
+            rhs = y;
+          }
+        );
+      shift =
+        let
+          t = promote ta;
+          amount = mkCast (promote tb) b;
+        in
+        if amount.kind == "lit" && sizeOf t == 4 && (amount.value < 0 || amount.value >= 32) then
+          unsupported at "shift of a 32-bit value by ${toString amount.value}"
+        else
+          foldBinop (
+            node at "binop" t {
+              inherit op;
+              lhs = mkCast t a;
+              rhs = amount;
+            }
+          );
     in
     if
       elem op [
@@ -597,14 +734,7 @@ let
       else
         invalid
     else if op == "<<" || op == ">>" then
-      if ints then
-        node at "binop" (promote ta) {
-          inherit op;
-          lhs = mkCast (promote ta) a;
-          rhs = mkCast (promote tb) b;
-        }
-      else
-        invalid
+      if ints then shift else invalid
     else if ints then
       let
         t = usual ta tb;
@@ -619,18 +749,111 @@ let
     else
       invalid;
 
+  # Typing of && and || on the typed operands a and b.
+  typeLogical =
+    at: op: a: b:
+    foldLogic (
+      node at (if op == "&&" then "logand" else "logor") tInt {
+        lhs = a;
+        rhs = b;
+      }
+    );
+
   binaryExpr =
     env: e:
     if e.op == "&&" || e.op == "||" then
       if hasSideEffects e.rhs then
         unsupported e "side effect on the right of '${e.op}'"
       else
-        node e (if e.op == "&&" then "logand" else "logor") tInt {
-          lhs = rv env e.lhs;
-          rhs = rv env e.rhs;
-        }
+        typeLogical e e.op (rv env e.lhs) (rv env e.rhs)
     else
       typeBinary e e.op (rv env e.lhs) (rv env e.rhs);
+
+  # ---- Integer constant expressions ----
+  # constExpr hooks e: the expression node e (cc/parse.nix) evaluated at compile time to a
+  # typed "lit" node of an integer type, with the types, conversions and wrapping of the
+  # typed tree (the same folding as above). It accepts literals, character literals, casts
+  # to integer types, unary and binary operators and `?:`; anything else is not a constant
+  # expression and fails. hooks supplies the leaves the checker does not know by itself:
+  #   ident  : name -> { type; value; } or null   a named constant (enum constant)
+  #   sizeOf : node -> integer or null            size in bytes for a "sizeof" or
+  #                                               "sizeoftype" node (type unsigned int)
+  # A null answer leaves the leaf unsupported or not constant. noConstHooks has none.
+  noConstHooks = {
+    ident = _: null;
+    sizeOf = _: null;
+  };
+
+  constExpr =
+    hooks: e:
+    let
+      x = constTyped hooks e;
+    in
+    if isIntLit x then x else fail e "expression is not an integer constant expression";
+
+  # e typed by the constant rules; the result is a "lit" node unless e is not constant.
+  constTyped =
+    hooks: e:
+    let
+      k = e.kind;
+      sub = constTyped hooks;
+      notConst = fail e "expression is not an integer constant expression";
+    in
+    if k == "intlit" then
+      litAt e (litType e) e.value
+    else if k == "charlit" then
+      litAt e tInt e.value
+    else if k == "ident" then
+      constIdent hooks e
+    else if k == "sizeof" || k == "sizeoftype" then
+      constSizeof hooks e
+    else if k == "cast" then
+      constCast e (sub e.expr)
+    else if k == "unary" then
+      typeUnary e e.op (sub e.expr)
+    else if k == "binary" then
+      (if e.op == "&&" || e.op == "||" then typeLogical else typeBinary) e e.op (sub e.lhs) (sub e.rhs)
+    else if k == "cond" then
+      constCond e (sub e.cond) (sub e.thenExpr) (sub e.elseExpr)
+    else
+      notConst;
+
+  constIdent =
+    hooks: e:
+    let
+      c = hooks.ident e.name;
+    in
+    if c == null then
+      fail e "expression is not an integer constant expression"
+    else
+      litAt e c.type c.value;
+
+  constSizeof =
+    hooks: e:
+    let
+      size = hooks.sizeOf e;
+    in
+    if size == null then unsupported e "sizeof" else litAt e tUInt size;
+
+  constCast =
+    e: x:
+    if pendingType e.type != null then
+      unsupported e (pendingType e.type)
+    else if !isInteger e.type || !isIntLit x then
+      fail e "expression is not an integer constant expression"
+    else
+      mkCast e.type x;
+
+  # `c ? a : b` on constants: the chosen operand converted to the common type.
+  constCond =
+    e: c: a: b:
+    if !(isIntLit c && isIntLit a && isIntLit b) then
+      fail e "expression is not an integer constant expression"
+    else
+      let
+        t = usual a.type b.type;
+      in
+      mkCast t (if c.value != 0 then a else b) // { inherit (e) line col; };
 
   lvalue =
     env: e:
@@ -1017,5 +1240,11 @@ let
       builtins.deepSeq result result;
 in
 {
-  inherit check types collect;
+  inherit
+    check
+    types
+    collect
+    constExpr
+    noConstHooks
+    ;
 }

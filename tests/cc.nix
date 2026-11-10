@@ -5,6 +5,7 @@
 let
   Lx = import ../cc/lex.nix;
   P = import ../cc/parse.nix;
+  Ch = import ../cc/check.nix;
   Cc = import ../cc;
   B = import ../lib/bits.nix;
   M = import ../lib/mem.nix;
@@ -357,6 +358,68 @@ let
     void put(int *p, int v) { *p = v; }
     int putBoth(int *p) { put(p, 5); put(p + 1, -6); return p[0] + p[1]; }
   '';
+
+  # ---- Signed 32-bit wrapping and constant expressions ----
+
+  intMax = 2147483647;
+  intMin = -2147483648;
+
+  wrapSrc = ''
+    int add(int a, int b) { return a + b; }
+    int sub(int a, int b) { return a - b; }
+    int mul(int a, int b) { return a * b; }
+    int quot(int a, int b) { return a / b; }
+    int rem(int a, int b) { return a % b; }
+    int negate(int a) { return -a; }
+    int shl24(int x) { return x << 24; }
+    int postInc(int i) { int j = i++; return i; }
+    int incMem(int *p) { (*p)++; return *p; }
+    int mix(int a, int b, int c, int d) { return a + b * c - d; }
+    int mixWrapped(int a, int b, int c, int d) { int t = b * c; t = a + t; t = t - d; return t; }
+    int mul3(int a, int b, int c) { return a * b * c; }
+    int diffMul(int a, int b, int c) { return (a - b) * c; }
+    int index30(int *p, int x) { return p[x << 30]; }
+    int folded(void) { return 2147483647 + 1; }
+    long long wide(long long a) { return a + 1; }
+  '';
+  wrapRet = fn: args: ret wrapSrc fn args;
+
+  # Number of wrapInt applications in the compiled src.
+  wrapCount = src: length (filter isList (builtins.split "wrapInt \\(" (Cc.compile src)));
+
+  # A constant expression evaluated in the scope of exprOf, as { type; value; }.
+  constWith =
+    hooks: e:
+    let
+      x = Ch.constExpr hooks (exprOf e);
+    in
+    {
+      type = x.type.tag;
+      inherit (x) value;
+    };
+  constOf = constWith Ch.noConstHooks;
+  constThrows =
+    e:
+    !(tryEval (
+      let
+        x = constOf e;
+      in
+      builtins.deepSeq x x
+    )).success;
+  constHooks = {
+    ident =
+      name:
+      if name == "RED" then
+        {
+          type = {
+            tag = "int";
+          };
+          value = 5;
+        }
+      else
+        null;
+    sizeOf = n: if n.kind == "sizeoftype" && n.type.tag == "int" then 4 else null;
+  };
 
   fixmulSrc = import ../cc/examples/spike.nix;
   fixmul =
@@ -1054,6 +1117,372 @@ in
   (t "cc run: FixedMul -3.0 * 2.0" (fixmul (-196608) 131072) (B.u32 (-393216)))
   (t "cc run: FixedMul -1 * 1 floors to -1" (fixmul (-1) 1) 4294967295)
   (t "cc run: FixedMul INT_MAX * INT_MAX" (fixmul 2147483647 2147483647) 4294901760)
+
+  # Signed 32-bit wrapping (expected values: C with -fwrapv, 32-bit two's complement)
+  (t "cc run: INT_MAX + 1 wraps" (wrapRet "add" [
+    intMax
+    1
+  ]) intMin)
+  (t "cc run: INT_MIN - 1 wraps" (wrapRet "sub" [
+    intMin
+    1
+  ]) intMax)
+  (t "cc run: INT_MIN / -1 is INT_MIN" (wrapRet "quot" [
+    intMin
+    (-1)
+  ]) intMin)
+  (t "cc run: 7 / -1 is -7" (wrapRet "quot" [
+    7
+    (-1)
+  ]) (-7))
+  (t "cc run: INT_MIN % -1 is 0" (wrapRet "rem" [
+    intMin
+    (-1)
+  ]) 0)
+  (t "cc run: 200 << 24 wraps" (wrapRet "shl24" [ 200 ]) (-939524096))
+  (t "cc run: 46341 * 46341 wraps" (wrapRet "mul" [
+    46341
+    46341
+  ]) (-2147479015))
+  (t "cc run: -INT_MIN is INT_MIN" (wrapRet "negate" [ intMin ]) intMin)
+  (t "cc run: i++ past INT_MAX wraps" (wrapRet "postInc" [ intMax ]) intMin)
+  (t "cc run: ++ on memory past INT_MAX wraps"
+    (
+      let
+        r = callWith (wordsAt [ intMax ]) wrapSrc "incMem" [ 4096 ];
+      in
+      {
+        inherit (r) ret;
+        word = M.loadWord r.mem 4096;
+      }
+    )
+    {
+      ret = intMin;
+      word = 2147483648;
+    }
+  )
+  (t "cc run: a + b * c - d unwrapped in between equals wrapping every step"
+    (map
+      (args: [
+        (wrapRet "mix" args)
+        (wrapRet "mixWrapped" args)
+      ])
+      [
+        [
+          intMax
+          65536
+          65536
+          (-5)
+        ]
+        [
+          intMin
+          46341
+          (-46341)
+          intMax
+        ]
+      ]
+    )
+    [
+      [
+        (-2147483644)
+        (-2147483644)
+      ]
+      [
+        2147479016
+        2147479016
+      ]
+    ]
+  )
+  (t "cc run: a * b * c past the bound wraps in between"
+    (map (wrapRet "mul3") [
+      [
+        65537
+        65537
+        65537
+      ]
+      [
+        (-2147483647)
+        intMax
+        3
+      ]
+      [
+        intMin
+        intMin
+        intMin
+      ]
+    ])
+    [
+      196609
+      (-3)
+      0
+    ]
+  )
+  (t "cc run: (a - b) * c past the bound wraps in between" (wrapRet "diffMul" [
+    intMax
+    intMin
+    intMax
+  ]) (-2147483647))
+  (t "cc run: INT_MIN * INT_MIN at run time is 0" (wrapRet "mul" [
+    intMin
+    intMin
+  ]) 0)
+  (t "cc run: index x << 30 is wrapped (x = 2^30 reads p[0])" ((callWith
+    (wordsAt [
+      77
+      88
+    ])
+    wrapSrc
+    "index30"
+    [
+      4096
+      1073741824
+    ]
+  ).ret
+  ) 77)
+  (t "cc run: long long does not wrap" (wrapRet "wide" [ intMax ]) 2147483648)
+  (t "cc run: a constant expression folds with wrapping" (wrapRet "folded" [ ]) intMin)
+
+  # Where wrapInt is applied (generated code)
+  (t "cc compile: wrapInt is bound once at the top" (length (
+    filter isList (builtins.split "inherit \\(R\\) wrapInt;" Cc.examples.spike.nix)
+  )) 1)
+  (t "cc compile: a + b - c + d wraps once"
+    (wrapCount "int f(int a, int b, int c, int d) { return a + b - c + d; }")
+    1
+  )
+  (t "cc compile: a + b * c - d wraps b * c (bound 62) and the result"
+    (wrapCount "int f(int a, int b, int c, int d) { return a + b * c - d; }")
+    2
+  )
+  (t "cc compile: a * b * c wraps a * b and the result"
+    (wrapCount "int f(int a, int b, int c) { return a * b * c; }")
+    2
+  )
+  (t "cc compile: (a << 20) + b leaves a << 20 unwrapped"
+    (wrapCount "int f(int a, int b) { return (a << 20) + b; }")
+    1
+  )
+  (t "cc compile: an operand of a comparison is wrapped"
+    (wrapCount "int f(int a, int b) { return a + b < a; }")
+    1
+  )
+  (t "cc compile: a pointer index is wrapped"
+    (wrapCount "int f(int *p, int x) { return p[x << 30]; }")
+    1
+  )
+  (t "cc compile: / by a constant other than -1 does not wrap"
+    (wrapCount "int f(int a) { return a / 2 + a % 3; }")
+    1
+  )
+  (t "cc compile: / and % by -1 or a variable wrap"
+    (map wrapCount [
+      "int f(int a) { return a / -1; }"
+      "int f(int a, int b) { return a % b; }"
+    ])
+    [
+      1
+      1
+    ]
+  )
+  (t "cc compile: unsigned and long long arithmetic do not wrap"
+    (wrapCount "unsigned f(unsigned a, long long b) { return a * a + (unsigned)(b * b + 1); }")
+    0
+  )
+  (t "cc compile: a constant expression folds to a literal"
+    (wrapCount "int f(void) { return (2147483647 + 1) * 3 - (200 << 24); }")
+    0
+  )
+  (t "cc compile: constant shift by 32 throws" (compileThrows "int f(int x) { return x << 32; }")
+    true
+  )
+  (t "cc compile: constant shift by a negative amount throws"
+    (compileThrows "unsigned f(unsigned x) { return x >> -1; }")
+    true
+  )
+
+  # Integer constant expressions (cc/check.nix constExpr)
+  (t "cc const: INT_MAX + 1" (constOf "2147483647 + 1") {
+    type = "int";
+    value = intMin;
+  })
+  (t "cc const: INT_MIN - 1" (constOf "-2147483647 - 1 - 1") {
+    type = "int";
+    value = intMax;
+  })
+  (t "cc const: INT_MIN / -1 and INT_MIN % -1"
+    (map constOf [
+      "(-2147483647 - 1) / -1"
+      "(-2147483647 - 1) % -1"
+    ])
+    [
+      {
+        type = "int";
+        value = intMin;
+      }
+      {
+        type = "int";
+        value = 0;
+      }
+    ]
+  )
+  (t "cc const: 200 << 24, 46341 * 46341, -INT_MIN"
+    (map (e: (constOf e).value) [
+      "200 << 24"
+      "46341 * 46341"
+      "-(-2147483647 - 1)"
+    ])
+    [
+      (-939524096)
+      (-2147479015)
+      intMin
+    ]
+  )
+  (t "cc const: unsigned wraps modulo 2^32"
+    (map constOf [
+      "0xffffffff + 1"
+      "0u - 1"
+      "0x80000000u * 2"
+      "0xffffffffu << 31"
+    ])
+    [
+      {
+        type = "uint";
+        value = 0;
+      }
+      {
+        type = "uint";
+        value = 4294967295;
+      }
+      {
+        type = "uint";
+        value = 0;
+      }
+      {
+        type = "uint";
+        value = 2147483648;
+      }
+    ]
+  )
+  (t "cc const: long long does not wrap" (constOf "(long long)2147483647 + 1") {
+    type = "llong";
+    value = 2147483648;
+  })
+  (t "cc const: casts convert"
+    (map constOf [
+      "(unsigned char)300"
+      "(signed char)200"
+      "(int)4294967295u"
+    ])
+    [
+      {
+        type = "uchar";
+        value = 44;
+      }
+      {
+        type = "schar";
+        value = -56;
+      }
+      {
+        type = "int";
+        value = -1;
+      }
+    ]
+  )
+  (t "cc const: >> floors and / truncates"
+    (map (e: (constOf e).value) [
+      "-7 >> 1"
+      "-7 / 2"
+      "-7 % 2"
+      "0x80000000u >> 31"
+    ])
+    [
+      (-4)
+      (-3)
+      (-1)
+      1
+    ]
+  )
+  (t "cc const: comparisons use the usual conversions"
+    (map (e: (constOf e).value) [
+      "-1 < 0u"
+      "-1 < 0"
+      "3 == 3"
+    ])
+    [
+      0
+      1
+      1
+    ]
+  )
+  (t "cc const: ! && || ?:"
+    (map constOf [
+      "!0 + (3 && 0) * 10 + (0 || 2) * 100"
+      "1 ? 2 : 3u"
+      "0 ? -1 : 5"
+    ])
+    [
+      {
+        type = "int";
+        value = 101;
+      }
+      {
+        type = "uint";
+        value = 2;
+      }
+      {
+        type = "int";
+        value = 5;
+      }
+    ]
+  )
+  (t "cc const: character literals"
+    (map (e: (constOf e).value) [
+      "'a' + 1"
+      "'\\n'"
+      "'\\0'"
+    ])
+    [
+      98
+      10
+      0
+    ]
+  )
+  (t "cc const: names and sizes come from the hooks"
+    (map (constWith constHooks) [
+      "RED + 1"
+      "sizeof(int) * 2"
+    ])
+    [
+      {
+        type = "int";
+        value = 6;
+      }
+      {
+        type = "uint";
+        value = 8;
+      }
+    ]
+  )
+  (t "cc const: non-constant operands throw"
+    (map constThrows [
+      "a + 1"
+      "*p"
+      "RED"
+      "sizeof(int)"
+      "1 / 0"
+      "1 << 32"
+      "(int *)0 == 0"
+    ])
+    [
+      true
+      true
+      true
+      true
+      true
+      true
+      true
+    ]
+  )
 
   # Outside the subset and type errors
   (t "cc compile: switch throws" (compileThrows "void f(int x) { switch (x) { } }") true)

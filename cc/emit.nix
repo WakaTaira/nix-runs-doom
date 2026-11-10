@@ -18,15 +18,24 @@
 #   - Side effects in expressions (assignments, ++ and --, calls, stores) become let
 #     bindings in C evaluation order; pure expressions stay nested.
 #   - Conditions are Nix booleans; a comparison is 0 or 1 only where its value is used.
-#   - Values wrap modulo 2^32 only where C wraps them (unsigned and pointer arithmetic,
-#     conversions); signed arithmetic does not wrap.
+#   - Unsigned and pointer arithmetic and conversions wrap modulo 2^32 as in C.
+#   - The results of +, -, *, unary - and << on int and long wrap to [-2^31, 2^31) with
+#     `wrapInt` (R.wrapInt, bound once at the top), and so does signed / and % unless the
+#     divisor is a constant other than -1. A +, -, * or unary - on int or long, or a
+#     << by a constant, may take its operands unwrapped while the bound b of its own
+#     result stays below 62, where b guarantees |value| <= 2^b: a wrapped value counts
+#     31, + and - the larger operand bound plus 1, * the sum, unary - the operand bound,
+#     and << k the operand bound plus k. Otherwise its unwrapped operands are wrapped
+#     first. Every other use of a value (bindings, conditions, comparisons, / and %, >>,
+#     bitwise operators, conversions, pointer arithmetic and indices, arguments, return
+#     values, stores) takes it wrapped. long long does not wrap.
 # Value representation: signed char, int, long and long long are signed Nix integers;
 # plain char (unsigned, see cc/check.nix), the unsigned types and pointers are
 # non-negative. Memory words are stored in the unsigned form.
 #
 # Generated names are `<C name>_<n>` (parameters `<C name>_0`) with n unique within a
 # function, and `<C name>_fn` for functions, so they collide neither with each other nor
-# with M, B, R, mem and the builtins the output uses.
+# with M, B, R, mem, wrapInt and the builtins the output uses.
 let
   Ch = import ./check.nix;
   T = Ch.types;
@@ -44,6 +53,7 @@ let
     length
     listToAttrs
     map
+    removeAttrs
     replaceStrings
     ;
 
@@ -264,26 +274,32 @@ let
   };
   mapC = r: f: r // { c = f r.c; };
 
-  exprs =
-    s: es:
+  # The expressions es emitted left to right by f (expr or exprRaw).
+  # -> { s; binds; cs; rs; } with rs the results of f.
+  exprsWith =
+    f: s: es:
     foldl'
       (
         acc: e:
         let
-          r = expr acc.s e;
+          r = f acc.s e;
         in
         {
           inherit (r) s;
           binds = acc.binds ++ r.binds;
           cs = acc.cs ++ [ r.c ];
+          rs = acc.rs ++ [ r ];
         }
       )
       {
         inherit s;
         binds = [ ];
         cs = [ ];
+        rs = [ ];
       }
       es;
+
+  exprs = exprsWith expr;
 
   # The operands es emitted left to right, then combined by f s cs -> { s; c; }.
   combine =
@@ -297,12 +313,15 @@ let
       inherit (r) binds;
     };
 
+  # The value of e, wrapped to the range of its type.
   expr =
     s: e:
     let
       k = e.kind;
     in
-    if k == "lit" then
+    if isRawOp e then
+      wrapped (rawOp s e)
+    else if k == "lit" then
       pure s (num e.value)
     else if k == "var" then
       pure s (atom s.vars.${e.var.key})
@@ -369,6 +388,99 @@ let
     else
       throw "cc: internal error: unexpected expression '${k}'";
 
+  # ---- Signed 32-bit wrapping ----
+  # An unwrapped result is { s; binds; c; bound; } with bound null when c is wrapped (in
+  # the range of its type), or the bound b (|c| <= 2^b) of an int or long value that is
+  # not wrapped yet.
+
+  wrapBound = 31;
+  boundLimit = 62;
+
+  wrapCode = c: app "wrapInt" [ c ];
+
+  wrapped = r: removeAttrs r [ "bound" ] // { c = if r.bound == null then r.c else wrapCode r.c; };
+
+  # Operations on int or long whose operands may be passed unwrapped: +, -, *, unary -
+  # and << by a constant.
+  isRawOp =
+    e:
+    T.isS32 e.type
+    && (
+      e.kind == "neg"
+      ||
+        e.kind == "binop"
+        && (
+          elem e.op [
+            "+"
+            "-"
+            "*"
+          ]
+          || e.op == "<<" && constShift e != null
+        )
+    );
+
+  # The value of e, unwrapped where e is a raw operation.
+  exprRaw = s: e: if isRawOp e then rawOp s e else expr s e // { bound = null; };
+
+  # The raw operation e on operands emitted by exprRaw; when the bound of its result
+  # would reach boundLimit, the unwrapped operands are wrapped first.
+  rawOp =
+    s: e:
+    let
+      k = if e.kind == "binop" && e.op == "<<" then constShift e else null;
+      operands =
+        if e.kind == "neg" then
+          [ e.expr ]
+        else if k != null then
+          [ e.lhs ]
+        else
+          [
+            e.lhs
+            e.rhs
+          ];
+      r = exprsWith exprRaw s operands;
+      boundOf = x: if x.bound or null == null then wrapBound else x.bound;
+      resultBound =
+        rs:
+        let
+          bs = map boundOf rs;
+          a = head bs;
+        in
+        if e.kind == "neg" then
+          a
+        else if k != null then
+          a + k
+        else if e.op == "*" then
+          a + elemAt bs 1
+        else
+          (if a > elemAt bs 1 then a else elemAt bs 1) + 1;
+      rs = if resultBound r.rs < boundLimit then r.rs else map wrapped r.rs;
+      cs = map (x: x.c) rs;
+      a = head cs;
+    in
+    {
+      inherit (r) s binds;
+      c =
+        if e.kind == "neg" then
+          neg a
+        else if k == 0 then
+          a
+        else if k != null then
+          mul a (num (B.pow2 k))
+        else if e.op == "+" then
+          add a (elemAt cs 1)
+        else if e.op == "-" then
+          sub a (elemAt cs 1)
+        else
+          mul a (elemAt cs 1);
+      bound = resultBound rs;
+    };
+
+  # Signed / and % wrap their result (INT_MIN / -1 is INT_MIN), unless the divisor is a
+  # constant other than -1.
+  divWraps =
+    e: T.isS32 e.type && (e.op == "/" || e.op == "%") && !(e.rhs.kind == "lit" && e.rhs.value != -1);
+
   # Shift amount of e when it is a constant the shift can be inlined for, otherwise null.
   # 2^63 is not a Nix integer: `long long << 63` is left to R.shlLL, and `>> 63` has its
   # own case in arith.
@@ -412,7 +524,13 @@ let
         else
           [ e.lhs ];
     in
-    combine s operands (s: cs: arith s t op k cs);
+    combine s operands (
+      s: cs:
+      let
+        o = arith s t op k cs;
+      in
+      if divWraps e then o // { c = wrapCode o.c; } else o
+    );
 
   arith =
     s: t: op: k: cs:
@@ -1022,7 +1140,7 @@ let
 
   emit =
     checked:
-    "{ M, B, R }:\nlet\n  inherit (builtins) bitAnd bitOr bitXor div;\n"
+    "{ M, B, R }:\nlet\n  inherit (builtins) bitAnd bitOr bitXor div;\n  inherit (R) wrapInt;\n"
     + concatStringsSep "" (map func checked.funcs)
     + "in\n{\n"
     + concatStringsSep "" (map (f: "  ${quoteAttr f.name} = ${f.name}_fn;\n") checked.funcs)
