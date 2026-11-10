@@ -5,6 +5,9 @@
 #   rvx  option 1 with the custom instruction `fixmul`
 #   nix  option 3: the C translated into Nix functions
 #   cc   the same C compiled to Nix by the Nix C compiler (cc/); `ccReport` compares it with nix
+#   draw the workload in the shape Doom uses (file-scope variables, argument-less draw
+#        functions, early return, wrapped signed arithmetic) compiled by cc/;
+#        `drawReport` compares it with nix
 #
 # Measurement: every variant runs the full load (columns=160, spans=200,
 # muls=10000) for 1 and for 2 frames, three times each. Nix records its own CPU
@@ -19,10 +22,19 @@
 #
 #   mkdir -p /tmp/spike && for v in nix cc; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 #   SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport
+#
+# The draw gate (draw/nix <= 1.40) needs the nix and draw variants. It is looser than the
+# cc gate because draw does work the hand-written nix variant does not: reads and writes of
+# file-scope variables on every call (about 6000 memory operations per frame) and the
+# wrapping of signed arithmetic.
+#
+#   mkdir -p /tmp/spike && for v in nix draw; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+#   SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.drawReport
 let
   D = import ./data.nix;
   cc = import ../../cc;
   spikeSrc = cc.examples.spike.src;
+  drawSrc = cc.examples.draw.src;
   inherit (builtins)
     concatStringsSep
     foldl'
@@ -41,6 +53,15 @@ let
     # The same C compiled by the Nix C compiler (cc/).
     cc = {
       run = mem: (cc.load spikeSrc).unit mem D.PARAMS;
+    };
+    # The draw input: the file-scope variables are initialized before the call.
+    draw = {
+      run =
+        mem:
+        let
+          f = cc.load drawSrc;
+        in
+        f.unit (f.__data.init mem) D.PARAMS;
     };
   };
 
@@ -114,34 +135,49 @@ let
 
   measuredCost = v: minTime v 2 - minTime v 1;
 
-  # The cc variant passes when it is at most 1.25 times as slow as the hand-written Nix.
-  ccGate = ratio: if ratio <= 1.25 then "CC GATE: pass" else "CC GATE: fail";
+  # A variant passes when it is at most `limit` times as slow as the hand-written Nix.
+  gate =
+    label: limit: ratio:
+    if ratio <= limit then "${label} GATE: pass" else "${label} GATE: fail";
 
-  # `costs` holds { nix; cc; } in seconds per frame.
-  mkCcReport =
+  ccGate = gate "CC" 1.25;
+  drawGate = gate "DRAW" 1.40;
+
+  # Report of the variant `name` against the hand-written Nix; `costs` holds { nix; <name>; }
+  # in seconds per frame.
+  mkGateReport =
+    name: gateFn:
     { costs }:
     concatStringsSep "\n" [
       "== Cost per frame =="
       (row costs "nix")
-      (row costs "cc")
+      (row costs name)
       ""
-      "  cc/nix : ${fixed 2 (costs.cc / costs.nix)}"
+      "  ${name}/nix : ${fixed 2 (costs.${name} / costs.nix)}"
       ""
-      (ccGate (costs.cc / costs.nix))
+      (gateFn (costs.${name} / costs.nix))
       ""
     ];
+
+  mkCcReport = mkGateReport "cc" ccGate;
+  mkDrawReport = mkGateReport "draw" drawGate;
+
+  missingStats = throw "set SPIKE_STATS_DIR to the directory of <variant>-n<k>-<r>.json stats files (see bench/spike/default.nix)";
 in
 {
   rv = entry variants.rv;
   rvx = entry variants.rvx;
   nix = entry variants.nix;
   cc = entry variants.cc;
+  draw = entry variants.draw;
 
   inherit
     verdict
     mkReport
     ccGate
     mkCcReport
+    drawGate
+    mkDrawReport
     ;
 
   report =
@@ -164,6 +200,17 @@ in
         costs = {
           nix = measuredCost "nix";
           cc = measuredCost "cc";
+        };
+      };
+
+  drawReport =
+    if statsDir == "" then
+      missingStats
+    else
+      mkDrawReport {
+        costs = {
+          nix = measuredCost "nix";
+          draw = measuredCost "draw";
         };
       };
 }

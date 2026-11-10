@@ -32,6 +32,7 @@ let
   load = loadWith { };
 
   spikeSrc = import ./examples/spike.nix;
+  drawSrc = import ./examples/draw.nix;
 in
 {
   inherit
@@ -44,5 +45,10 @@ in
   examples.spike = {
     src = spikeSrc;
     nix = compile spikeSrc;
+  };
+
+  examples.draw = {
+    src = drawSrc;
+    nix = compile drawSrc;
   };
 }

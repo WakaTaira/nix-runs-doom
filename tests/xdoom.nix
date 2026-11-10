@@ -15,6 +15,7 @@ let
     concatMap
     foldl'
     genList
+    toString
     ;
 
   # FIXMUL: x3 = fixmul(x1, x2), with x1 = a and x2 = b given as signed or unsigned
@@ -99,6 +100,7 @@ let
     {
       screen = genList pixel 64000;
       result = mod (frames * sum) 4294967296;
+      inherit spanPixel;
     };
 
   spikeWant = spikeModel spikeParams;
@@ -121,6 +123,71 @@ let
       }
     ];
 
+  # The draw input (cc/examples/draw.nix): file-scope variables are initialized first.
+  drawVariant = {
+    run =
+      mem:
+      let
+        f = Cc.load Cc.examples.draw.src;
+      in
+      f.unit (f.__data.init mem) SpikeData.PARAMS;
+  };
+
+  # Draw the span of row `y` (the values `unit` puts into the variables) with the compiled
+  # R_DrawSpan alone and compare its 160 pixels (screen x = 160..319) with the model.
+  drawSpanRowCase =
+    y:
+    let
+      f = Cc.load Cc.examples.draw.src;
+      sym = f.__data.symbols;
+      set = mem: kv: M.storeWord mem sym.${kv.name} kv.value;
+      mem0 = f.init (f.__data.init (SpikeData.image spikeParams));
+      mem1 = foldl' set mem0 [
+        {
+          name = "ds_y";
+          value = y;
+        }
+        {
+          name = "ds_x1";
+          value = 160;
+        }
+        {
+          name = "ds_x2";
+          value = 319;
+        }
+        {
+          name = "ds_xfrac";
+          value = y * 16384;
+        }
+        {
+          name = "ds_yfrac";
+          value = y * 65536;
+        }
+        {
+          name = "ds_xstep";
+          value = 65536;
+        }
+        {
+          name = "ds_ystep";
+          value = 1024;
+        }
+        {
+          name = "ds_source";
+          value = SpikeData.FLAT;
+        }
+        {
+          name = "ds_colormap";
+          value = SpikeData.CMAP;
+        }
+      ];
+      mem = f.R_DrawSpan mem1;
+    in
+    {
+      name = "xdoom: draw R_DrawSpan row ${toString y} matches the model";
+      got = genList (k: M.loadByte mem (SpikeData.SCREEN + y * 320 + 160 + k)) 160;
+      expected = genList (k: spikeWant.spanPixel y k) 160;
+    };
+
   spikeCases =
     spikeCase "rv" (import ../bench/spike/rv.nix { })
     ++ spikeCase "rvx" (import ../bench/spike/rvx.nix)
@@ -128,7 +195,20 @@ let
     ++ spikeCase "cc" {
       run = mem: (Cc.load Cc.examples.spike.src).unit mem SpikeData.PARAMS;
     }
+    ++ spikeCase "draw" drawVariant
     ++ [
+      (drawSpanRowCase 62)
+      (drawSpanRowCase 63)
+      {
+        name = "xdoom: draw gate at exactly 1.40 passes";
+        got = Spike.drawGate 1.40;
+        expected = "DRAW GATE: pass";
+      }
+      {
+        name = "xdoom: draw gate at 1.41 fails";
+        got = Spike.drawGate 1.41;
+        expected = "DRAW GATE: fail";
+      }
       {
         name = "xdoom: spike verdict at exactly 2.0 is option 3";
         got = Spike.verdict 2.0;
