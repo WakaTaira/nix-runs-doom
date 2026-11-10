@@ -960,6 +960,19 @@ let
     int rVar(unsigned char *d, unsigned char *t, int n) { int i = 0, k = 42; while (n--) { k = i & 7; *d++ = t[k]; i++; } return k; }
     int rDecl(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { int k = i & 7; *d++ = t[k]; i++; } return i; }
     int linIdx(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[i]; i++; } return i; }
+    int ifRead(unsigned char *d, unsigned char *t, int n, int c) { int x; while (n--) { x = 7; if (c) x = t[n & 3]; *d++ = x; } return x; }
+    int elseRead(unsigned char *d, unsigned char *t, int n, int c) { int x; while (n--) { x = 7; if (c) x = 5; else x = t[n & 3]; *d++ = x; } return x; }
+    int bothRead(unsigned char *d, unsigned char *t, int n, int c) { int x; while (n--) { x = 7; if (c) x = t[n & 3]; else x = t[(n + 1) & 3] + 100; *d++ = x; } return x; }
+    int bigIdx(unsigned char *d, unsigned char *t, int n, long long w) { while (n--) *d++ = t[(w + n) & 0x7fffffffffffffffLL]; return 0; }
+    int bigSum(unsigned char *d, unsigned char *t, int n, long long w) { while (n--) *d++ = t[((w + n) & 0x7fffffffffffffffLL) + (w & 0x7fffffffffffffffLL)]; return 0; }
+    int xDiv(unsigned char *d, int n, int x, int y) { int i = 0; while (n--) { d[i + x / y] = i; i++; } return i; }
+    int xFits(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[(int)(u >> 1)]; u += 2; } return 0; }
+    int wordAt(unsigned char *d, unsigned char *s, int n) { int r = 0; while (n--) { r = *(int *)s; *d++ = (r >> 24) + 1; } return r; }
+    int words(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = (((int *)t)[i & 3] >> 24) + 1; i++; } return 0; }
+    int xTmp(unsigned char *d, int n) { int t = -1; while (n--) { if (n & 1) t = n; *d++ = t; } return t; }
+    int xTwice(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { int k = i & 7; k = i; *d++ = t[k]; i++; } return i; }
+    int xSra(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[i >> 29]; i++; } return 0; }
+    int xDown(unsigned char *d, unsigned char *s, int n) { while (n--) *d++ = *s--; return 0; }
     int xRange(unsigned char *d, unsigned char *t, int n) { int x; while (n--) { x = n * 3; *d++ = t[x]; } return 0; }
     int xBreak(unsigned char *d, int n) { while (n--) { if (n == 1) break; *d++ = n; } return n; }
     int xTwo(unsigned char *d, int n) { while (n--) { *d++ = n; *d++ = n + 10; } return 0; }
@@ -1057,6 +1070,11 @@ let
     "rVar"
     "rDecl"
     "linIdx"
+    "ifRead"
+    "elseRead"
+    "bothRead"
+    "wordAt"
+    "words"
   ];
   bulkExcluded = [
     "xRange"
@@ -1074,6 +1092,14 @@ let
     "xLong"
     "xInStep"
     "xCall"
+    "bigIdx"
+    "bigSum"
+    "xDiv"
+    "xFits"
+    "xTmp"
+    "xTwice"
+    "xSra"
+    "xDown"
   ];
   # The return values of steps for n = 3 iterations with the step c: a, b, x, y, z, u, q
   # and m.
@@ -1090,6 +1116,19 @@ let
         ] d 0
       )
     ) 8;
+  # The table { 10, 11, 12, 13 } of the if tests, and the word 0x04030201 of wordAt.
+  quad = withBytes M.empty tab [
+    10
+    11
+    12
+    13
+  ];
+  quadWord = withBytes M.empty tab [
+    1
+    2
+    3
+    4
+  ];
   # The bytes of rByte: the table with t[255] = 99, and the indices 0, 3, 255 at 12288.
   byteMem = withBytes (withBytes tabled (tab + 255) [ 99 ]) 12288 [
     0
@@ -4946,6 +4985,333 @@ in
           10
         ]
         false
+      ]
+    ]
+  )
+
+  # Bulk loops: review fixes
+  (t "cc bulk: a load in a branch of if is recorded in order and checked on entry"
+    [
+      (bulkOn quad "ifRead" [ buf tab 5 1 ] buf 5)
+      (bulkOn quad "ifRead" [ buf tab 5 0 ] buf 5)
+      (bulkOn quad "elseRead" [ buf tab 5 0 ] buf 5)
+      (bulkOn quad "elseRead" [ buf tab 5 1 ] buf 5)
+      (bulkOn quad "bothRead" [ buf tab 5 1 ] buf 5)
+      (bulkOn quad "bothRead" [ buf tab 5 0 ] buf 5)
+      (bulkOn quad "ifRead" [
+        (tab + 3)
+        tab
+        5
+        1
+      ] (tab + 3) 5)
+    ]
+    [
+      [
+        10
+        [
+          10
+          13
+          12
+          11
+          10
+        ]
+        true
+      ]
+      [
+        7
+        [
+          7
+          7
+          7
+          7
+          7
+        ]
+        true
+      ]
+      [
+        10
+        [
+          10
+          13
+          12
+          11
+          10
+        ]
+        true
+      ]
+      [
+        5
+        [
+          5
+          5
+          5
+          5
+          5
+        ]
+        true
+      ]
+      [
+        10
+        [
+          10
+          13
+          12
+          11
+          10
+        ]
+        true
+      ]
+      [
+        111
+        [
+          111
+          110
+          113
+          112
+          111
+        ]
+        true
+      ]
+      [
+        10
+        [
+          10
+          10
+          12
+          11
+          10
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: an index bound of 2^32 or more is no range, and the loop compiles"
+    [
+      (bulkTabled "bigIdx" [ buf tab 3 0 ] buf 3)
+      (bulkTabled "bigSum" [ buf tab 3 0 ] buf 3)
+    ]
+    [
+      [
+        0
+        [
+          30
+          20
+          10
+        ]
+        false
+      ]
+      [
+        0
+        [
+          30
+          20
+          10
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: the entry test holds the requirements of the count forms and the count limit"
+    [
+      (contains "n_0 >= 0 && " (fnCode bulkSrc "doPost"))
+      (contains "n_0 >= 0 && " (fnCode bulkSrc "whilePost"))
+      (contains "n_0 >= 1 && " (fnCode bulkSrc "doPre"))
+      (contains "n_0 >= 1 && " (fnCode bulkSrc "whilePre"))
+      (contains "e_0 < 2147483647 && " (fnCode bulkSrc "le"))
+      (contains "e_0 > -2147483648 && " (fnCode bulkSrc "ge"))
+      (map (fn: countIn " <= 16777216 && " (fnCode bulkSrc fn)) bulkCandidates)
+    ]
+    [
+      true
+      true
+      true
+      true
+      true
+      true
+      (map (_: 1) bulkCandidates)
+    ]
+  )
+  (t
+    "cc bulk: a division by a variable in the store address keeps the loop, which does not divide when N = 0"
+    [
+      (bulkCall "xDiv" [ buf 0 1 0 ] buf 1)
+      (bulkCall "xDiv" [ buf 3 4 2 ] buf 5)
+    ]
+    [
+      [
+        0
+        [ 0 ]
+        false
+      ]
+      [
+        3
+        [
+          0
+          0
+          0
+          1
+          2
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: a narrowing cast of a bounded value has no range"
+    (bulkTabled "xFits" [ buf tab 3 ] buf 3)
+    [
+      0
+      [
+        10
+        20
+        30
+      ]
+      false
+    ]
+  )
+  (t "cc bulk: a read range ends at the last byte of a wider read"
+    [
+      (bulkOn quadWord "wordAt" [
+        (tab + 3)
+        tab
+        2
+      ] (tab + 3) 2)
+      (bulkOn quadWord "wordAt" [
+        (tab + 4)
+        tab
+        2
+      ] (tab + 4) 2)
+      (bulkTabled "words" [
+        (tab + 15)
+        tab
+        4
+      ] (tab + 15) 4)
+      (bulkTabled "words" [
+        (tab + 16)
+        tab
+        4
+      ] (tab + 16) 4)
+    ]
+    [
+      [
+        84083201
+        [
+          5
+          6
+        ]
+        false
+      ]
+      [
+        67305985
+        [
+          5
+          5
+        ]
+        true
+      ]
+      [
+        0
+        [
+          41
+          81
+          1
+          42
+        ]
+        false
+      ]
+      [
+        0
+        [
+          41
+          81
+          1
+          1
+        ]
+        true
+      ]
+    ]
+  )
+  (t
+    "cc bulk: an assignment in if, a second assignment, a signed >> and a decreasing read keep the loop"
+    [
+      (bulkFilled "xTmp" [ buf 3 ] buf 4)
+      (bulkTabled "xTwice" [ buf tab 3 ] buf 3)
+      (bulkTabled "xSra" [ buf tab 3 ] buf 3)
+      (bulkTabled "xDown" [
+        buf
+        (tab + 2)
+        3
+      ] buf 3)
+    ]
+    [
+      [
+        1
+        [
+          255
+          1
+          1
+          9
+        ]
+        false
+      ]
+      [
+        3
+        [
+          10
+          20
+          30
+        ]
+        false
+      ]
+      [
+        0
+        [
+          10
+          10
+          10
+        ]
+        false
+      ]
+      [
+        0
+        [
+          30
+          20
+          10
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: for (; n--; p++), e < i and i >= e with N = 1"
+    [
+      (bulkFilled "forPost" [ buf 1 ] buf 2)
+      (bulkFilled "gt" [ buf 1 0 ] buf 2)
+      (bulkFilled "ge" [ buf 0 0 ] buf 2)
+    ]
+    [
+      [
+        (-999)
+        [
+          1
+          9
+        ]
+        true
+      ]
+      [
+        0
+        [
+          1
+          9
+        ]
+        true
+      ]
+      [
+        (-1)
+        [
+          0
+          9
+        ]
+        true
       ]
     ]
   )

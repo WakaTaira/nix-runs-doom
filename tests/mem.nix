@@ -66,7 +66,10 @@ let
     ) M.empty addrs;
 
   # Addresses around the boundaries of leaves (256 B), level-2 nodes (16 KiB),
-  # 1 MiB root entries and the end of the 32-bit space.
+  # 1 MiB root entries and the end of the 32-bit space, where the last leaf, node and
+  # root entry start at 2^32 - 256, 2^32 - 16384 and 2^32 - 2^20. The end itself needs
+  # no entry: B.add wraps, so the addresses around 0 include 2^32 - 5 .. 2^32 - 1 (an
+  # entry 2^32 would repeat those of 0).
   boundaries =
     concatMap
       (
@@ -92,7 +95,9 @@ let
         1048576
         5242880
         2147483648
-        4294967296
+        4293918720
+        4294950912
+        4294967040
       ];
   accessAddrs = boundaries ++ [
     4660
@@ -274,7 +279,7 @@ let
     }
   ];
 
-  # Writing 300 bytes over existing content keeps the bytes that are not written.
+  # Writing 5 bytes over existing content keeps the bytes that are not written.
   keepCase = {
     name = "mem: storeRun keeps the bytes around the written range";
     got =
@@ -305,6 +310,35 @@ let
       ]
       ++ [ (R.loadByte base 4666) ];
   };
+
+  # Long runs evaluate without a recursion as deep as n (recursive versions overflowed
+  # the stack from about n = 860000 for storeRun and n = 3400 for storeStride with
+  # stride 16384). The bytes at both ends, in the middle and just past the last one.
+  deepCase =
+    kind: a: stride: n:
+    let
+      m =
+        if kind == "run" then
+          M.storeRun M.empty a n (valsFor n)
+        else
+          M.storeStride M.empty a stride n (valsFor n);
+      at = [
+        0
+        1
+        (div n 2)
+        (n - 2)
+        (n - 1)
+      ];
+    in
+    {
+      name = "mem: ${kind} stride=${toString stride} n=${toString n} evaluates without deep recursion";
+      got = map (i: M.loadByte m (a + i * stride)) at ++ [ (M.loadByte m (a + n * stride)) ];
+      expected = map (i: bitAnd (valueAt i) 255) at ++ [ 0 ];
+    };
+  deepCases = [
+    (deepCase "run" 1048577 1 1000000)
+    (deepCase "stride" 1048577 16384 5000)
+  ];
 in
 map loadCase accessAddrs
 ++ map storeCase accessAddrs
@@ -313,3 +347,4 @@ map loadCase accessAddrs
 ++ topCases
 ++ emptyCases
 ++ [ keepCase ]
+++ deepCases

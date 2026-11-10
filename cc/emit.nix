@@ -1436,12 +1436,12 @@ let
         if n.elseStmt == null then
           {
             s = s1 // {
-              inherit (th.s) n;
+              inherit (th.s) n bulkLoads;
             };
             binds = [ ];
           }
         else
-          stmt (s1 // { inherit (th.s) n; }) n.elseStmt;
+          stmt (s1 // { inherit (th.s) n bulkLoads; }) n.elseStmt;
       changed = k: varCode th.s k != varCode s1 k || varCode el.s k != varCode s1 k;
       # The entries share their hits, so they join all together or not at all.
       cacheKeys = map (c: c.key) s1.cached;
@@ -1454,13 +1454,14 @@ let
         st:
         (if memChanged then [ "mem = ${st.mem};" ] else [ ]) ++ map (k: "${at k} = ${varCode st k};") keys;
       branch = r: renderLet r.binds "{ ${concatStringsSep " " (fields r.s)} }";
-      f = fresh (s1 // { inherit (el.s) n; }) "if";
+      # The loads of the branches stay recorded in a bulk iteration (see "Bulk loops").
+      f = fresh (s1 // { inherit (el.s) n bulkLoads; }) "if";
       code = "if ${c.c.code} then\n  ${indent (branch th)}\nelse\n  ${indent (branch el)}";
     in
     if keys == [ ] && !memChanged then
       {
         s = s1 // {
-          inherit (el.s) n;
+          inherit (el.s) n bulkLoads;
         };
         inherit (c) binds;
       }
@@ -2033,8 +2034,18 @@ let
 
   # The bound U of an index e that lies in [0, U], or null. env maps the variables with a
   # known range at this point; pure tells that the index has no side effects (otherwise its
-  # variables have no range).
+  # variables have no range). A bound of 2^32 or more counts as none: such an index
+  # cannot pass the entry test, and sums and products of larger bounds would overflow at
+  # compile time.
   idxRange =
+    env: pure: e:
+    let
+      u = idxBound env pure e;
+    in
+    if u != null && u < pow32 then u else null;
+
+  # The bound of e by the rules above, before idxRange limits it.
+  idxBound =
     env: pure: e:
     let
       k = kindOf e;
