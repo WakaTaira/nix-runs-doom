@@ -11,11 +11,13 @@
 # Byte-granular accessors resolve the two lower keys, the byte divisor and the
 # keep mask with one lookup in a 16384-entry table indexed by the low 14 bits of
 # the byte address; storeByte walks the path once. storeRun writes many bytes with
-# one `//` per leaf instead of one path copy per byte; storeStride does the same
-# with one `//` per 16 KiB node for a stride of 256 or more, is storeRun for a
+# one `//` per leaf instead of one path copy per byte, merging the words at both ends
+# with their old bytes; storeStride does the same with one `//` per 16 KiB node for a
+# stride of 256 or more (directly when the bytes lie in one node), is storeRun for a
 # stride of 1, and folds storeByte for a stride of 2 to 255. readPages hands out the
 # leaves over a byte range as lazy lists of bytes, for code that reads a table many
-# times without walking the trie for each byte.
+# times without walking the trie for each byte; readLeaves hands out the leaf sets
+# themselves, read byte by byte with leafByte, for code that reads a table a few times.
 let
   inherit (builtins)
     bitAnd
@@ -202,24 +204,8 @@ let
 
   nodeAt = m: a: (m.${rootKey a} or { }).${midKey a} or { };
 
-  # Install a leaf (256 B) or a level-2 node (16 KiB) at the address a, forcing
-  # the path like the other stores do.
-  putLeaf =
-    m: a: leaf:
-    let
-      a0 = rootKey a;
-      a1 = midKey a;
-      n0 = m.${a0} or { };
-      n1 = n0.${a1} or { };
-      n1' = n1 // {
-        ${elemAt keyList (bitAnd (div a 256) 63)} = leaf;
-      };
-      n0' = n0 // {
-        ${a1} = n1';
-      };
-    in
-    seq leaf (seq n1' (seq n0' (m // { ${a0} = n0'; })));
-
+  # Install a level-2 node (16 KiB) at the address a, forcing the path like the other
+  # stores do.
   putNode =
     m: a: node:
     let
@@ -256,72 +242,130 @@ let
 
   forceAll = s: foldl' (acc: x: seq x acc) 0 (attrValues s);
 
-  # nw whole words starting at the word-aligned byte address wa; the word k comes
-  # from vals[i0 + 4k .. i0 + 4k + 3]. One `//` per leaf; the leaves are folded with
-  # foldl', so the evaluation depth does not grow with nw.
-  storeWords =
-    m: wa: nw: vals: i0:
+  # Replace the leaf (256 B) at the byte address a with f applied to it (a missing leaf
+  # is { }), walking the path once and forcing it like the other stores do.
+  modifyLeaf =
+    m: a: f:
     let
-      byteAt = i: bitAnd (elemAt vals i) 255;
-      first =
-        let
-          w0 = bitAnd (div wa 4) 63;
-        in
-        if nw < 64 - w0 then nw else 64 - w0;
-      # Leaf c holds the words from offset `startOf c` on: the first one up to the end
-      # of its leaf, every other one a whole leaf or the rest.
-      leaves = if nw <= 0 then 0 else 1 + div (nw - first + 63) 64;
-      startOf = c: if c == 0 then 0 else first + 64 * (c - 1);
-      leaf =
-        m0: c:
-        let
-          k0 = startOf c;
-          cnt =
-            if c == 0 then
-              first
-            else if nw - k0 < 64 then
-              nw - k0
-            else
-              64;
-          la = wa + 4 * k0;
-          w0 = bitAnd (div la 4) 63;
-          part = listToAttrs (
-            genList (j: {
-              name = elemAt keyList (w0 + j);
-              value =
-                let
-                  i = i0 + 4 * (k0 + j);
-                in
-                byteAt i + 256 * byteAt (i + 1) + 65536 * byteAt (i + 2) + 16777216 * byteAt (i + 3);
-            }) cnt
-          );
-        in
-        seq (forceAll part) (putLeaf m0 la (leafAt m0 la // part));
+      a0 = rootKey a;
+      a1 = midKey a;
+      k2 = elemAt keyList (bitAnd (div a 256) 63);
+      n0 = m.${a0} or { };
+      n1 = n0.${a1} or { };
+      leaf = f (n1.${k2} or { });
+      n1' = n1 // {
+        ${k2} = leaf;
+      };
+      n0' = n0 // {
+        ${a1} = n1';
+      };
     in
-    foldl' leaf m (genList (c: c) leaves);
+    seq leaf (seq n1' (seq n0' (m // { ${a0} = n0'; })));
+
+  # The same for the level-2 node (16 KiB) at the byte address a.
+  modifyNode =
+    m: a: f:
+    let
+      a0 = rootKey a;
+      a1 = midKey a;
+      n0 = m.${a0} or { };
+      node = f (n0.${a1} or { });
+      n0' = n0 // {
+        ${a1} = node;
+      };
+    in
+    seq node (seq n0' (m // { ${a0} = n0'; }));
+
+  # The word at the word address w after writing the low 8 bits of vals[i] to the byte
+  # address a + i for i = 0 .. n-1: a word inside the run is built from vals alone, a
+  # word at an end of the run keeps the bytes of old outside it.
+  runWord =
+    a: n: vals: old: w:
+    let
+      i = 4 * w - a;
+      byte = j: bitAnd (elemAt vals (i + j)) 255;
+      part = j: d: if i + j >= 0 && i + j < n then byte j * d else bitAnd old (255 * d);
+    in
+    if i >= 0 && i + 4 <= n then
+      byte 0 + 256 * byte 1 + 65536 * byte 2 + 16777216 * byte 3
+    else
+      part 0 1 + part 1 256 + part 2 65536 + part 3 16777216;
+
+  # The leaf old with its words ws .. we (word addresses inside it) replaced by those of
+  # the run (see runWord), the new words forced.
+  runLeaf =
+    a: n: vals: ws: we: old:
+    let
+      part = listToAttrs (
+        genList (
+          j:
+          let
+            key = elemAt keyList (bitAnd (ws + j) 63);
+          in
+          {
+            name = key;
+            value = runWord a n vals (old.${key} or 0) (ws + j);
+          }
+        ) (we - ws + 1)
+      );
+    in
+    seq (forceAll part) (old // part);
 
   # The low 8 bits of vals[i] are written to address a + i for i = 0 .. n-1.
   # The caller guarantees n >= 0 and, for n >= 1, 0 <= a and a + n <= 2^32. Only
-  # the first n elements of vals are forced.
+  # the first n elements of vals are forced. Each touched leaf is updated with one `//`
+  # (the words at both ends merged with their old bytes); the leaves are folded with
+  # foldl', so the evaluation depth does not grow with n.
   storeRun =
     m: a: n: vals:
-    let
-      h0 = bitAnd (4 - bitAnd a 3) 3;
-      head = if h0 > n then n else h0;
-      nw = div (n - head) 4;
-      tailStart = head + 4 * nw;
-      bytes =
-        m0: from: to:
-        foldl' (mm: i: storeByte mm (a + i) (elemAt vals i)) m0 (genList (i: from + i) (to - from));
-    in
-    bytes (storeWords (bytes m 0 head) (a + head) nw vals head) tailStart n;
+    if n <= 0 then
+      m
+    else
+      let
+        wFirst = div a 4;
+        wLast = div (a + n - 1) 4;
+        lFirst = div wFirst 64;
+        lLast = div wLast 64;
+        leaf =
+          m0: l:
+          modifyLeaf m0 (l * 256) (
+            runLeaf a n vals (if l == lFirst then wFirst else l * 64) (
+              if l == lLast then wLast else l * 64 + 63
+            )
+          );
+      in
+      if lFirst == lLast then
+        leaf m lFirst
+      else
+        foldl' leaf m (genList (j: lFirst + j) (lLast - lFirst + 1));
+
+  # The leaves of the node old that the bytes vals[i .. i + cnt - 1] go to, at the
+  # addresses ai + j * stride (j < cnt) inside the node, with stride >= 256: one leaf
+  # each, as a set from the leaf keys to the new leaves.
+  strideLeaves =
+    old: ai: stride: vals: i: cnt:
+    listToAttrs (
+      genList (
+        j:
+        let
+          p = elemAt byteTable (bitAnd (ai + j * stride) 16383);
+          leaf = old.${p.hi} or { };
+          nv = bitOr (bitAnd (leaf.${p.lo} or 0) p.keep) (bitAnd (elemAt vals (i + j)) 255 * p.d);
+        in
+        {
+          name = p.hi;
+          value = seq nv (leaf // { ${p.lo} = nv; });
+        }
+      ) cnt
+    );
 
   # The low 8 bits of vals[i] are written to address a + i * stride for
   # i = 0 .. n-1. The caller guarantees n >= 0, stride >= 1 and, for n >= 1,
   # 0 <= a and a + (n-1) * stride < 2^32. Only the first n elements of vals are forced.
   # stride 1 is storeRun, and stride 2 .. 255 folds storeByte. For stride >= 256 every
   # byte lies in its own leaf, so one `//` per touched leaf and one per 16 KiB node
-  # suffice; the nodes are folded with foldl' (their first indices found by
+  # suffice. When all the addresses lie in one node, that node is updated directly;
+  # otherwise the nodes are folded with foldl' (their first indices found by
   # genericClosure), so the evaluation depth does not grow with n.
   storeStride =
     m: a: stride: n: vals:
@@ -348,22 +392,16 @@ let
         let
           ai = a + i * stride;
           old = nodeAt m0 ai;
-          part = listToAttrs (
-            genList (
-              j:
-              let
-                p = elemAt byteTable (bitAnd (ai + j * stride) 16383);
-                leaf = old.${p.hi} or { };
-                nv = bitOr (bitAnd (leaf.${p.lo} or 0) p.keep) (bitAnd (elemAt vals (i + j)) 255 * p.d);
-              in
-              {
-                name = p.hi;
-                value = seq nv (leaf // { ${p.lo} = nv; });
-              }
-            ) (countAt i)
-          );
+          part = strideLeaves old ai stride vals i (countAt i);
         in
         seq (forceAll part) (putNode m0 ai (old // part));
+      # All n addresses lie in the node of a.
+      inOneNode =
+        old:
+        let
+          part = strideLeaves old a stride vals 0 n;
+        in
+        seq (forceAll part) (old // part);
     in
     if stride == 1 then
       storeRun m a n vals
@@ -371,8 +409,29 @@ let
       foldl' (mm: i: storeByte mm (a + i * stride) (elemAt vals i)) m (genList (i: i) n)
     else if n <= 0 then
       m
+    else if div a 16384 == div (a + (n - 1) * stride) 16384 then
+      modifyNode m a inOneNode
     else
       foldl' node m starts;
+
+  # The leaves (256 B) that the bytes [base, base + len) touch, from the first one on, as
+  # a lazy list of the leaf sets themselves: a leaf is taken from the trie when used.
+  # The caller guarantees len >= 1, 0 <= base and base + len - 1 < 2^32.
+  readLeaves =
+    m: base: len:
+    let
+      first = div base 256;
+    in
+    genList (j: leafAt m ((first + j) * 256)) (div (base + len - 1) 256 - first + 1);
+
+  # Byte base + o (0 <= o < len) of the leaves = readLeaves m base len, with
+  # q = bitAnd base 255 + o: byte bitAnd q 255 of leaf div q 256 (0 when unwritten).
+  leafByte =
+    leaves: q:
+    let
+      p = elemAt byteTable (bitAnd q 255);
+    in
+    bitAnd (div ((elemAt leaves (div q 256)).${p.lo} or 0) p.d) 255;
 in
 {
   inherit
@@ -388,5 +447,7 @@ in
     storeRun
     storeStride
     readPages
+    readLeaves
+    leafByte
     ;
 }

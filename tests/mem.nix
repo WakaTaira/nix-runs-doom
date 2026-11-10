@@ -1,7 +1,7 @@
 # Tests for lib/mem.nix. The byte, half and word accessors are compared with a naive
 # reference written with loadWordAt / storeWordAt only (the definitions that
 # lib/mem.nix had before its table-driven rewrite). storeRun and storeStride are
-# compared with a fold of storeByte, and readPages with loadByte.
+# compared with a fold of storeByte, and readPages and readLeaves with loadByte.
 let
   M = import ../lib/mem.nix;
   B = import ../lib/bits.nix;
@@ -171,9 +171,33 @@ let
   viewAll =
     m: a: stride: n:
     concatMap (t: view m t) (targets a stride n ++ [ a ]);
-  foldStore =
-    m: a: stride: n:
-    foldl' (mm: i: R.storeByte mm (a + i * stride) (valueAt i)) m (genList (i: i) n);
+  foldStoreWith =
+    valAt: m: a: stride: n:
+    foldl' (mm: i: R.storeByte mm (a + i * stride) (valAt i)) m (genList (i: i) n);
+  foldStore = foldStoreWith valueAt;
+
+  # storeRun (kind "run") or storeStride of the values valAt i, on memory prefilled
+  # around every target, compared with the fold of the reference storeByte: the bytes
+  # around the targets and the whole tree.
+  bulkCaseWith =
+    label: valAt: kind: a: stride: n:
+    let
+      m = prefilled a stride n;
+      vals = genList valAt n ++ [ (throw "storeRun/storeStride forced an element beyond n") ];
+      got = if kind == "run" then M.storeRun m a n vals else M.storeStride m a stride n vals;
+      want = foldStoreWith valAt m a stride n;
+    in
+    {
+      name = "mem: ${kind}${label} a=${toString a} stride=${toString stride} n=${toString n} matches storeByte fold";
+      got = [
+        (viewAll got a stride n)
+        (got == want)
+      ];
+      expected = [
+        (viewAll want a stride n)
+        true
+      ];
+    };
 
   bulkCase =
     kind: a: stride: n:
@@ -264,6 +288,89 @@ let
       256
       70000
     ];
+
+  # Values that are negative or above 255, of which only the low 8 bits are written.
+  oddValues = [
+    (-1)
+    (-256)
+    (-257)
+    256
+    511
+    (-2)
+    1000
+  ];
+  oddAt = i: elemAt oddValues (i - 7 * div i 7);
+  # Words at an end of the run only (inside one word), whole words only, both, and
+  # the direct path of storeStride (one 16 KiB node).
+  oddCases = [
+    (bulkCaseWith " (odd values)" oddAt "run" 4097 1 3)
+    (bulkCaseWith " (odd values)" oddAt "run" 4096 1 8)
+    (bulkCaseWith " (odd values)" oddAt "run" 4097 1 13)
+    (bulkCaseWith " (odd values)" oddAt "stride" 4101 320 20)
+  ];
+
+  # storeRun over memory filled around every target (so every word that the run
+  # touches holds a pattern): starts with the low 2 bits 0 to 3, counts that end inside
+  # one word or in each position of a word, runs across a leaf, a 16 KiB node and a
+  # 1 MiB root entry, and runs whose last byte is 2^32 - 1.
+  denseCounts = genList (i: i + 1) 9 ++ [
+    13
+    255
+    256
+    257
+    600
+  ];
+  denseRunCases =
+    concatMap (a: map (bulkCaseWith " (dense)" valueAt "run" a 1) denseCounts) [
+      4096
+      4097
+      4098
+      4099
+    ]
+    ++
+      concatMap
+        (
+          a:
+          map (bulkCaseWith " (dense)" valueAt "run" a 1) [
+            9
+            600
+          ]
+        )
+        [
+          4093
+          16381
+          1048573
+        ]
+    ++ map (n: bulkCaseWith " (dense)" valueAt "run" (4294967296 - n) 1 n) [
+      2
+      9
+      13
+      257
+    ];
+
+  # storeStride with stride >= 256: all bytes in one 16 KiB node, the last byte alone
+  # at the start of the next node, and the first byte alone at the end of the previous
+  # node (when the others fit in one node), over prefilled memory.
+  nodeStrides = [
+    256
+    320
+    4096
+  ];
+  nodeCounts = [
+    1
+    2
+    51
+    52
+  ];
+  nodeAt0 = 2097152;
+  nodeCases = concatMap (
+    s:
+    concatMap (n: [
+      (bulkCaseWith " (node)" valueAt "stride" (nodeAt0 + 7) s n)
+      (bulkCaseWith " (node)" valueAt "stride" (nodeAt0 + 16384 - (n - 1) * s) s n)
+      (bulkCaseWith " (node)" valueAt "stride" (nodeAt0 + 3 * 16384 - 1) s n)
+    ]) nodeCounts
+  ) nodeStrides;
 
   # With n = 0 the address and the stride are not used and no element is forced.
   emptyCases = [
@@ -399,7 +506,8 @@ let
         (genList (o: M.loadByte m (base + o)) len)
       ];
     };
-  pageCases = map (x: pageCase pageMem (builtins.head x) (elemAt x 1)) [
+  # The pairs [ base len ] of the readPages and readLeaves tests.
+  pageRanges = [
     # low 8 bits 0, 1 and 255; lengths 1, 128, 256, 257, 4096 and 16384
     [
       4096
@@ -482,6 +590,27 @@ let
     ]
   ];
 
+  pageCases = map (x: pageCase pageMem (builtins.head x) (elemAt x 1)) pageRanges;
+
+  # readLeaves gives the same leaves as readPages, as leaf sets read with leafByte.
+  leafCase =
+    m: base: len:
+    let
+      leaves = M.readLeaves m base len;
+    in
+    {
+      name = "mem: readLeaves base=${toString base} len=${toString len} with leafByte matches loadByte";
+      got = [
+        (length leaves)
+        (genList (o: M.leafByte leaves (bitAnd base 255 + o)) len)
+      ];
+      expected = [
+        (leavesOf base len)
+        (genList (o: M.loadByte m (base + o)) len)
+      ];
+    };
+  leafCases = map (x: leafCase pageMem (builtins.head x) (elemAt x 1)) pageRanges;
+
   # A memory built directly, whose word 2 of the leaf at 0x1000 and word 0 of the leaf at
   # 0x1100 fail when read: readPages reads neither for the lengths and for byte 0x1001.
   lazyMem = {
@@ -516,6 +645,35 @@ let
         171
       ];
     };
+
+  # A memory built directly, whose leaf at 0x1100 and word 2 of the leaf at 0x1000 fail
+  # when taken: readLeaves takes neither for the length and for byte 0x1001.
+  lazyLeafMem = {
+    "0" = {
+      "0" = {
+        "16" = {
+          "0" = 43776;
+          "2" = throw "readLeaves read word 2 of the leaf at 0x1000";
+        };
+        "17" = throw "readLeaves took the leaf at 0x1100";
+      };
+    };
+  };
+  lazyLeafCase =
+    let
+      leaves = M.readLeaves lazyLeafMem 4096 512;
+    in
+    {
+      name = "mem: readLeaves takes only the leaves that are used";
+      got = [
+        (length leaves)
+        (M.leafByte leaves 1)
+      ];
+      expected = [
+        2
+        171
+      ];
+    };
 in
 map loadCase accessAddrs
 ++ map storeCase accessAddrs
@@ -527,3 +685,8 @@ map loadCase accessAddrs
 ++ deepCases
 ++ pageCases
 ++ [ lazyCase ]
+++ oddCases
+++ denseRunCases
+++ nodeCases
+++ leafCases
+++ [ lazyLeafCase ]
