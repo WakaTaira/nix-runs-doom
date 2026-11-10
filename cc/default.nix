@@ -7,7 +7,9 @@
 # dataBase (default 0x00400000) is the address of the first file-scope variable. A
 # compiled function takes the memory trie (lib/mem.nix) and its arguments, and returns the
 # new memory, or { mem; ret; } when it returns a value. `__data.init` (see cc/emit.nix)
-# writes the initial values of the file-scope variables; apply it to the memory first.
+# writes the initial values of the file-scope variables and static locals and the contents
+# of the string literals (placed after them, listed in `__data.strings`); apply it to the
+# memory first.
 let
   P = import ./parse.nix;
   Ch = import ./check.nix;

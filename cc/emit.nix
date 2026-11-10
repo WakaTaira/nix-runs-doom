@@ -4,10 +4,12 @@
 #   { M, B, R }: { <C function name> = <Nix function>; ...; __data = <data>; }
 # with M = lib/mem.nix, B = lib/bits.nix and R = cc/runtime.nix. It imports nothing, so
 # it can be loaded from the store (cc/default.nix). __data describes the file-scope
-# variables (cc/check.nix, "Data"):
-#   { base; size; symbols = { <C name> = <address>; ... }; init = mem: <mem>; }
-# init writes the initial values that are not 0 into a memory where the whole data area
-# reads as 0; callers apply it before calling the functions. The translation is
+# variables, static locals and string literals (cc/check.nix, "Data"):
+#   { base; size; symbols = { <C name> = <address>; ... };
+#     strings = [ { addr; size; } ... ]; init = mem: <mem>; }
+# init writes the initial values that are not 0 (the contents of the string literals
+# among them) into a memory where the whole data area reads as 0; callers apply it before
+# calling the functions. The translation is
 # mechanical, except for the loop driver and the cached reads described below:
 #   - A C function becomes `mem: <params>:` returning the new memory, or { mem; ret; }
 #     when it returns a value.
@@ -3453,6 +3455,9 @@ let
       symbols = concatStringsSep "" (
         map (x: "      ${quoteAttr x.name} = ${toString x.addr};\n") d.symbols
       );
+      strings = concatStringsSep "" (
+        map (s: "      { addr = ${toString s.addr}; size = ${toString s.size}; }\n") d.strings
+      );
       writes = concatStringsSep "" (
         map (w: "      [ ${toString w.addr} ${toString w.size} ${toString w.value} ]\n") d.inits
       );
@@ -3461,6 +3466,7 @@ let
     + "    base = ${toString d.base};\n"
     + "    size = ${toString d.size};\n"
     + "    symbols = ${if d.symbols == [ ] then "{ }" else "{\n${symbols}    }"};\n"
+    + "    strings = ${if d.strings == [ ] then "[ ]" else "[\n${strings}    ]"};\n"
     + "    init = mem: ${if d.inits == [ ] then "mem" else "R.initData mem [\n${writes}    ]"};\n"
     + "  };\n";
 

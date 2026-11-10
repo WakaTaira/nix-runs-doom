@@ -1630,6 +1630,204 @@ let
     }
   '';
 
+  # ---- Slice 8: string literals ----
+  # Expected values follow C, worked out by hand and checked against gcc
+  # (-fwrapv -funsigned-char) where the size of a pointer does not matter.
+
+  # The byte lists of the string literal tokens of src.
+  strBytes = src: map (k: k.bytes) (filter (k: k.kind == "string") (toks src));
+  # The values of the character literal tokens of src.
+  charValues = src: map (k: k.value) (filter (k: k.kind == "char") (toks src));
+  # The results of the calls [ fn arg ... ] of src, each on its initialized data (as dret,
+  # but compiled once), with loadFn.
+  dretAllWith =
+    loadFn: src: calls:
+    let
+      d = loadData loadFn src;
+    in
+    map (c: (foldl' (g: a: g a) (d.f.${head c} d.mem) (builtins.tail c)).ret) calls;
+  dretAll = dretAllWith Cc.load;
+  # __data.strings of the loaded src as [ offset size ] pairs, offsets relative to base.
+  stringsOf =
+    loaded:
+    map (s: [
+      (s.addr - base)
+      s.size
+    ]) loaded.__data.strings;
+
+  strExprSrc = ''
+    int slen(const char *s) { int n = 0; while (*s++) n++; return n; }
+    int ssum(const char *s) { int t = 0; while (*s) t += *s++; return t; }
+    int scmp(const char *a, const char *b) {
+      while (*a && *a == *b) { a++; b++; }
+      return *a - *b;
+    }
+    const char *ret3(void) { return "abc"; }
+    int calls(void) {
+      return slen("hello") * 100 + slen("") * 10 + scmp("abc", ret3()) + scmp("abd", "abc") * 1000;
+    }
+    int reads(void) { return "abc"[1] * 1000000 + *"abc" * 1000 + *("abc" + 2) + 2["abc"] * 0; }
+    int sizes(void) {
+      return sizeof "abc" + sizeof("") * 10 + sizeof("ab" "cd" "e") * 100 + sizeof("abc" + 1) * 1000
+        + sizeof(*"abc") * 10000;
+    }
+    int ptrs(void) {
+      const char *p;
+      p = "xyz";
+      const char *q = p + 1;
+      return p[2] + (q - p) * 1000 + (p != 0) * 10000 + (q > p) * 100000;
+    }
+    int retd(void) { return ret3()[2] + ret3()[3] * 10; }
+    int conds(int c) { const char *p = c ? "abc" : "de"; return slen(p) * 100 + *p; }
+    int commas(int x) { int r = (x++, "pq")[1]; return r * 10 + x; }
+    int ands(int x) { int r = x && slen("abc") == 3; return r * 10 + (x || "a"[0] == 'b'); }
+    int scan(void) { int n = 0; for (int i = 0; i < 5; i++) n += "abcde"[i] * (i + 1); return n; }
+    int cached(int k) { int s = 0; for (int i = 0; i < k; i++) s += "xyz"[1] * i; return s; }
+    char buf[16];
+    void fill(void) { for (int i = 0; i < 6; i++) buf[i] = "abcde"[i]; }
+    void copy(char *d, const char *s, int n) { for (int i = 0; i < n; i++) d[i] = s[i]; }
+    void strcp(char *d, const char *s) { while ((*d++ = *s++)) ; }
+    int copied(void) {
+      fill();
+      int a = ssum(buf);
+      copy(buf, "hello", 6);
+      int b = slen(buf) * 1000 + buf[4];
+      strcp(buf, "world!");
+      return a * 1000000 + b * 10 + slen(buf);
+    }
+    int copied2(void) { strcp(buf, "world!"); return ssum(buf); }
+    int high(void) { return "\377\200"[0] + "\377\200"[1] * 1000 + (*"\377" > 0) * 1000000; }
+  '';
+
+  strInitSrc = ''
+    char s8[8] = "abc";
+    char sn[] = "abc";
+    char s3[3] = "abc";
+    char after = 'z';
+    char s4[4] = { "abc" };
+    char sb[] = { "abc" };
+    signed char ss[] = "\377a";
+    unsigned char us[] = "\377a";
+    struct M { char name[6]; const char *p; int v; } m1 = { "abc", "def", 3 };
+    char names[3][8] = { "a", "bc", "def" };
+    const char *pn[] = { "a", "b", "a" };
+    union U { char c[4]; int i; } u1 = { "ab" };
+    char n1[][8] = { "a", "bc" };
+    char n2[2][3] = { "abc", "def" };
+    struct S { char name[4]; int v; } t1[] = { "ab", 1, "cd", 2 }, t2[] = { { "ef", 3 }, { "gh", 4 } };
+    const char *cn[] = { "a" "b", "c" };
+    char sz[sizeof "abc"];
+    char *pp = "abc" + 1;
+    char *pq = &"abc"[1];
+    unsigned char *pu = (unsigned char *)"abc";
+    char *pb = { "abc" };
+    int *pi = "abc";
+    const char *fp = "same";
+    char sp[] = ("abc");
+    int i1(void) { return s8[2] * 1000 + s8[3] + s8[7] + sizeof s8 * 1000000; }
+    int i2(void) { return sizeof sn * 100 + sn[3] + sn[0] * 1000; }
+    int i3(void) { return sizeof s3 * 1000 + s3[2] + after * 10000; }
+    int i4(void) { return s4[2] + s4[3] * 10 + sizeof s4 * 1000 + sizeof sb * 100000 + sb[1] * 10000000; }
+    int i5(void) { return ss[0] * 1000 + us[0] + ss[1] * 1000000; }
+    int i6(void) { return m1.name[2] * 1000000 + m1.p[1] * 1000 + m1.v + sizeof(struct M) * 100; }
+    int i7(void) { return names[1][1] * 1000000 + names[2][2] * 1000 + names[0][1] + sizeof names * 10; }
+    int i8(void) { return (pn[0] == pn[2]) + (pn[0] != pn[1]) * 10 + pn[1][0] * 100; }
+    int i9(void) { return u1.c[1] * 1000 + u1.c[2] + sizeof u1 * 100000; }
+    int i10(void) { return sizeof n1 + n1[1][1] * 100 + sizeof n2 * 100000 + ((char *)n2)[3] * 1000000; }
+    int i11(void) { return sizeof t1 + t1[1].name[1] * 100 + t1[1].v * 100000 + t1[0].v * 1000000; }
+    int i12(void) { return sizeof t2 + t2[1].name[0] * 100 + t2[1].v * 100000 + t2[0].name[1] * 1000000; }
+    int i13(void) { return sizeof cn + cn[0][1] * 100 + cn[1][0] * 100000; }
+    int i14(void) {
+      return sizeof sz + (pp == pq) * 10 + ((char *)pu == pb) * 100 + *pp * 1000
+        + ((char *)pi == pb) * 1000000;
+    }
+    int i15(void) { return (fp == "same") + sizeof sp * 10 + sp[2] * 100; }
+    int stl(int k) {
+      static char b[] = "xy";
+      static const char *q = "xy";
+      static char *r = { "pq" };
+      b[0] = 'X';
+      return b[k] + q[k] * 1000 + sizeof b * 1000000 + r[1] * 10000000;
+    }
+    int sw(int x) {
+      switch (x) {
+      case sizeof "ab": return 1;
+      case sizeof(char[sizeof "abcd"]): return 2;
+      default: return 0;
+      }
+    }
+    int an(void) { const char *s = "abcd"; return (int)((const char *)(&"abcd" + 1) - s) + sizeof *&"abcd" * 10; }
+    int tf(void) { int r = 0; if ("a") r = 1; return r + !"" * 10 + !!"" * 100; }
+    int nc(int c) {
+      const char *p = c ? "abc" : (void *)0;
+      const char *q = c ? (void *)0 : "d";
+      int *z = 0;
+      int *w = c ? z : 0;
+      return (p == 0) + (q == 0) * 10 + (w == 0) * 100 + (p ? *p : 0) * 1000;
+    }
+  '';
+
+  strStoreSrc = ''
+    int g1;
+    static int g2 = 3;
+    char arr[] = "qq";
+    int lenof(const char *s) { int n = 0; while (s[n]) n++; return n; }
+    int sf(void) { static int st = 1; return lenof("ab") + lenof("ab") + lenof("cde") + sizeof "zzzz" + st; }
+    int z(void) {
+      const char *p = "a\0b";
+      const char *q = "a\0c";
+      return (p != q) + p[2] * 10 + q[2] * 1000 + lenof(p) * 100000 + sizeof "a\0b" * 1000000;
+    }
+  '';
+  strStore = Cc.load strStoreSrc;
+
+  strOrderSrc = ''
+    const char *a = "one";
+    int f(void) { return *"two" + *"one"; }
+    const char *b = "three";
+    int h(void) { return (a == "one") + (b == "three") * 10 + *"two" * 100; }
+  '';
+
+  strShareSrc = ''
+    const char *s1(void) { return "abc"; }
+    const char *s2(void) { return "abc"; }
+    const char *s3(void) { return "bc"; }
+    int eq(void) { return (s1() == s2()) + (s1() + 1 == s3()) * 10; }
+    char *gm(void) { return "mno"; }
+    int w(void) { char *p = gm(); p[0] = 'M'; "mno"[1] = 'N'; return gm()[0] * 1000 + gm()[1]; }
+  '';
+
+  strNoStorageSrc = ''
+    char ca[] = "zz";
+    char cb[sizeof "abc"];
+    int so(void) { return sizeof "abcdef" + sizeof("xy" + 1) + sizeof(*"pq") + sizeof ca * 100; }
+  '';
+
+  # Inputs generated at the sizes of Doom's data (about 1,800 string literals).
+  manyStrings = n: f: concatStringsSep ", " (genList f n);
+  strDistinctSrc = ''
+    const char *t[] = { ${manyStrings 2000 (i: "\"s${toString i}\"")} };
+    int rd(int i, int j) { return t[i][j]; }
+    int ne(void) { return t[0] != t[1] && t[1998] != t[1999]; }
+  '';
+  strSameSrc = ''
+    const char *u[] = { ${manyStrings 2000 (_: "\"same\"")} };
+    int eq(void) { return u[0] == u[1999] && u[1000] == u[0]; }
+  '';
+  bigString = concatStringsSep "" (genList (_: "a") 4095) + "Z";
+  strBigSrc = ''
+    const char *b = "${bigString}";
+    char arr[] = "${bigString}";
+    int rb(void) { return b[4095] + "${bigString}"[4094] * 1000; }
+    int ra(void) { return arr[4095] + sizeof arr * 1000; }
+  '';
+  strJoinedSrc = ''
+    int sz(void) {
+      return sizeof ${concatStringsSep " " (genList (_: "\"ab\"") 200)}
+        + (${concatStringsSep "\n" (genList (_: "\"ab\"") 200)})[399] * 10000;
+    }
+  '';
+
 in
 [
   # Lexer
@@ -1701,7 +1899,40 @@ in
     "3:4"
   ])
   (t "cc lex: preprocessor directive throws" (!(tryEval (toks "#define X 1")).success) true)
-  (t "cc lex: string literal throws" (!(tryEval (toks "f(\"s\")")).success) true)
+  (t "cc lex: string literal"
+    (map (k: [
+      k.kind
+      (k.bytes or null)
+      (posOf k)
+    ]) (toks "f(\"s\")"))
+    [
+      [
+        "ident"
+        null
+        "1:1"
+      ]
+      [
+        "punct"
+        null
+        "1:2"
+      ]
+      [
+        "string"
+        [ 115 ]
+        "1:3"
+      ]
+      [
+        "punct"
+        null
+        "1:6"
+      ]
+      [
+        "eof"
+        null
+        "1:7"
+      ]
+    ]
+  )
 
   # Parser: precedence and associativity
   (t "cc parse: a - b - c is left-associative" (parsed "a - b - c") "(- (- a b) c)")
@@ -1783,7 +2014,17 @@ in
   )
   (t "cc lex: character literal position" (posOf (elemAt (toks "x = '\\''") 2)) "1:5")
   (t "cc lex: multi-character literal throws" (!(tryEval (toks "'ab'")).success) true)
-  (t "cc lex: octal escape throws" (!(tryEval (toks "'\\012'")).success) true)
+  (t "cc lex: octal and hex escapes in character literals"
+    (charValues "'\\012' '\\377' '\\x41' '\\101' '\\0' '\"'")
+    [
+      10
+      255
+      65
+      65
+      0
+      34
+    ]
+  )
   (t "cc lex: unterminated character literal throws" (!(tryEval (toks "'a")).success) true)
 
   # Parser: types
@@ -2072,7 +2313,27 @@ in
       "float"
     ]
   )
-  (t "cc parse: string literal throws" (throws "int f(void) { return g(\"s\"); }") true)
+  (t "cc parse: string literal"
+    (
+      let
+        a = head (exprOf "g(\"ab\" \"c\")").args;
+      in
+      [
+        a.kind
+        a.bytes
+        (posOf a)
+      ]
+    )
+    [
+      "strlit"
+      [
+        97
+        98
+        99
+      ]
+      "1:41"
+    ]
+  )
   (t "cc parse: designated initializer throws" (throws "int a[2] = { [1] = 2 };") true)
   (t "cc parse: block-scope static" (map (d: d.storage) (bodyDecls "void f(void) { static int x; }"))
     [
@@ -7779,6 +8040,583 @@ in
       4326
       140
       true
+    ]
+  )
+
+  # ---- Slice 8: string literals ----
+
+  # Lexer
+  (t "cc lex: escapes in string literals"
+    (strBytes ''
+      a = "\n\t\r\b\a\f\v\\\'\"\?"; b = "\0"; c = "\377\x41\101"; d = "\1234"; e = "\08";
+      f = "\x41g"; g = "\012"; h = "\0007"; i = "\x0000041";
+    '')
+    [
+      [
+        10
+        9
+        13
+        8
+        7
+        12
+        11
+        92
+        39
+        34
+        63
+      ]
+      [ 0 ]
+      [
+        255
+        65
+        65
+      ]
+      [
+        83
+        52
+      ]
+      [
+        0
+        56
+      ]
+      [
+        65
+        103
+      ]
+      [ 10 ]
+      [
+        0
+        55
+      ]
+      [ 65 ]
+    ]
+  )
+  (t "cc lex: 0 bytes, quotes, backslashes and comment markers in string literals"
+    [
+      (strBytes ''a = "a\0b"; b = "a\\"; c = "\""; d = ""; e = "'"; f = "//"; g = "/*"; h = "*/";'')
+      (length (toks ''a = "/*"; b'')) # a = "/*" ; b eof
+      (charValues "x = '\"';")
+      (strBytes "x = \"\\200\\xff\";")
+    ]
+    [
+      [
+        [
+          97
+          0
+          98
+        ]
+        [
+          97
+          92
+        ]
+        [ 34 ]
+        [ ]
+        [ 39 ]
+        [
+          47
+          47
+        ]
+        [
+          47
+          42
+        ]
+        [
+          42
+          47
+        ]
+      ]
+      6
+      [ 34 ]
+      [
+        [
+          128
+          255
+        ]
+      ]
+    ]
+  )
+  (t "cc lex: adjacent string literals are joined into the first"
+    (
+      let
+        ks = toks "x = \"ab\" \"c\"; y = \"a\" /* c */ \"b\"\n  // d\n  \"c\"; z = \"\\x1\" \"2\";";
+        strs = filter (k: k.kind == "string") ks;
+      in
+      [
+        (map (k: k.bytes) strs)
+        (map posOf strs)
+        (length ks)
+      ]
+    )
+    [
+      [
+        [
+          97
+          98
+          99
+        ]
+        [
+          97
+          98
+          99
+        ]
+        [
+          1
+          50
+        ]
+      ]
+      [
+        "1:5"
+        "1:19"
+        "3:12"
+      ]
+      13
+    ]
+  )
+  (t "cc lex: invalid string and character literals throw" (map lexThrows [
+    "x = \"ab;"
+    "x = \"a\nb\";"
+    "x = \"\\q\";"
+    "x = \"\\x\";"
+    "x = \"\\x100\";"
+    "x = \"\\400\";"
+    "x = '\\400';"
+    "x = \"a${builtins.fromJSON ''"\u00e9"''}\";"
+  ]) (genList (_: true) 8))
+  (t "cc lex: prefixed string literals throw, a prefix with a space is an identifier"
+    [
+      (map lexThrows [
+        "x = L\"a\";"
+        "x = u\"a\";"
+        "x = U\"a\";"
+        "x = u8\"a\";"
+      ])
+      (texts "L \"a\" u8 \"b\" xu\"c\"")
+    ]
+    [
+      [
+        true
+        true
+        true
+        true
+      ]
+      [
+        "L"
+        "\"a\""
+        "u8"
+        "\"b\""
+        "xu"
+        "\"c\""
+        ""
+      ]
+    ]
+  )
+
+  # Expressions
+  (t "cc run: string literals in expressions"
+    (dretAll strExprSrc [
+      [ "calls" ]
+      [ "reads" ]
+      [ "sizes" ]
+      [ "ptrs" ]
+      [ "retd" ]
+      [
+        "conds"
+        1
+      ]
+      [
+        "conds"
+        0
+      ]
+      [
+        "commas"
+        5
+      ]
+      [
+        "ands"
+        1
+      ]
+      [
+        "ands"
+        0
+      ]
+      [ "high" ]
+    ])
+    [
+      1500
+      98097099
+      14614
+      111122
+      99
+      397
+      300
+      1136
+      11
+      0
+      1128255
+    ]
+  )
+  (t "cc run: loops over string literals, with cached reads and in bulk"
+    (
+      let
+        out = Cc.compile strExprSrc;
+      in
+      [
+        (dretAll strExprSrc [
+          [ "scan" ]
+          [
+            "cached"
+            4
+          ]
+          [ "copied" ]
+          [ "copied2" ]
+        ])
+        (contains "'char = M.loadByte mem " out)
+        (contains "M.storeRun" out)
+      ]
+    )
+    [
+      [
+        1495
+        726
+        495051116
+        585
+      ]
+      true
+      true
+    ]
+  )
+
+  # Storage
+  (t "cc run: string literals are placed after the variables and static locals"
+    [
+      (stringsOf strStore)
+      strStore.__data.size
+      (map (n: strStore.__data.symbols.${n} - base) [
+        "g1"
+        "g2"
+        "arr"
+        "sf'st'5'27"
+      ])
+      (dretAll strStoreSrc [
+        [ "sf" ]
+        [ "z" ]
+      ])
+    ]
+    [
+      [
+        [
+          16
+          3
+        ]
+        [
+          19
+          4
+        ]
+        [
+          23
+          4
+        ]
+        [
+          27
+          4
+        ]
+      ]
+      31
+      [
+        0
+        4
+        8
+        12
+      ]
+      [
+        13
+        4199981
+      ]
+    ]
+  )
+  (t "cc run: string literals are placed in the order of their first use"
+    [
+      (stringsOf (Cc.load strOrderSrc))
+      (dretAll strOrderSrc [ [ "h" ] ])
+    ]
+    [
+      [
+        [
+          8
+          4
+        ]
+        [
+          12
+          4
+        ]
+        [
+          16
+          6
+        ]
+      ]
+      [ 11611 ]
+    ]
+  )
+  (t "cc run: equal string literals share an array, a tail does not, writes are seen"
+    [
+      (stringsOf (Cc.load strShareSrc))
+      (dretAll strShareSrc [
+        [ "eq" ]
+        [ "w" ]
+      ])
+    ]
+    [
+      [
+        [
+          0
+          4
+        ]
+        [
+          4
+          3
+        ]
+        [
+          7
+          4
+        ]
+      ]
+      [
+        1
+        77078
+      ]
+    ]
+  )
+  (t "cc run: sizeof operands and character array initializers need no storage"
+    [
+      (Cc.load strNoStorageSrc).__data.strings
+      (dretAll strNoStorageSrc [ [ "so" ] ])
+      (contains "    strings = [ ];\n" (Cc.compile strNoStorageSrc))
+    ]
+    [
+      [ ]
+      [ 312 ]
+      true
+    ]
+  )
+  (t "cc run: data without string literals is placed as before"
+    [
+      (Cc.load dataSrc).__data.strings
+      (Cc.load (import ../cc/examples/draw.nix)).__data.size
+      (Cc.load (import ../cc/examples/draw.nix)).__data.strings
+    ]
+    [
+      [ ]
+      2148
+      [ ]
+    ]
+  )
+  (t "cc run: string literals move with dataBase, and must end at or below 2^32"
+    (
+      let
+        src = "const char *p = \"ab\"; int f(void) { return *\"cd\" + p[1] * 1000; }";
+        high =
+          s: Cc.compileWith { dataBase = 4294967288; } "int a; const char *f(void) { return \"${s}\"; }";
+        loadHigh = Cc.loadWith { dataBase = 4294967288; } "int a; const char *f(void) { return \"abc\"; }";
+      in
+      [
+        (map (s: [
+          s.addr
+          s.size
+        ]) (Cc.loadWith { dataBase = 8192; } src).__data.strings)
+        (dretAllWith (Cc.loadWith { dataBase = 8192; }) src [ [ "f" ] ])
+        (tryEval (high "abc")).success
+        (map (s: s.addr) loadHigh.__data.strings)
+        (tryEval (high "abcd")).success
+      ]
+    )
+    [
+      [
+        [
+          8196
+          3
+        ]
+        [
+          8199
+          3
+        ]
+      ]
+      [ 98099 ]
+      true
+      [ 4294967292 ]
+      false
+    ]
+  )
+
+  # Initializers
+  (t "cc run: string literals as initializers"
+    [
+      (dretAll strInitSrc (
+        map (n: [ n ]) [
+          "i1"
+          "i2"
+          "i3"
+          "i4"
+          "i5"
+          "i6"
+          "i7"
+          "i8"
+          "i9"
+          "i10"
+          "i11"
+          "i12"
+          "i13"
+          "i14"
+          "i15"
+        ]
+      ))
+      (offsetsOf strInitSrc [
+        "s3"
+        "after"
+      ])
+    ]
+    [
+      [
+        8099000
+        97400
+        1223099
+        980404099
+        96999255
+        99102603
+        99102240
+        9811
+        498000
+        100609916
+        1210016
+        102410316
+        9909808
+        1098114
+        9941
+      ]
+      [
+        12
+        15
+      ]
+    ]
+  )
+  (t "cc run: string literals in static locals, sizeof in case labels, &, ! and ?:"
+    (dretAll strInitSrc [
+      [
+        "stl"
+        0
+      ]
+      [
+        "stl"
+        1
+      ]
+      [
+        "sw"
+        3
+      ]
+      [
+        "sw"
+        5
+      ]
+      [
+        "sw"
+        4
+      ]
+      [ "an" ]
+      [ "tf" ]
+      [
+        "nc"
+        1
+      ]
+      [
+        "nc"
+        0
+      ]
+    ])
+    [
+      1133120088
+      1133121121
+      1
+      2
+      0
+      55
+      101
+      97110
+      101
+    ]
+  )
+  (t "cc compile: invalid uses of string literals throw" (map compileThrows [
+    "char s[2] = \"abc\";"
+    "int a[] = \"abc\";"
+    "int a[4] = \"abc\";"
+    "char s[4] = { \"abc\", \"d\" };"
+    "void f(void) { char buf[] = \"abc\"; }"
+    "int f(int x) { switch (x) { case \"abc\"[1]: return 1; } return 0; }"
+    "int x = \"abc\"[0];"
+    "int x = (int)\"abc\";"
+    "void f(void) { \"abc\" = 0; }"
+  ]) (genList (_: true) 9))
+
+  # Sizes (the evaluation stack must not overflow)
+  (t "cc run: 2000 distinct string literals in one initializer"
+    [
+      (dretAll strDistinctSrc [
+        [
+          "rd"
+          0
+          1
+        ]
+        [
+          "rd"
+          1000
+          4
+        ]
+        [
+          "rd"
+          1999
+          4
+        ]
+        [ "ne" ]
+      ])
+      (length (Cc.load strDistinctSrc).__data.strings)
+    ]
+    [
+      [
+        48
+        48
+        57
+        1
+      ]
+      2000
+    ]
+  )
+  (t "cc run: 2000 equal string literals share one array"
+    [
+      (dretAll strSameSrc [ [ "eq" ] ])
+      (stringsOf (Cc.load strSameSrc))
+    ]
+    [
+      [ 1 ]
+      [
+        [
+          8000
+          5
+        ]
+      ]
+    ]
+  )
+  (t "cc run: a string literal of 4096 bytes and a join of 200 literals"
+    [
+      (dretAll strBigSrc [
+        [ "rb" ]
+        [ "ra" ]
+      ])
+      (dretAll strJoinedSrc [ [ "sz" ] ])
+    ]
+    [
+      [
+        97090
+        4097090
+      ]
+      [ 980401 ]
     ]
   )
 ]

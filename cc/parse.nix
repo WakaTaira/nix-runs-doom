@@ -122,7 +122,10 @@
 #       (no suffix, l/L, ll/LL), text the literal as written. `-1` is a "unary" node.
 #   { kind = "charlit"; value; text; }                     character literal (type int);
 #       value is the character code, text the literal as written; position: the literal
-#   { kind = "ident"; name; }                              variable; position: the name
+#   { kind = "strlit"; bytes; }                            string literal (adjacent ones
+#       joined, see cc/lex.nix); bytes are the byte values without the terminating 0;
+#       position: the first literal
+#   { kind = "ident"; name; }                            variable; position: the name
 #   { kind = "call"; name; args = [ <expression> ]; }      direct call; position: the name
 #   { kind = "cast"; type; expr; }                         position: the `(`
 #   { kind = "unary"; op; expr; }                          op: "-" "~" "!"; position: op
@@ -1803,6 +1806,11 @@ let
         else if t.kind == "char" then
           {
             node = mk t "charlit" { inherit (t) value text; };
+            i = i + 1;
+          }
+        else if t.kind == "string" then
+          {
+            node = mk t "strlit" { inherit (t) bytes; };
             i = i + 1;
           }
         else if t.kind == "ident" then

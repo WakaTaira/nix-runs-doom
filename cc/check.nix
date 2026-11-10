@@ -40,8 +40,9 @@
 # the value the generated code would compute (signed int and long wrap to 32 bits), except
 # a division by zero. A constant shift of a 32-bit value by a negative amount or by 32 or
 # more, and of a long long by a negative amount, by 64 or more, or left by 63, is
-# unsupported. The address of a file-scope variable is a pointer "lit", and so is
-# a constant pointer plus or minus a constant (member offsets and constant indices).
+# unsupported. The address of a file-scope variable (or of a static local or a string
+# literal) is a pointer "lit", and so is a constant pointer plus or minus a constant
+# (member offsets and constant indices).
 #   { kind = "lit"; value; }                     integer constant in the range of type, or
 #                                                a constant address (pointer type)
 #   { kind = "var"; var; }                       local variable or parameter;
@@ -80,7 +81,10 @@
 # Arrays, structs and unions are objects in memory: while an expression is checked they are
 # "deref" nodes of array, struct or union type (the address in expr), which never reach
 # the typed tree. An array used as a value decays to a pointer to its first element; a
-# struct or union is only used through its members, its address and sizeof.
+# struct or union is only used through its members, its address and sizeof. A string
+# literal is such an array object of type char[N] (N counts the 0 at the end) at a
+# constant address; its contents are read from memory, never folded, so it is not part
+# of an integer constant expression (but sizeof of it is).
 #
 # Statements (position of the first token):
 #   { kind = "block"; items; }
@@ -117,21 +121,33 @@
 # File-scope variables are placed in declaration order (of their definitions), each at the
 # next offset aligned for its type, from the address dataBase (default 0x00400000), and
 # after them the static locals in source order, each named
-# `<function>'<name>'<line>'<col>` (of its name; not a C identifier):
-#   { base; size; symbols = [ { name; addr; } ]; inits = [ { addr; size; value; } ]; }
-# size is the end of the last variable minus base. inits are the scalar stores of the
-# initializers whose value is not 0 (size 1, 2 or 4 bytes, value in the stored unsigned
-# form), in address order within each variable.
+# `<function>'<name>'<line>'<col>` (of its name; not a C identifier), and after them the
+# arrays of the string literals that need storage (see stringUses), one for each distinct
+# contents, with alignment 1, in the order of the first such literal of each:
+#   { base; size; symbols = [ { name; addr; } ]; strings = [ { addr; size; } ];
+#     inits = [ { addr; size; value; } ]; }
+# size is the end of the last variable or string minus base; strings are in address
+# order. inits are the scalar stores of the initializers whose value is not 0 (size 1, 2
+# or 4 bytes, value in the stored unsigned form), in address order within each variable,
+# followed by the bytes of the strings that are not 0.
+#
+# A string literal initializes an array of char, signed char or unsigned char (alone or
+# in braces, also as an element or member without braces): its bytes are stored, the
+# rest of the array keeps 0, the array may leave out the 0 at the end, and an array
+# without a length takes N. A literal there and in the operand of sizeof needs no storage;
+# every other one does, which is decided from the syntax tree and the types only.
 let
   B = import ../lib/bits.nix;
   inherit (builtins)
     any
     attrNames
+    attrValues
     bitAnd
     bitOr
     bitXor
     concatLists
     concatMap
+    concatStringsSep
     div
     elem
     elemAt
@@ -139,6 +155,7 @@ let
     foldl'
     genericClosure
     genList
+    groupBy
     hasAttr
     head
     isAttrs
@@ -148,6 +165,7 @@ let
     listToAttrs
     map
     removeAttrs
+    sort
     stringLength
     substring
     ;
@@ -475,6 +493,30 @@ let
   # struct is defined.
   hasLLong = t: if isArray t then hasLLong t.of else t.tag == "llong";
 
+  # An array of char, signed char or unsigned char (which a string literal may initialize).
+  isCharArray =
+    t:
+    isArray t
+    && elem t.of.tag [
+      "char"
+      "schar"
+      "uchar"
+    ];
+
+  # The type of a string literal with the contents bytes: char[N], N counting the 0 at
+  # the end.
+  stringType = bytes: {
+    tag = "array";
+    of = ty "char";
+    len = length bytes + 1;
+  };
+
+  hexDigits = "0123456789abcdef";
+  hexByte = b: substring (div b 16) 1 hexDigits + substring (bitAnd b 15) 1 hexDigits;
+  # The key of the contents bytes of a string literal in ctx.strings: `"` and two hex
+  # digits per byte (not a data symbol, and the 0 bytes are kept).
+  stringKey = bytes: "\"" + concatStringsSep "" (map hexByte bytes);
+
   # ---- Expressions ----
 
   node =
@@ -549,7 +591,8 @@ let
     else
       node x "cast" t { expr = x; };
 
-  isNullConst = x: x.kind == "lit" && x.value == 0 && isInteger x.type;
+  # The type is tested before the value, so the address of a constant pointer is not read.
+  isNullConst = x: x.kind == "lit" && isInteger x.type && x.value == 0;
   # A null pointer constant for a function pointer: also `(void *)0`.
   isNullFn = x: isNullConst x || x.kind == "lit" && isPtr x.type && isVoid x.type.to && x.value == 0;
 
@@ -715,6 +758,8 @@ let
       node e "lit" (litType e) { inherit (e) value; }
     else if k == "charlit" then
       litAt e tInt e.value
+    else if k == "strlit" then
+      stringObject env.ctx e
     else if k == "ident" then
       identExpr env e
     else if k == "call" then
@@ -777,6 +822,15 @@ let
   objectAt =
     ctx: e: t: sym:
     node e "deref" t { expr = litAt e (ptrTo t) ctx.addrs.${sym}; };
+
+  # The array of the string literal e (a "strlit" node), at the address of its contents
+  # (see placeStrings).
+  stringObject =
+    ctx: e:
+    let
+      t = stringType e.bytes;
+    in
+    node e "deref" t { expr = litAt e (ptrTo t) ctx.strings.${stringKey e.bytes}; };
 
   # A name in env.vars is a local variable, or a block-scope `extern` or `static` variable
   # ({ name; type; object; } with object its data symbol).
@@ -1006,6 +1060,13 @@ let
     else
       sizeOfT env.ctx t;
 
+  # Whether the expression e, typed as x, is a null pointer constant of type `void *`: a
+  # cast to `void *` of an integer constant 0 (`(void *)0`). The test reads the form of e,
+  # not the value of x, so it never reads a constant address.
+  isVoidNull =
+    env: e: x:
+    isPtr x.type && isVoid x.type.to && e.kind == "cast" && isNullConst (valueOf env e.expr);
+
   # `c ? a : b`: the branches converted to their common type.
   condExpr =
     env: e:
@@ -1023,6 +1084,10 @@ let
         else if isFnPtr ta && isNullFn b then
           ta
         else if isNullFn a && isFnPtr tb then
+          tb
+        else if isPtr ta && isVoidNull env e.elseExpr b then
+          ta
+        else if isVoidNull env e.thenExpr a && isPtr tb then
           tb
         else if isPtr ta && isNullConst b then
           ta
@@ -2095,14 +2160,15 @@ let
   # funcs: the function signatures by name ({ ret; params; variadic; defined; }); defs: the
   # typed function definitions; size: the bytes placed so far; objects: the placed variables
   # ([ { name; addr; end; at; writes; } ], writes as the inits of the data). The context
-  #   ctx = { structs; enums; consts; globals; tags; addrs; }
+  #   ctx = { structs; enums; consts; globals; tags; addrs; strings; }
   # holds the struct and union layouts by tag (see "Objects"), the enum types by tag, the
   # enumerators by name ({ type; value; }), the file-scope variables by name
   # ({ type; defined; hasInit; at; }), the internal names of the block-scope tags in scope
-  # by tag (empty at file scope; see resolveType), and the addresses of all defined
+  # by tag (empty at file scope; see resolveType), the addresses of all defined
   # variables and static locals by data symbol, taken from the end of the fold and
   # placeStatics (an extern declaration may precede the definition that places the
-  # variable).
+  # variable), and the addresses of the string literals by key (see stringKey), taken
+  # from placeStrings.
 
   fileEnv = acc: {
     vars = { };
@@ -2482,7 +2548,14 @@ let
   # initializer list.
   sizedType =
     env: g: t:
-    if isArray t && t.len == null && g.init != null && g.init.kind == "initlist" then
+    let
+      s = stringInit t g.init;
+    in
+    if !(isArray t && t.len == null && g.init != null) then
+      t
+    else if s != null then
+      t // { len = length s.bytes + 1; }
+    else if g.init.kind == "initlist" then
       t // { len = (fillFrom env t 0 g.init.items 0).count; }
     else
       t;
@@ -2527,7 +2600,12 @@ let
 
   initWrites =
     env: t: a: x:
-    if isAggregate t then
+    let
+      s = stringInit t x;
+    in
+    if s != null then
+      stringWrites t a s
+    else if isAggregate t then
       (
         if x.kind == "initlist" then
           fillList env t a x
@@ -2538,6 +2616,47 @@ let
       scalarList env t a x
     else
       [ (scalarInit env t a x) ];
+
+  # The string literal that initializes the array t from the initializer x: x itself, or
+  # the only item of a braced x, when t is an array of a character type; null when x is
+  # no such initializer. A string literal for an array of another type is an error.
+  stringInit =
+    t: x:
+    let
+      items = x.items;
+    in
+    if !isArray t then
+      null
+    else if x.kind == "strlit" then
+      (
+        if isCharArray t then x else fail x "array of non-character type initialized from a string literal"
+      )
+    else if x.kind == "initlist" && isCharArray t && (head items).kind == "strlit" then
+      (
+        if length items > 1 then
+          fail (elemAt items 1) "excess elements in char array initializer"
+        else
+          head items
+      )
+    else
+      null;
+
+  # The stores of the string literal s into the character array t at address a: its bytes
+  # (the end of the array keeps the 0 of the memory). The array may leave out the 0 at the
+  # end of the literal, but no other byte.
+  stringWrites =
+    t: a: s:
+    let
+      n = length s.bytes;
+    in
+    if t.len < n then
+      fail s "initializer-string for char array is too long"
+    else
+      genList (i: {
+        addr = a + i;
+        size = 1;
+        value = elemAt s.bytes i;
+      }) n;
 
   fillList =
     env: t: a: list:
@@ -2606,7 +2725,7 @@ let
           x = elemAt items st.i;
           sa = a + slot.offset;
           r =
-            if x.kind == "initlist" then
+            if x.kind == "initlist" || (x.kind == "strlit" && isCharArray slot.type) then
               {
                 writes = initWrites env slot.type sa x;
                 i = st.i + 1;
@@ -2656,6 +2775,8 @@ let
         addr = a;
         inherit size;
         value = bitAnd v (B.pow2 (8 * size) - 1);
+        # The initializer, whose string literals need storage (see stringUses).
+        expr = x;
       };
 
   constAddress =
@@ -2718,6 +2839,84 @@ let
       }
     ) { inherit (acc) size objects; } (concatMap (f: declsIn "statics" f.body) acc.defs);
 
+  # The string literals in the syntax tree n that need storage: all of them but those in
+  # the operand of sizeof and in the initializers of static locals (whose literals come
+  # from their stores, see stringUses).
+  stringsIn = collect (x: kindOf x == "strlit") (
+    x:
+    elem (kindOf x) [
+      "strlit"
+      "sizeof"
+      "sizeoftype"
+    ]
+    || kindOf x == "vardecl" && x.storage == "static"
+  );
+
+  # The string literals that need storage: those in the function bodies, and those in the
+  # scalar initializers of the placed objects (a literal that initializes a character
+  # array is not one of them). Both are found from the syntax tree and the types, without
+  # the addresses, which depend on them.
+  stringUses =
+    items: objects:
+    concatMap (i: if i.kind == "func" then stringsIn i.body else [ ]) items
+    ++ concatMap (o: concatMap (w: if w ? expr then stringsIn w.expr else [ ]) o.writes) objects;
+
+  # Whether the node a comes before the node b in the source.
+  before = a: b: a.line < b.line || a.line == b.line && a.col < b.col;
+
+  # The arrays of the string literals uses (see stringUses), one for each contents, placed
+  # from the offset start in the order of the first use of each, with alignment 1.
+  # -> { list = [ { key; addr; size; bytes; at; } ]; end; addrs; } with end the offset
+  # after the last one and addrs the addresses by key (ctx.strings). The offsets are forced
+  # in order, so they do not build a chain of thunks.
+  placeStrings =
+    dataBase: start: uses:
+    let
+      groups = groupBy (u: stringKey u.bytes) uses;
+      firsts = sort before (
+        map (us: foldl' (a: b: if before b a then b else a) (head us) us) (attrValues groups)
+      );
+      n = length firsts;
+      step =
+        st:
+        let
+          s = elemAt firsts st.k;
+          size = length s.bytes + 1;
+        in
+        builtins.seq st.off (
+          if st.k >= n then
+            null
+          else
+            {
+              node = {
+                key = stringKey s.bytes;
+                addr = dataBase + st.off;
+                inherit size;
+                inherit (s) bytes;
+                at = s;
+              };
+              s = {
+                k = st.k + 1;
+                off = st.off + size;
+              };
+            }
+        );
+      r = iterate step {
+        k = 0;
+        off = start;
+      };
+    in
+    {
+      list = r.nodes;
+      end = r.s.off;
+      addrs = listToAttrs (
+        map (s: {
+          name = s.key;
+          value = s.addr;
+        }) r.nodes
+      );
+    };
+
   checkItems =
     dataBase: items:
     let
@@ -2731,6 +2930,7 @@ let
           globals = { };
           tags = { };
           inherit addrs;
+          strings = strings.addrs;
         };
         size = 0;
         objects = [ ];
@@ -2742,8 +2942,13 @@ let
           value = o.addr;
         }) placed.objects
       );
+      strings = placeStrings dataBase placed.size (stringUses items placed.objects);
     in
-    r // { inherit (placed) size objects; };
+    r
+    // {
+      inherit (placed) size objects;
+      inherit strings;
+    };
 
   # How the block-scope extern x refers to the file-scope variable of its name in the final
   # context ctx: "ok" (defined, with a compatible type), "undefined" or "type" (defined
@@ -2780,14 +2985,26 @@ let
       blockExtern = head blockExterns;
       # The first variable that ends above 2^32.
       overflow = head (filter (o: o.end > B.mask32 + 1) r.objects);
+      # The string literals that end above 2^32 (after the variables, which end below).
+      stringOverflows = filter (s: s.addr + s.size > B.mask32 + 1) r.strings.list;
       extern = r.ctx.globals.${head externs};
+      objectInits = map (w: { inherit (w) addr size value; }) (concatMap (o: o.writes) r.objects);
+      stringInits = concatMap (
+        s:
+        genList (i: {
+          addr = s.addr + i;
+          size = 1;
+          value = elemAt s.bytes i;
+        }) (length s.bytes)
+      ) r.strings.list;
       result = {
         funcs = r.defs;
         data = {
           base = dataBase;
-          inherit (r) size;
+          size = if r.strings.list == [ ] then r.size else r.strings.end;
           symbols = map (o: { inherit (o) name addr; }) r.objects;
-          inits = filter (w: w.value != 0) (concatMap (o: o.writes) r.objects);
+          strings = map (s: { inherit (s) addr size; }) r.strings.list;
+          inits = filter (w: w.value != 0) (objectInits ++ stringInits);
         };
       };
     in
@@ -2806,6 +3023,8 @@ let
       fail (head conflicts) "conflicting types for '${(head conflicts).name}'"
     else if undefinedCalls != [ ] then
       unsupported (head undefinedCalls) "call to function '${(head undefinedCalls).name}' that is declared but not defined"
+    else if stringOverflows != [ ] then
+      fail (head stringOverflows).at "the data does not fit below 2^32 from dataBase (string literal)"
     else
       builtins.deepSeq result result;
 
