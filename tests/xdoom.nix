@@ -200,14 +200,24 @@ let
       (drawSpanRowCase 62)
       (drawSpanRowCase 63)
       {
-        name = "xdoom: draw gate at exactly 1.25 passes";
-        got = Spike.drawGate 1.25;
+        name = "xdoom: draw gate at exactly 0.75 passes";
+        got = Spike.drawGate 0.75;
         expected = "DRAW GATE: pass";
       }
       {
-        name = "xdoom: draw gate at 1.26 fails";
-        got = Spike.drawGate 1.26;
+        name = "xdoom: draw gate at 0.76 fails";
+        got = Spike.drawGate 0.76;
         expected = "DRAW GATE: fail";
+      }
+      {
+        name = "xdoom: frame cost of 5 frames against 1 is a quarter of the difference";
+        got = Spike.frameCost 5 1.0 3.0;
+        expected = 0.5;
+      }
+      {
+        name = "xdoom: frame cost of 2 frames against 1 is the difference";
+        got = Spike.frameCost 2 1.0 3.0;
+        expected = 2.0;
       }
       {
         name = "xdoom: spike verdict at exactly 2.0 is option 3";

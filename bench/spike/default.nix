@@ -10,24 +10,30 @@
 #        `drawReport` compares it with nix
 #
 # Measurement: every variant runs the full load (columns=160, spans=200,
-# muls=10000) for 1 and for 2 frames, three times each. Nix records its own CPU
+# muls=10000) for 1, 2 and 5 frames, three times each. Nix records its own CPU
 # time (a clock is not observable inside an evaluation), and the report reads it
-# back. The cost of one frame is min(cpuTime of 2 frames) - min(cpuTime of 1
-# frame), which cancels the fixed cost of an evaluation.
+# back. `report` (the M0 verdict) takes the cost of one frame as min(cpuTime of 2
+# frames) - min(cpuTime of 1 frame); `ccReport` and `drawReport` take
+# (min(cpuTime of 5 frames) - min(cpuTime of 1 frame)) / 4. Both cancel the fixed cost
+# of an evaluation; the longer baseline of the second damps the run-to-run jitter. The
+# rounds (r) are the outer loop, so the variants alternate and drift in machine load
+# hits all of them alike.
 #
-#   mkdir -p /tmp/spike && for v in rv rvx nix; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+#   mkdir -p /tmp/spike && for r in 1 2 3; do for v in rv rvx nix; do for k in 1 2; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 #   SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report
 #
-# The cc gate (cc/nix <= 1.25) needs only the nix and cc variants:
+# The cc gate (cc/nix <= 1.25) needs only the nix and cc variants, with 1 and 5 frames:
 #
-#   mkdir -p /tmp/spike && for v in nix cc; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+#   mkdir -p /tmp/spike && for r in 1 2 3; do for v in nix cc; do for k in 1 5; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 #   SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport
 #
-# The draw gate (draw/nix <= 1.25, the same bound as the cc gate) needs the nix and draw
-# variants.
+# The draw gate (draw/nix <= 0.75) needs the nix and draw variants, with 1 and 5 frames.
 #
-#   mkdir -p /tmp/spike && for v in nix draw; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
-#   SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.drawReport
+#   mkdir -p /tmp/spike && for r in 1 2 3; do for v in nix draw; do for k in 1 5; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+#   SPIKE_STATS_DIR=/tmp/spike nice -n 19 taskset -c 0-15 nix eval --raw -f . bench.spike.drawReport
+#
+# `bench.spike.screens` holds the sha256 of the 64000 screen bytes after one full frame
+# of nix, cc and draw; the three must be equal.
 let
   D = import ./data.nix;
   cc = import ../../cc;
@@ -75,7 +81,15 @@ let
   entry = v: {
     n1 = workload v 1;
     n2 = workload v 2;
+    n5 = workload v 5;
   };
+
+  # sha256 of the screen bytes (as a JSON list) after one full frame.
+  screenHash =
+    v:
+    builtins.hashString "sha256" (
+      builtins.toJSON (D.screenBytes (v.run (D.image (full // { frames = 1; }))))
+    );
 
   pixels = 64000;
 
@@ -131,7 +145,16 @@ let
       ]
     );
 
-  measuredCost = v: minTime v 2 - minTime v 1;
+  # Cost of one frame from the minimum times of a run of 1 frame and of `frames` frames.
+  frameCost =
+    frames: t1: tn:
+    (tn - t1) / (frames - 1);
+
+  # M0 verdict: 2 frames against 1.
+  measuredCost = v: frameCost 2 (minTime v 1) (minTime v 2);
+
+  # Gate reports: 5 frames against 1.
+  measuredCost5 = v: frameCost 5 (minTime v 1) (minTime v 5);
 
   # A variant passes when it is at most `limit` times as slow as the hand-written Nix.
   gate =
@@ -139,7 +162,7 @@ let
     if ratio <= limit then "${label} GATE: pass" else "${label} GATE: fail";
 
   ccGate = gate "CC" 1.25;
-  drawGate = gate "DRAW" 1.25;
+  drawGate = gate "DRAW" 0.75;
 
   # Report of the variant `name` against the hand-written Nix; `costs` holds { nix; <name>; }
   # in seconds per frame.
@@ -169,7 +192,14 @@ in
   cc = entry variants.cc;
   draw = entry variants.draw;
 
+  screens = {
+    nix = screenHash variants.nix;
+    cc = screenHash variants.cc;
+    draw = screenHash variants.draw;
+  };
+
   inherit
+    frameCost
     verdict
     mkReport
     ccGate
@@ -196,8 +226,8 @@ in
     else
       mkCcReport {
         costs = {
-          nix = measuredCost "nix";
-          cc = measuredCost "cc";
+          nix = measuredCost5 "nix";
+          cc = measuredCost5 "cc";
         };
       };
 
@@ -207,8 +237,8 @@ in
     else
       mkDrawReport {
         costs = {
-          nix = measuredCost "nix";
-          draw = measuredCost "draw";
+          nix = measuredCost5 "nix";
+          draw = measuredCost5 "draw";
         };
       };
 }

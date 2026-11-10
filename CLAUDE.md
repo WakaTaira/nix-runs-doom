@@ -41,6 +41,7 @@ The Nix C compiler keeps its C inputs and test cases as Nix strings (`cc/example
 | Spike report (needs measured stats, see below) | `SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report` |
 | cc gate report (needs measured stats of `nix` and `cc`, see below) | `SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport` |
 | draw gate report (needs measured stats of `nix` and `draw`, see below) | `SPIKE_STATS_DIR=/tmp/spike nice -n 19 taskset -c 0-15 nix eval --raw -f . bench.spike.drawReport` |
+| Screen hashes after one full frame (`nix`, `cc`, `draw`; must be equal) | `nice -n 19 taskset -c 0-15 nix eval --json -f . bench.spike.screens` |
 | Format | `nix fmt` |
 
 The flake exposes only `lib`, `tests`, `fizzbuzz` and `fizzbuzzC`, so the commands on those also work as `.#<attr>` (flakes only see git-tracked files, so `git add -N` new files first). `bench.*`, `scaffold.*` and `cc.*` are used with `-f .` only.
@@ -56,21 +57,21 @@ nix eval --raw -f . bench.report
 Execution-strategy spike (M0; compares clang-compiled RV32IM, the same with the `fixmul` instruction, and C translated to Nix; each variant runs 1 and 2 frames three times, and the cost of a frame is the difference of the minimum CPU times):
 
 ```sh
-mkdir -p /tmp/spike && for v in rv rvx nix; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+mkdir -p /tmp/spike && for r in 1 2 3; do for v in rv rvx nix; do for k in 1 2; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.report
 ```
 
-Gate of the Nix C compiler (`cc/`; compares the compiled C with the hand-written Nix variant and prints `CC GATE: pass` when cc/nix <= 1.25):
+Gate of the Nix C compiler (`cc/`; compares the compiled C with the hand-written Nix variant and prints `CC GATE: pass` when cc/nix <= 1.25). The gates take the cost of a frame as (minimum CPU time of 5 frames - minimum of 1 frame) / 4, and the rounds are the outer loop so that the variants alternate:
 
 ```sh
-mkdir -p /tmp/spike && for v in nix cc; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+mkdir -p /tmp/spike && for r in 1 2 3; do for v in nix cc; do for k in 1 5; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 SPIKE_STATS_DIR=/tmp/spike nix eval --raw -f . bench.spike.ccReport
 ```
 
-Gate of the draw input (`cc/examples/draw.nix`: file-scope variables, argument-less draw functions, early return, wrapped signed arithmetic; prints `DRAW GATE: pass` when draw/nix <= 1.25, the same bound as the cc gate):
+Gate of the draw input (`cc/examples/draw.nix`: file-scope variables, argument-less draw functions, early return, wrapped signed arithmetic; prints `DRAW GATE: pass` when draw/nix <= 0.75):
 
 ```sh
-mkdir -p /tmp/spike && for v in nix cc draw; do for k in 1 2; do for r in 1 2 3; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
+mkdir -p /tmp/spike && for r in 1 2 3; do for v in nix draw; do for k in 1 5; do NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/spike/$v-n$k-$r.json nice -n 19 taskset -c 0-15 nix eval -f . bench.spike.$v.n$k >/dev/null; done; done; done
 SPIKE_STATS_DIR=/tmp/spike nice -n 19 taskset -c 0-15 nix eval --raw -f . bench.spike.drawReport
 ```
 
@@ -100,13 +101,13 @@ Regenerate the transitional C fixture: `nix build .#fizzbuzz-c && cp result/fizz
 - `toolchain/doom.nix` — build-only derivation behind `nix build .#doom-scaffold`: cross-compiles unpatched doomgeneric for RV32IM with clang + lld against headers and stubs generated from `lib/hostcall.nix`; outputs `doom.elf`, `doom.hex` and `doom.dis`.
 - `scaffold/` — doomgeneric on the emulator: `boot.nix` (loads the ELF, builds argv on the stack, runs with `runUntil` of `lib/cpu.nix` until a frame count), `platform.nix` (the `DG_*` host calls: frame records and a virtual clock), `render.nix` (ANSI still image), `profile.nix` (pc samples summed by function), `default.nix` (`scaffold.boot.report`, `scaffold.title`, `scaffold.demo.report`).
 - `tests/unit.nix`, `tests/mext.nix`, `tests/dsl.nix` — RV32I, M-extension and eDSL tests; every CPU test runs both with and without a code region and the two must agree (`tests/paths.nix`). `tests/mem.nix` checks `lib/mem.nix` against a naive reference built from `loadWordAt` / `storeWordAt`, and `storeRun` / `storeStride` against a `storeByte` fold.
-- `cc/` — the C compiler written in Nix (C source -> Nix source): `lex.nix` (lexer), `parse.nix` (parser), `check.nix` (type checker), `emit.nix` (Nix code generator), `runtime.nix` (runtime helpers used by the generated code), `default.nix` (`compile` / `load`), `examples/spike.nix` (the M0 reference C as a string), `examples/draw.nix` (the same workload in Doom's shape: file-scope variables, argument-less draw functions, early return). File-scope variables live at fixed addresses in a data area (`__data` of the compiled output holds `base`, `size`, `symbols` and `init`; `compileWith` / `loadWith` take `dataBase`). `emit.nix` drives a loop with no condition to test with `R.loopDo`, and an innermost loop without calls caches its reads at constant addresses in loop variables, read again after any store that may overlap them.
+- `cc/` — the C compiler written in Nix (C source -> Nix source): `lex.nix` (lexer), `parse.nix` (parser), `check.nix` (type checker), `emit.nix` (Nix code generator), `runtime.nix` (runtime helpers used by the generated code), `default.nix` (`compile` / `load`), `examples/spike.nix` (the M0 reference C as a string), `examples/draw.nix` (the same workload in Doom's shape: file-scope variables, argument-less draw functions, early return). File-scope variables live at fixed addresses in a data area (`__data` of the compiled output holds `base`, `size`, `symbols` and `init`; `compileWith` / `loadWith` take `dataBase`). `emit.nix` drives a loop with no condition to test with `R.loopDo`, and an innermost loop without calls caches its reads at constant addresses in loop variables, read again after any store that may overlap them. An innermost loop without calls that has a countable trip count (`n--`, `--n`, or a unit-step comparison), induction or temporary variables only, exactly one 1-byte store at an address `a0 + k * d` and loads of known extent runs in bulk: after an entry test (counts, address ranges below 2^32 and no overlap between the store range and the load ranges) it computes the stored values with `genList` and writes them with `M.storeRun` / `M.storeStride`, and when the test is false it runs the ordinary loop. The exact rules are at the top of `cc/emit.nix`.
 - `tests/cc.nix` — tests of the Nix C compiler.
 - `tests/fastpath.nix` — regression and self-modifying-code tests for the code-region path.
-- `tests/xdoom.nix` — both-path tests for the `fixmul` (custom-0) instruction, the equivalence tests of the five spike variants (`rv`, `rvx`, `nix`, `cc`, `draw`), the packed-position rows of `R_DrawSpan` of `draw`, and the boundary tests of the spike verdict, the cc gate and the draw gate.
+- `tests/xdoom.nix` — both-path tests for the `fixmul` (custom-0) instruction, the equivalence tests of the five spike variants (`rv`, `rvx`, `nix`, `cc`, `draw`), the packed-position rows of `R_DrawSpan` of `draw`, and the boundary tests of the frame-cost calculation, the spike verdict, the cc gate (1.25) and the draw gate (0.75).
 - `examples/fizzbuzz/` — FizzBuzz in the eDSL.
 - `examples/fizzbuzz-c/`, `toolchain/guest.nix` — transitional clang-built C version and its hex fixture.
-- `bench/spike/` — the M0 execution-strategy spike: `data.nix` (shared memory image and checks), `rv.nix` / `rvx.nix` (clang output transcribed to the eDSL, without / with `fixmul`), `nix.nix` (the C translated to Nix), `default.nix` (`bench.spike.*` workloads and the report with its verdict). Variant `cc` is the same C compiled by `cc/`; `bench.spike.ccReport` compares it with `nix` and prints the `CC GATE:` line. Variant `draw` is `cc/examples/draw.nix` compiled by `cc/` (the memory is initialized with `__data.init` first); `bench.spike.drawReport` compares it with `nix` and prints the `DRAW GATE:` line.
+- `bench/spike/` — the M0 execution-strategy spike: `data.nix` (shared memory image and checks), `rv.nix` / `rvx.nix` (clang output transcribed to the eDSL, without / with `fixmul`), `nix.nix` (the C translated to Nix), `default.nix` (`bench.spike.*` workloads and the report with its verdict). Variant `cc` is the same C compiled by `cc/`; `bench.spike.ccReport` compares it with `nix` and prints the `CC GATE:` line (the cost of a frame is measured with 5 frames against 1). Variant `draw` is `cc/examples/draw.nix` compiled by `cc/` (the memory is initialized with `__data.init` first); `bench.spike.drawReport` compares it with `nix` and prints the `DRAW GATE:` line (bound 0.75). `bench.spike.screens` holds the sha256 of the screen after one full frame of `nix`, `cc` and `draw`.
 - `fixmul` (`lib/cpu.nix`, encoder in `lib/asm.nix`) — custom-0 instruction for Doom's fixed-point multiply: `(a * b) >> 16` on signed 32-bit operands via a 64-bit product.
 - `bench/` — `workload.nix`, `report.nix` (Doom performance budget), `format.nix` (shared number/string formatting), `default.nix` (`bench.run` / `bench.report`).
 
