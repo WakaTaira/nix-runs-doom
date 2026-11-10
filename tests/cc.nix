@@ -1155,6 +1155,10 @@ let
     int zero(unsigned char *d, unsigned char *t, int n) { while (n--) *d++ = t[n & 63]; return n; }
     int fill(unsigned char *d, int n) { while (n--) *d++ = 42; return 0; }
     int copy(unsigned char *d, unsigned char *s, int n) { while (n--) *d++ = *s++; return 0; }
+    int lens(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[i & 63] + t[i & 1023]; i++; } return 0; }
+    int conv(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = (t[i & 63] + ((signed char *)t)[i & 63]) >> 1; i++; } return 0; }
+    int top16k(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[u & 16383]; u += 1000; } return 0; }
+    int over16k(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[u & 16384]; u += 1000; } return 0; }
   '';
   pageCode = fnCode pageSrc;
   # The functions of pageSrc with the marked bulk stores (see bulkFns), and with a
@@ -1238,6 +1242,16 @@ let
     (-32768)
     0
   ];
+  # The 1024-byte table r of lens at 0x50f0, crossing the leaf at 0x5100, and the
+  # 16385-byte table w of top16k and over16k at 0x20010.
+  tr = 20720;
+  tw = 131088;
+  trOf = j: bitAnd (j * 11 + j / 256) 255;
+  twOf = j: bitAnd (j * 17 + j / 128) 255;
+  rMem = M.storeRun M.empty tr 1024 (genList trOf 1024);
+  wMem = M.storeRun M.empty tw 16385 (genList twOf 16385);
+  # The value of conv for the unsigned byte u: (u + (signed char)u) >> 1.
+  convOf = u: if u >= 128 then u - 128 else u;
   # The counts of the value tests: around the threshold 32, and a long loop.
   pageCounts = [
     1
@@ -5940,6 +5954,120 @@ in
       true
       false
       true
+      true
+    ]
+  )
+
+  (t "cc page: reads of one base with two lengths get their own pages, and T follows the longer"
+    [
+      (countIn "M\\.readPages" (pageCode "lens"))
+      (contains " >= 40 then" (pageCode "lens"))
+      (map (n: pageOn rMem "lens" [ pbuf tr n ] pbuf n) [
+        31
+        32
+        33
+        39
+        40
+        41
+        300
+      ])
+    ]
+    [
+      2
+      true
+      (map
+        (n: [
+          0
+          (genList (k: bitAnd (trOf (bitAnd k 63) + trOf (bitAnd k 1023)) 255) n)
+          true
+        ])
+        [
+          31
+          32
+          33
+          39
+          40
+          41
+          300
+        ]
+      )
+    ]
+  )
+  (t "cc page: reads that differ only in their conversion share the pages"
+    [
+      (countIn "M\\.readPages" (pageCode "conv"))
+      (pageRuns fMem "conv" (n: [
+        pbuf
+        tf
+        n
+      ]))
+    ]
+    [
+      1
+      (pageWant (_: 0) (_: k: convOf (tfOf (bitAnd k 63))))
+    ]
+  )
+  (t "cc page: a read range of 16384 bytes is read by pages from T = 520 on, one of 16385 is not"
+    [
+      (countIn "M\\.readPages" (pageCode "top16k"))
+      (contains " >= 520 then" (pageCode "top16k"))
+      (countIn "M\\.readPages" (pageCode "over16k"))
+      (map (n: pageOn wMem "top16k" [ pbuf tw n ] pbuf n) [
+        519
+        520
+        521
+      ])
+      (map (n: pageOn wMem "over16k" [ pbuf tw n ] pbuf n) [
+        519
+        520
+        521
+      ])
+      (runsUnpaged wMem "top16k" [
+        pbuf
+        tw
+        519
+      ])
+      (runsUnpaged wMem "top16k" [
+        pbuf
+        tw
+        520
+      ])
+      (runsUnpaged wMem "over16k" [
+        pbuf
+        tw
+        521
+      ])
+    ]
+    [
+      1
+      true
+      0
+      (map
+        (n: [
+          0
+          (genList (k: twOf (bitAnd (1000 * k) 16383)) n)
+          true
+        ])
+        [
+          519
+          520
+          521
+        ]
+      )
+      (map
+        (n: [
+          0
+          (genList (k: twOf (bitAnd (1000 * k) 16384)) n)
+          true
+        ])
+        [
+          519
+          520
+          521
+        ]
+      )
+      true
+      false
       true
     ]
   )
