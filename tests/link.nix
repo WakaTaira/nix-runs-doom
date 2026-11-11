@@ -8,6 +8,7 @@ let
   Ch = import ../cc/check.nix;
   H = import ../lib/hostcall.nix;
   Lk = import ../cc/link.nix;
+  Lx = import ../cc/lex.nix;
   P = import ../cc/parse.nix;
   M = import ../lib/mem.nix;
   B = import ../lib/bits.nix;
@@ -1804,6 +1805,23 @@ in
       ]
       [ "a" ]
       "a"
+    ]
+  )
+  (t "cc link 35: the tokens of a unit carry its name, which the errors of the lexer show"
+    (
+      let
+        src = "int f(void)\n{\n  return \"a\" \"b\"[0]; /* x\n */ }\n";
+      in
+      [
+        (Lx.lexNamed "a" src == map (k: k // { file = "a"; }) (Lx.lex src))
+        (throws (Lx.lexNamed "a" "int f(void) { return 1.5; }"))
+        (throws (lk [ (u "a" "int f(void) { return 1.5; }") ]))
+      ]
+    )
+    [
+      true
+      true
+      true
     ]
   )
   (t "cc link 31: switch conditions and sizeof operands that fold an imported address"

@@ -19,8 +19,7 @@
 #                                                  with external linkage, __data, __units
 #                                                  and __init (apply it to the memory first);
 #                                                  errors of a unit are at
-#                                                  <name>:<line>:<col> (but those of the
-#                                                  lexer, at <line>:<col>)
+#                                                  <name>:<line>:<col>
 #   linkFiles   { files; read; includePaths ? [ ]; defines ? { }; dataBase ? <default>;
 #                 host ? host.default; allowUndefined ? false; }
 #                            -> attrs              the same for the files (each preprocessed

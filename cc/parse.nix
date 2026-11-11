@@ -10,9 +10,9 @@
 # "<file>:<line>:<col>", and every node also has `file` and `seq` (the index of its
 # token in the translation unit, see cc/lex.nix fromPp), which identifies it where the
 # position does in other input: the tokens of one macro expansion share a position. With
-# parseNamed, every node has `file` (the name of the unit) and no `seq`, so the position
-# is "<name>:<line>:<col>" (but in the errors of cc/lex.nix, which has no name) and
-# nodes are identified by their position as with parse.
+# parseNamed, every token (cc/lex.nix lexNamed) and node has `file` (the name of the
+# unit) and no `seq`, so the position is "<name>:<line>:<col>", and nodes are identified
+# by their position as with parse.
 #
 # Syntax tree
 # -----------
@@ -1876,10 +1876,10 @@ let
   parse = src: parseTokenList (L.lex src);
 
   # The unit node of the source src of the unit named name (cc/link.nix): as parse, but
-  # every token and node also has file = name, so that errors are at
-  # "<name>:<line>:<col>". Nothing else changes (anonymous tags and the identity of nodes
-  # stay those of parse, as they have no seq).
-  parseNamed = name: src: parseTokenList (map (t: t // { file = name; }) (L.lex src));
+  # every token and node also has file = name, so that errors, those of the lexer
+  # included, are at "<name>:<line>:<col>". Nothing else changes (anonymous tags and the
+  # identity of nodes stay those of parse, as they have no seq).
+  parseNamed = name: src: parseTokenList (L.lexNamed name src);
 
   # The unit node of a token list (as produced by cc/lex.nix lex or fromPp).
   parseTokenList =

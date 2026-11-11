@@ -37,7 +37,9 @@
 # and string literals with a prefix (L, u, U, and u8 for strings, which are recognized
 # with the literal), floating-point literals, and characters that start no C token.
 # Errors are thrown as "cc: <line>:<col>: <message>" ("unsupported: ..." for valid C
-# outside the subset).
+# outside the subset). lexNamed name src is lex for the source of a unit named name (of
+# a link, see cc/parse.nix parseNamed): its tokens also have file = name, and its errors
+# are at "<name>:<line>:<col>".
 #
 # For the preprocessor (cc/pp.nix): ppLex cuts a file into preprocessing tokens (lines
 # spliced, comments removed, nothing checked), ppOne tells whether a text is one such
@@ -439,13 +441,31 @@ let
       if k == 1 then
         pos // { col = pos.col + stringLength s; }
       else
-        {
+        pos
+        // {
           line = pos.line + (k - 1) / 2;
           col = stringLength (elemAt lines (k - 1)) + 1;
         };
 
-  lex =
-    src:
+  lex = lexFrom {
+    line = 1;
+    col = 1;
+  };
+
+  # The tokens of the source of the unit named name: as lex, but every token, and the
+  # position of every error, also has file = name.
+  lexNamed =
+    name:
+    lexFrom {
+      line = 1;
+      col = 1;
+      file = name;
+    };
+
+  # lex from the position origin ({ line; col; } and maybe file), whose other attributes
+  # every position keeps.
+  lexFrom =
+    origin: src:
     let
       pieces = split tokenRe src;
       n = (length pieces - 1) / 2;
@@ -453,14 +473,7 @@ let
       raw = genList (
         i:
         let
-          before =
-            if i == 0 then
-              {
-                line = 1;
-                col = 1;
-              }
-            else
-              (elemAt raw (i - 1)).end;
+          before = if i == 0 then origin else (elemAt raw (i - 1)).end;
           start = advance before (elemAt pieces (2 * i));
           text = head (elemAt pieces (2 * i + 1));
         in
@@ -471,19 +484,10 @@ let
       ) n;
       # Force positions and tokens in source order (first error wins, shallow recursion).
       forced = foldl' (acc: r: builtins.seq r.tok (builtins.seq r.end acc)) null raw;
-      endPos = advance (
-        if n == 0 then
-          {
-            line = 1;
-            col = 1;
-          }
-        else
-          (elemAt raw (n - 1)).end
-      ) (elemAt pieces (2 * n));
-      eof = {
+      endPos = advance (if n == 0 then origin else (elemAt raw (n - 1)).end) (elemAt pieces (2 * n));
+      eof = endPos // {
         kind = "eof";
         text = "";
-        inherit (endPos) line col;
       };
     in
     builtins.seq forced (joinStrings (map (r: r.tok) (filter (r: r.tok != null) raw)) ++ [ eof ]);
@@ -793,6 +797,7 @@ in
 {
   inherit
     lex
+    lexNamed
     ppLex
     ppOne
     fromPpToken
