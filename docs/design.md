@@ -69,16 +69,26 @@ behaviour.
 ### Shifts by a variable amount are not reduced
 
 - **What.** A shift by a variable amount multiplies or divides by a power of two from a
-  table of 63 entries (`B.shl`, `B.srl` and `B.sra` in `lib/bits.nix`, `R.shlInt` and
-  `R.sraInt` in `cc/runtime.nix`); the amount is not taken modulo 32. A constant amount
-  outside the range of the type is rejected at compile time
-  (`unsupported: shift of a 32-bit value by ...`, `cc/check.nix`).
+  table of the powers 2^0 to 2^62 (`B.pow2` in `lib/bits.nix`), and the amount is not
+  reduced: `B.shl`, `B.srl` and `B.sra` in `lib/bits.nix` and `R.shlInt` and `R.sraInt`
+  in `cc/runtime.nix` for 32-bit values, `R.shlLL` and `R.sraLL` in `cc/runtime.nix` for
+  `long long`. A constant amount outside the range of the type is rejected at compile
+  time (`unsupported: shift of a 32-bit value by ...`, `... of a 64-bit value by ...` and
+  `left shift of a 64-bit value by 63`, `cc/check.nix`).
 - **Why.** Masking the amount would be paid by every variable shift.
-- **Observable differences.** An amount of 32 to 62 gives 0 (or -1 for `>>` of a negative
-  value), unless the product passes 2^63, which stops the evaluation with
-  `integer overflow`; a negative amount or one of 63 or more stops it with an index error
-  of `builtins.elemAt`. (C leaves these undefined; RISC-V uses the low 5 bits of the
-  amount.)
+- **Observable differences.**
+  - 32-bit values (`int`, `long`, their unsigned types, and narrower types after
+    promotion): an amount of 32 to 62 gives 0 (or -1 for `>>` of a negative value),
+    unless the product of `<<` passes 2^63, which stops the evaluation with
+    `integer overflow`; a negative amount or one of 63 or more stops it with an index
+    error of `builtins.elemAt`. (C leaves these undefined; RISC-V uses the low 5 bits of
+    the amount.)
+  - `long long`: an amount of 0 to 63 for `>>` gives the value C defines: 0 to 62 divide
+    exactly, with the floor (`R.sraLL 1099511627776 32` is 256), and 63 gives the sign,
+    0 or -1. `<<` by 0 to 62 is exact, and a result that passes the range stops the
+    evaluation with `integer overflow` (see below). `<<` by 63, even of 0 (which C
+    defines as 0), `>>` by 64 or more and a negative amount stop it with an index error
+    of `builtins.elemAt`.
 
 ### `long long` does not wrap
 
