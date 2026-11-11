@@ -1562,6 +1562,49 @@ in
       4
     ]
   )
+  (t "cc link 35: the nodes of a unit carry its name; tags and static locals keep their names"
+    (
+      let
+        src = "struct { int v; } s; extern int x; int f(void) { static int n; return n + s.v + x; }";
+        named = P.parseNamed "a" src;
+        plain = P.parse src;
+        checked = Ch.checkWith {
+          dataBase = base;
+          link.externAddr = _: 0;
+        } named;
+      in
+      [
+        (map (i: i.file or null) named.items)
+        ((elemAt named.items 1).type.name == (elemAt plain.items 1).type.name)
+        (elemAt named.items 1).type.name
+        (attrNames (lkWith { allowUndefined = true; } [ (u "a" src) ]).__data.units.a.symbols)
+        (attrNames (Cc.load "${src} int x;").__data.symbols)
+        (map (v: v.file or null) checked.layout.imports.vars)
+        (head checked.checked.funcs).file
+      ]
+    )
+    [
+      [
+        "a"
+        "a"
+        "a"
+        "a"
+      ]
+      true
+      "(anonymous at 1:1)"
+      [
+        "f'n'1'61"
+        "s"
+      ]
+      [
+        "f'n'1'61"
+        "s"
+        "x"
+      ]
+      [ "a" ]
+      "a"
+    ]
+  )
   (t "cc link 31: switch conditions and sizeof operands that fold an imported address"
     [
       (runCalls folded [

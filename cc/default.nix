@@ -17,7 +17,10 @@
 #                            -> attrs              compile the preprocessed C sources and
 #                                                  link them (cc/link.nix): the functions
 #                                                  with external linkage, __data, __units
-#                                                  and __init (apply it to the memory first)
+#                                                  and __init (apply it to the memory first);
+#                                                  errors of a unit are at
+#                                                  <name>:<line>:<col> (but those of the
+#                                                  lexer, at <line>:<col>)
 #   linkFiles   { files; read; includePaths ? [ ]; defines ? { }; dataBase ? <default>;
 #                 host ? host.default; allowUndefined ? false; }
 #                            -> attrs              the same for the files (each preprocessed
@@ -90,7 +93,7 @@ let
     Lk.link {
       units = map (u: {
         inherit (u) name;
-        unit = P.parse u.src;
+        unit = P.parseNamed u.name u.src;
       }) units;
       inherit dataBase host allowUndefined;
     };

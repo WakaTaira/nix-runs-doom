@@ -2,13 +2,17 @@
 # operators by precedence climbing). Typedef names are tracked per scope, so a
 # declaration and an expression or a cast are told apart as in C.
 #
-# Entry points: parse : string -> unit node, and parseTokenList : tokens -> unit node (for
-# the tokens of a preprocessed file, cc/lex.nix fromPp). Errors are thrown as
+# Entry points: parse : string -> unit node, parseNamed : name -> string -> unit node (a
+# unit of a link, see below), and parseTokenList : tokens -> unit node (for the tokens of
+# a preprocessed file, cc/lex.nix fromPp). Errors are thrown as
 # "cc: <line>:<col>: <message>", and as "cc: <line>:<col>: unsupported: <what>" for valid
 # C outside the supported subset; for a preprocessed file the position is
 # "<file>:<line>:<col>", and every node also has `file` and `seq` (the index of its
 # token in the translation unit, see cc/lex.nix fromPp), which identifies it where the
-# position does in other input: the tokens of one macro expansion share a position.
+# position does in other input: the tokens of one macro expansion share a position. With
+# parseNamed, every node has `file` (the name of the unit) and no `seq`, so the position
+# is "<name>:<line>:<col>" (but in the errors of cc/lex.nix, which has no name) and
+# nodes are identified by their position as with parse.
 #
 # Syntax tree
 # -----------
@@ -191,7 +195,8 @@ let
       inherit kind;
       inherit (t) line col;
     }
-    // (if t ? seq then { inherit (t) file seq; } else { })
+    // (if t ? file then { inherit (t) file; } else { })
+    // (if t ? seq then { inherit (t) seq; } else { })
     // fields;
 
   setOf =
@@ -669,7 +674,7 @@ let
           name =
             if hasTag then
               tagTok.text
-            else if kw ? file then
+            else if kw ? seq then
               "(anonymous at ${posText kw} #${toString i})"
             else
               "(anonymous at ${toString kw.line}:${toString kw.col})";
@@ -1870,6 +1875,12 @@ let
   # surface while the items are iterated; deepSeq makes that independent of laziness.
   parse = src: parseTokenList (L.lex src);
 
+  # The unit node of the source src of the unit named name (cc/link.nix): as parse, but
+  # every token and node also has file = name, so that errors are at
+  # "<name>:<line>:<col>". Nothing else changes (anonymous tags and the identity of nodes
+  # stay those of parse, as they have no seq).
+  parseNamed = name: src: parseTokenList (map (t: t // { file = name; }) (L.lex src));
+
   # The unit node of a token list (as produced by cc/lex.nix lex or fromPp).
   parseTokenList =
     toks:
@@ -1879,5 +1890,5 @@ let
     builtins.deepSeq unit unit;
 in
 {
-  inherit parse parseTokenList;
+  inherit parse parseNamed parseTokenList;
 }

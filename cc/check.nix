@@ -23,7 +23,7 @@
 # functions. Without link, imports are empty.
 #
 # Errors are thrown as "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for
-# a preprocessed file, whose nodes have `file`), and as
+# a preprocessed file or a named unit of a link, whose nodes have `file`), and as
 # "cc: <line>:<col>: unsupported: <what>" for valid C outside the supported subset.
 # `types` holds the type helpers shared with the emitter, `collect` the tree walker, and
 # `constExpr` / `noConstHooks` the integer constant expression evaluator (see there).
@@ -207,7 +207,8 @@ let
     substring
     ;
 
-  # The position of a node: { line; col; }, with file and seq for a preprocessed file.
+  # The position of a node: { line; col; }, with file and seq for a preprocessed file, and
+  # file for a unit of a link (cc/parse.nix parseNamed).
   posOf =
     n:
     if n ? seq then
@@ -219,6 +220,8 @@ let
           seq
           ;
       }
+    else if n ? file then
+      { inherit (n) line col file; }
     else
       { inherit (n) line col; };
   # The identity of the node n in keys and names: its position "<line>:<col>", or in a
