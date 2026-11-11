@@ -19,12 +19,12 @@
 # A block-scope extern that disagrees with another declaration of the name, calls of a
 # function through declarations that disagree, and a call to a function with internal
 # linkage that is declared but not defined stay errors (see linkUnit), raised when imports
-# or checked is evaluated. checked also has
-# link = { funcs; }, the names of the imported functions. Without link, imports are empty.
-# Errors are thrown as
-# "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for a preprocessed file,
-# whose nodes have `file`), and as "cc: <line>:<col>: unsupported: <what>" for valid
-# C outside the supported subset. `types` holds the type helpers shared with the emitter,
+# or checked is evaluated. checked also has link = { funcs; }, the names of the imported
+# functions. Without link, imports are empty.
+#
+# Errors are thrown as "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for
+# a preprocessed file, whose nodes have `file`), and as
+# "cc: <line>:<col>: unsupported: <what>" for valid C outside the supported subset. `types` holds the type helpers shared with the emitter,
 # `collect` the tree walker, and `constExpr` / `noConstHooks` the integer constant
 # expression evaluator (see there).
 #
