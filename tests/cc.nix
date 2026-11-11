@@ -1647,6 +1647,24 @@ let
     in
     map (c: (foldl' (g: a: g a) (d.f.${head c} d.mem) (builtins.tail c)).ret) calls;
   dretAll = dretAllWith Cc.load;
+
+  # ---- The whole source as one macro (the preprocessed path) ----
+  # Every token of the expansion is at the position of the macro name: the worst case for
+  # anything that tells nodes apart by their position. The code must be the same as without
+  # the preprocessor, except the names of the static locals in __data.symbols.
+  asOneMacro = src: "#define ALL_ " + builtins.replaceStrings [ "\n" ] [ " \\\n" ] src + "\nALL_\n";
+  oneMacroFile = src: {
+    main = "m.c";
+    read = n: if n == "m.c" then asOneMacro src else null;
+  };
+  loadAsMacro = src: Cc.loadFile (oneMacroFile src);
+  withoutSymbols =
+    code:
+    concatStringsSep "" (
+      filter builtins.isString (builtins.split "\n    symbols = [{][^}]*[}];\n" code)
+    );
+  sameAsMacro =
+    src: withoutSymbols (Cc.compileFile (oneMacroFile src)) == withoutSymbols (Cc.compile src);
   # A test that calls each argument-less function of src named in expected on the
   # initialized data (compiled once) and compares the results by name.
   tRets =
@@ -8634,6 +8652,74 @@ in
         4097090
       ]
       [ 980401 ]
+    ]
+  )
+  (t "cc preprocessed: sources compiled as the expansion of one macro give the same code" (map
+    sameAsMacro
+    [
+      scopeSrc
+      scopeDeclSrc
+      staticSrc
+      logicSrc
+      commaSrc
+      switchRunSrc
+      switchKindsSrc
+      jumpSrc
+      controlSrc
+      loopDoSrc
+      cacheSrc
+      rangeSrc
+      bulkSrc
+      pageSrc
+      liveSrc
+      strExprSrc
+      strOrderSrc
+      strShareSrc
+      structRunSrc
+      unionSrc
+      bitSrc
+      fnPtrSrc
+    ]
+  ) (genList (_: true) 22))
+  (t "cc preprocessed: static locals of one macro expansion run and are named <function>'<name>'<seq>"
+    (
+      let
+        calls = [
+          [ "counter" ]
+          [ "counter2" ]
+          [ "hideS" ]
+          [ "outer" ]
+          [
+            "nest"
+            0
+          ]
+          [
+            "nest"
+            1
+          ]
+          [ "sp" ]
+          [ "sl" ]
+          [ "su" ]
+          [ "self" ]
+          [
+            "sumTo"
+            5
+          ]
+        ];
+        names = filter (n: builtins.match ".*'.*" n != null) (
+          attrNames (loadAsMacro staticSrc).__data.symbols
+        );
+      in
+      [
+        (dretAllWith loadAsMacro staticSrc calls == dretAll staticSrc calls)
+        (all (n: builtins.match "[A-Za-z0-9_]+'[A-Za-z0-9_]+'[0-9]+" n != null) names)
+        (length names)
+      ]
+    )
+    [
+      true
+      true
+      14
     ]
   )
 ]

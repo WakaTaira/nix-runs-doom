@@ -122,7 +122,8 @@
 # File-scope variables are placed in declaration order (of their definitions), each at the
 # next offset aligned for its type, from the address dataBase (default 0x00400000), and
 # after them the static locals in source order, each named
-# `<function>'<name>'<line>'<col>` (of its name; not a C identifier), and after them the
+# `<function>'<name>'<line>'<col>` (of its name; `<function>'<name>'<seq>` in a
+# preprocessed file, seq the index of the name token; not a C identifier), and after them the
 # arrays of the string literals that need storage (see stringUses), one for each distinct
 # contents, with alignment 1, in the order of the first such literal of each:
 #   { base; size; symbols = [ { name; addr; } ]; strings = [ { addr; size; } ];
@@ -171,8 +172,23 @@ let
     substring
     ;
 
-  # The position of a node: { line; col; }, with file for a preprocessed file.
-  posOf = n: if n ? file then { inherit (n) line col file; } else { inherit (n) line col; };
+  # The position of a node: { line; col; }, with file and seq for a preprocessed file.
+  posOf =
+    n:
+    if n ? seq then
+      {
+        inherit (n)
+          line
+          col
+          file
+          seq
+          ;
+      }
+    else
+      { inherit (n) line col; };
+  # The identity of the node n in keys and names: its position "<line>:<col>", or in a
+  # preprocessed file "#<seq>" (the tokens of one macro expansion share a position).
+  idOf = n: if n ? seq then "#${toString n.seq}" else "${toString n.line}:${toString n.col}";
   posText = n: "${if n ? file then "${n.file}:" else ""}${toString n.line}:${toString n.col}";
   fail = n: msg: throw "cc: ${posText n}: ${msg}";
   unsupported = n: what: fail n "unsupported: ${what}";
@@ -1444,7 +1460,7 @@ let
     env: at: name: type:
     let
       var = {
-        key = "${name}@${toString at.line}:${toString at.col}";
+        key = "${name}@${idOf at}";
         inherit name type;
       };
     in
@@ -1678,14 +1694,18 @@ let
 
   # A static local: a variable at a fixed address in the data, placed after the file-scope
   # variables (see checkItems), with the data symbol `<function>'<name>'<line>'<col>`
-  # (not a C identifier). Its type and initializer follow the rules of file-scope
+  # (`<function>'<name>'<seq>` in a preprocessed file; not a C identifier). Its type and initializer follow the rules of file-scope
   # variables. -> { env; static = { sym; size; align; line; col; writesAt; }; } with
   # writesAt the initial stores at a given address.
   staticVar =
     env: d:
     let
       name = d.name;
-      sym = "${env.fn}'${name}'${toString d.line}'${toString d.col}";
+      sym =
+        if d ? seq then
+          "${env.fn}'${name}'${toString d.seq}"
+        else
+          "${env.fn}'${name}'${toString d.line}'${toString d.col}";
       t0 = resolveType env d d.type;
       # The initializer sees the variable itself.
       env' = bindObject env name t sym;
@@ -1754,8 +1774,8 @@ let
   tagKey = name: "tag ${name}";
 
   # The internal name of a block-scope tag defined at the node n: the tag with its
-  # position, unique in the translation unit.
-  localTagName = n: "${n.name}@${toString n.line}:${toString n.col}";
+  # identity (idOf), unique in the translation unit.
+  localTagName = n: "${n.name}@${idOf n}";
 
   # env with the tag of the definition n bound to the internal name.
   bindTag =
@@ -2861,8 +2881,10 @@ let
     concatMap (i: if i.kind == "func" then stringsIn i.body else [ ]) items
     ++ concatMap (o: concatMap (w: if w ? expr then stringsIn w.expr else [ ]) o.writes) objects;
 
-  # Whether the node a comes before the node b in the source.
-  before = a: b: a.line < b.line || a.line == b.line && a.col < b.col;
+  # Whether the node a comes before the node b in the source (by seq in a preprocessed
+  # file, whose positions are not in order across files and macro expansions).
+  before =
+    a: b: if a ? seq then a.seq < b.seq else a.line < b.line || a.line == b.line && a.col < b.col;
 
   # The arrays of the string literals uses (see stringUses), one for each contents, placed
   # from the offset start in the order of the first use of each, with alignment 1.

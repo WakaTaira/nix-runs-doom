@@ -43,7 +43,8 @@
 # spliced, comments removed, nothing checked), ppOne tells whether a text is one such
 # token (for `##`), and fromPp turns the preprocessed tokens into the tokens above (the
 # same checks and messages, at "<file>:<line>:<col>"; digraphs are unsupported), joining
-# adjacent string literals after expansion. Those tokens also have `file`.
+# adjacent string literals after expansion. Those tokens also have `file`, and `seq`, their
+# index in the translation unit, which identifies them (see fromPp).
 let
   A = import ../lib/ascii.nix;
   inherit (builtins)
@@ -734,16 +735,14 @@ let
 
   # The tokens of the compiler for the preprocessed tokens toks, adjacent string literals
   # joined, ending in an "eof" token at end ({ file; line; col; }). Converted in order, so
-  # the first error wins.
+  # the first error wins. Each token also has seq, its index in the list: the tokens of
+  # one macro expansion share a position, so seq (not the position) identifies a token.
   fromPp =
     toks: end:
     let
       conv = map fromPpToken toks;
       forced = foldl' (acc: t: builtins.seq t acc) null conv;
-    in
-    builtins.seq forced (
-      joinStrings conv
-      ++ [
+      all = joinStrings conv ++ [
         (
           end
           // {
@@ -751,8 +750,9 @@ let
             text = "";
           }
         )
-      ]
-    );
+      ];
+    in
+    builtins.seq forced (genList (k: elemAt all k // { seq = k; }) (length all));
 in
 {
   inherit

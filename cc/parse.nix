@@ -6,7 +6,9 @@
 # the tokens of a preprocessed file, cc/lex.nix fromPp). Errors are thrown as
 # "cc: <line>:<col>: <message>", and as "cc: <line>:<col>: unsupported: <what>" for valid
 # C outside the supported subset; for a preprocessed file the position is
-# "<file>:<line>:<col>", and every node also has `file`.
+# "<file>:<line>:<col>", and every node also has `file` and `seq` (the index of its
+# token in the translation unit, see cc/lex.nix fromPp), which identifies it where the
+# position does in other input: the tokens of one macro expansion share a position.
 #
 # Syntax tree
 # -----------
@@ -186,7 +188,7 @@ let
       inherit kind;
       inherit (t) line col;
     }
-    // (if t ? file then { inherit (t) file; } else { })
+    // (if t ? seq then { inherit (t) file seq; } else { })
     // fields;
 
   setOf =

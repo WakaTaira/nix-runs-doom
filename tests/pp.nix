@@ -58,6 +58,29 @@ let
     in
     (foldl' (g: a: g a) (r.${fn} (r.__data.init M.empty)) args).ret;
   run = src: runFiles { "main.c" = src; };
+  # The return values of the calls ([ fn arg ... ]) of the program src, made in order on
+  # one memory (so static locals keep their values between them).
+  runCalls =
+    src: calls:
+    let
+      r = Cc.loadFile {
+        main = "main.c";
+        read = readOf { "main.c" = src; };
+      };
+      call =
+        acc: c:
+        let
+          o = foldl' (g: a: g a) (r.${head c} acc.mem) (builtins.tail c);
+        in
+        {
+          inherit (o) mem;
+          rets = acc.rets ++ [ o.ret ];
+        };
+    in
+    (foldl' call {
+      mem = r.__data.init M.empty;
+      rets = [ ];
+    } calls).rets;
   compileThrows =
     src:
     throws (
@@ -826,6 +849,152 @@ in
       4818
       127
     ]
+  )
+
+  # ---- Identity of nodes from one macro expansion ----
+  # The tokens of an expansion share a position; the compiler must still tell apart the
+  # declarations, static locals, tags, string literals, loops and branches they make.
+  # Expected values checked with gcc.
+  (t "pp identity: shadowing locals declared in one expansion stay apart"
+    [
+      (run "#define BODY { int t = 1; { int t = 2; t = t + 1; } return t; }\nint f(void) BODY" "f" [ ])
+      (run ''
+        #define B3 { int t = 1; int r = 0; { int t = 10; { int t = 100; r = r + t; } r = r + t; } r = r + t; return r; }
+        int f(void) B3
+      '' "f" [ ])
+      (run ''
+        #define INNER { int t = 7; acc = acc * 10 + t; }
+        #define OUTER(v) { int t = v; INNER acc = acc * 10 + t; }
+        #define BOTH OUTER(1) OUTER(2)
+        int f(void) { int acc = 0; BOTH return acc; }
+      '' "f" [ ])
+    ]
+    [
+      1
+      111
+      7172
+    ]
+  )
+  (t "pp identity: static locals of one expansion in two functions and twice in one"
+    (runCalls
+      ''
+        #define COUNTER(name, step) int name(void) { static int c = 0; c = c + step; return c; }
+        #define TWO COUNTER(f, 1) COUNTER(g, 10)
+        TWO
+        #define BUMP(step) { static int c = 0; c = c + step; acc = acc * 100 + c; }
+        #define BUMPS BUMP(1) BUMP(10)
+        int h(void) { int acc = 0; BUMPS return acc; }
+      ''
+      [
+        [ "f" ]
+        [ "g" ]
+        [ "f" ]
+        [ "g" ]
+        [ "h" ]
+        [ "h" ]
+      ]
+    )
+    [
+      1
+      10
+      2
+      20
+      110
+      220
+    ]
+  )
+  (t "pp identity: two block-scope tags of one name from one expansion" (run ''
+    #define TAGS { struct s { char a[3]; }; r = r * 100 + sizeof(struct s); { struct s { int a[5]; }; r = r * 100 + sizeof(struct s); } r = r * 100 + sizeof(struct s); }
+    int f(void) { int r = 0; TAGS return r; }
+  '' "f" [ ]) 32003)
+  (t "pp identity: string literals of one expansion are placed as in the same code without it"
+    (
+      let
+        strs = ''const char *a = "xy"; const char *b = "pq"; const char *c = "xy"; const char *d = "z";'';
+        body = "return a[1] * 1000000 + b[0] * 1000 + c[0] + d[0] * 0;";
+        viaMacro = "#define STRS ${strs}\nint g(void) { return \"q\"[0]; }\nint f(void) { STRS ${body} }\n";
+        plain = "int g(void) { return \"q\"[0]; }\nint f(void) { ${strs} ${body} }\n";
+        strings =
+          f:
+          map (x: [
+            x.addr
+            x.size
+          ]) f.__data.strings;
+      in
+      [
+        (run viaMacro "f" [ ])
+        (strings (
+          Cc.loadFile {
+            main = "main.c";
+            read = readOf { "main.c" = viaMacro; };
+          }
+        ))
+        (strings (Cc.load plain))
+      ]
+    )
+    [
+      121112120
+      [
+        [
+          4194304
+          2
+        ]
+        [
+          4194306
+          3
+        ]
+        [
+          4194309
+          3
+        ]
+        [
+          4194312
+          2
+        ]
+      ]
+      [
+        [
+          4194304
+          2
+        ]
+        [
+          4194306
+          3
+        ]
+        [
+          4194309
+          3
+        ]
+        [
+          4194312
+          2
+        ]
+      ]
+    ]
+  )
+  (t "pp identity: loops of one expansion (bulk stores and cached reads) keep their own data" (run ''
+    unsigned char a1[16], a2[16], b1[16], b2[16];
+    int g1 = 3, g2 = 5;
+    #define COPY(d, s, k) { int i; for (i = 0; i < 16; i++) d[i] = s[i] + k; }
+    #define SUMG(g, n) { int i; for (i = 0; i < n; i++) acc = acc + g; }
+    #define LOOPS COPY(b1, a1, 1) COPY(b2, a2, 2) SUMG(g1, 4) SUMG(g2, 6)
+    int f(void) {
+      int acc = 0; int i;
+      for (i = 0; i < 16; i++) { a1[i] = i; a2[i] = 100 + i; }
+      LOOPS
+      for (i = 0; i < 16; i++) acc = acc + b1[i] * 1000 + b2[i];
+      return acc;
+    }
+  '' "f" [ ]) 137794)
+  (t "pp identity: side effects right of && and ||, the comma operator and switch from one expansion"
+    (run ''
+      #define LOGIC(x) { if (x > 0 && (cnt = cnt + 1) > 0) r = r + 1; if (x > 5 || (cnt = cnt + 10) > 0) r = r + 2; }
+      #define SW(x) switch (x) { case 1: r = r * 10 + 1; break; case 2: r = r * 10 + 2; default: r = r * 10 + 9; }
+      #define ALL(x) LOGIC(x) SW(x) r = (cnt = cnt + 100, r * 10 + cnt % 10);
+      #define TWICE ALL(1) ALL(2)
+      int f(void) { int r = 0; int cnt = 0; TWICE return r * 1000 + cnt; }
+    '' "f" [ ])
+    314292222
   )
 
   # ---- A program of several files ----

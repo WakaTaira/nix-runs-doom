@@ -2827,7 +2827,8 @@ let
       store = iter.s.bulkStore;
       loads = iter.s.bulkLoads;
       indices = genList (i: i) (length p.regions);
-      sameNode = a: b: a.line == b.line && a.col == b.col;
+      # A preprocessed file identifies nodes by seq (see cc/parse.nix).
+      sameNode = a: b: if a ? seq then a.seq == b.seq else a.line == b.line && a.col == b.col;
       matches =
         it:
         it.s.bulkStore != null
