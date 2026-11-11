@@ -148,6 +148,70 @@ in
       "w # define V 3 V"
     ]
   )
+  (t "pp lines: CR LF ends a line like LF (splices, line comments, strings, values)"
+    (
+      let
+        lf = lines [
+          "#define BUMP(v) \\"
+          "  ((v) + 1)"
+          "#define A 1 \\"
+          " + 2"
+          "int f(void) { return BUMP(A) * 10; } // ends in a backslash \\"
+          "int g(void) { return 99; }"
+          "const char *s = \"a\\"
+          "b\";"
+          "int h(void) { return s[1]; }"
+        ];
+        crlf = builtins.replaceStrings [ "\n" ] [ "\r\n" ] lf;
+        toksOf =
+          src:
+          map (k: "${k.text}@${posOf k}") (ppFiles {
+            "main.c" = src;
+          });
+        values = src: [
+          (run src "f" [ ])
+          (run src "h" [ ])
+        ];
+      in
+      [
+        (toksOf crlf == toksOf lf)
+        (values lf)
+        (values crlf)
+        (throws (
+          Cc.compileFile {
+            main = "main.c";
+            read = readOf { "main.c" = crlf + "int g(void) { return 1; }\r\n"; };
+          }
+        ))
+      ]
+    )
+    [
+      true
+      [
+        40
+        98
+      ]
+      [
+        40
+        98
+      ]
+      false
+    ]
+  )
+  (t "pp lines: a CR without LF, and a backslash with spaces before the newline, are errors"
+    [
+      (ppThrows "a\rb")
+      (ppThrows "#define A 1 \\ \n + 2\nA")
+      (ppThrows "#if 0\nx \\\t\n#endif\n")
+      (pp "a \\\nb")
+    ]
+    [
+      true
+      true
+      true
+      "a b"
+    ]
+  )
   (t "pp lines: trigraphs are not replaced (as in the GNU modes of gcc and clang)"
     [
       (pp "a ??( b ??) c")
@@ -263,6 +327,28 @@ in
       true
       true
       true
+    ]
+  )
+  (t "pp include: a name that starts with / is read as it is"
+    [
+      (map (k: k.text) (
+        ppWith { main = "src/main.c"; } {
+          "src/main.c" = "#include \"/headers/a.h\"\n";
+          "/headers/a.h" = "abs";
+          "src//headers/a.h" = "joined";
+        }
+      ))
+      (map (k: k.text) (
+        ppWith { includePaths = [ "inc" ]; } {
+          "main.c" = "#include </headers/a.h>\n";
+          "/headers/a.h" = "abs";
+          "inc//headers/a.h" = "joined";
+        }
+      ))
+    ]
+    [
+      [ "abs" ]
+      [ "abs" ]
     ]
   )
   (t "pp include: nesting of 200 files is accepted, 201 is an error"
@@ -439,12 +525,14 @@ in
   )
   (t "pp function: a directive inside the arguments, and a call across a directive, are unsupported"
     [
-      (ppThrows "#define F(x) x\nF(1,\n#define Y\n2)")
+      (ppThrows "#define F(a, b) a b\nF(1,\n#define Y\n2)")
+      (pp "#define F(a, b) a b\nF(1,\n2)")
       (ppThrows "#define F(x) x\nF\n#define Y\n(1)")
       (pp "#define F(x) x\nF\n#define Y\n+(1)")
     ]
     [
       true
+      "1 2"
       true
       "F + ( 1 )"
     ]
@@ -461,6 +549,40 @@ in
       "\"a+b\" \"a + b\" \"a b\" \"a b\""
       "\"\\\"a\\\\n\\\" '\\\\'' \\\"\\\\\\\\\\\"\" \"\\\"\\\\x\\\"\" \"\" \"\""
       "\"E\" \"S(1)\""
+    ]
+  )
+  (t "pp stringify: an empty expansion or argument passes the whitespace before it on"
+    (map
+      (
+        x:
+        pp (
+          lines [
+            "#define E"
+            "#define EF(a)"
+            "#define ID(a) a"
+            "#define C(a, b) x a##b"
+            "#define STR(a) #a"
+            "#define XSTR(a) STR(a)"
+          ]
+          + x
+        )
+      )
+      [
+        "XSTR(x E+)"
+        "XSTR(x EF(1)+)"
+        "XSTR(C(,y))"
+        "XSTR(x ID(E)+)"
+        "XSTR(x ID()y)"
+        "XSTR(x+E)"
+      ]
+    )
+    [
+      "\"x +\""
+      "\"x +\""
+      "\"x y\""
+      "\"x +\""
+      "\"x y\""
+      "\"x+\""
     ]
   )
   (t "pp stringify: `#` must be followed by a parameter in a function-like macro"
@@ -635,6 +757,30 @@ in
     (ppThrows "#ifdef X Y\n#endif")
     (ppThrows "#if 1\n#endif X")
   ] (genList (_: true) 17))
+  (t "pp if: character constants only with ==, !=, &&, ||, !, ?: and parentheses"
+    [
+      (pp "#if 'a' == 97 && ('b') != 'c' && !'\\0' && (1 ? 'x' : 'y') == 'x' && ('\\377' == 255 || 0)\nyes\n#endif")
+      (ppThrows "#if 'a' - 'b' < 0\n#endif")
+      (ppThrows "#if -'a'\n#endif")
+      (ppThrows "#if ~'a'\n#endif")
+      (ppThrows "#if 'a' < 'b'\n#endif")
+      (ppThrows "#if 'a' << 1\n#endif")
+      (ppThrows "#if 1 & 'a'\n#endif")
+      (ppThrows "#if (1 ? 'a' : 0) + 1\n#endif")
+      (ppThrows "#if 0 && 'a' * 2\n#endif")
+    ]
+    [
+      "yes"
+      true
+      true
+      true
+      true
+      true
+      true
+      true
+      true
+    ]
+  )
   (t "pp if: unsigned literals, values of 2^63 or more, overflow and division by zero are errors"
     [
       (ppThrows "#if 1u\n#endif")
@@ -721,6 +867,31 @@ in
       "7"
       "1"
       "199901L"
+    ]
+  )
+  (t
+    "pp directives: whitespace after an object-like macro name, #ifdef defined, _Pragma, __STDC_HOSTED__"
+    [
+      (ppThrows "#define x$y 1")
+      (ppThrows "#define X\"a\"")
+      (pp "#define X (1)\n#define Y\nX Y")
+      (ppThrows "#ifdef defined\n#endif")
+      (ppThrows "#ifndef defined\n#endif")
+      (ppThrows "_Pragma(\"once\") int x;")
+      (ppThrows "#define P _Pragma(\"once\")")
+      (throws (ppWith { defines.P = "_Pragma(\"once\")"; } { "main.c" = ""; }))
+      (pp "#if 0\n_Pragma(\"once\")\n#endif\n__STDC_HOSTED__")
+    ]
+    [
+      true
+      true
+      "( 1 )"
+      true
+      true
+      true
+      true
+      true
+      "1"
     ]
   )
   (t "pp predefined: __LINE__ in a call over lines is the line of the outermost name"
@@ -1079,6 +1250,29 @@ in
         "1999"
       ]
       "0"
+    ]
+  )
+  (t "pp scale: an argument of 60000 tokens, a call of 6000 arguments, an expansion to 98415 tokens"
+    [
+      (length (ppFiles {
+        "main.c" = "#define F(x) x\nF(" + concatStringsSep " + " (genList (_: "a") 30000) + ") z\n";
+      }))
+      (map (k: k.text) (ppFiles {
+        "main.c" = "#define F(${
+          concatStringsSep "," (genList (i: "p${toString i}") 6000)
+        }) p0 p5999\nF(${concatStringsSep "," (nums 6000)})\n";
+      }))
+      (length (ppFiles {
+        "main.c" = "#define T(x) x x x\n#define N(x) T(T(T(x)))\nN(N(N(a b c d e)))\n";
+      }))
+    ]
+    [
+      60000
+      [
+        "0"
+        "5999"
+      ]
+      98415
     ]
   )
   (t "pp scale: 100 nested #if, 2000 tokens on a line and in #if, a call of 200 arguments"

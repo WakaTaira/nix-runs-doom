@@ -12,11 +12,12 @@
 # read : name -> contents (string) or null when there is no such file. Names are relative
 # names separated by `/`; `#include "x"` looks in the directory of the including file,
 # then in includePaths, and `#include <x>` in includePaths only, each directory d giving
-# the name "d/x" ("x" when d is ""). `..` and absolute names are passed as they are.
+# the name "d/x" ("x" when d is ""); a name that starts with `/` is passed to read as it
+# is. Names are not normalized (`..` and `//` stay).
 # defines are object-like macros defined first (name -> replacement text of one line,
-# like -D); their tokens are at "<command line>". `__STDC__` is 1 and `__STDC_VERSION__`
-# 199901L; `__FILE__` is the name given to read and `__LINE__` the line of the token
-# (see below).
+# like -D); their tokens are at "<command line>". `__STDC__` and `__STDC_HOSTED__` are 1
+# and `__STDC_VERSION__` 199901L; `__FILE__` is the name given to read and `__LINE__` the
+# line of the token (see below).
 #
 # Lines are spliced and comments removed in the whole file first (cc/lex.nix ppLex), so
 # a skipped group follows the same lines, comments and quotes as an active one; there,
@@ -33,11 +34,20 @@
 # `#` or `##`. A token produced by an expansion is at the position of the name of the
 # outermost macro call. `__LINE__` is the line of its token: in the replacement of a call
 # that spans lines, the line of the name; written in an argument, its own line (arguments
-# are expanded before they are substituted).
+# are expanded before they are substituted). A macro whose replacement is empty, and an
+# empty argument, pass the whitespace before them on to the next token (for `#`).
+#
+# The hide sets follow the rules above, which C leaves open where the name at the end of
+# a replacement takes its `(` from the copy of an argument that was expanded first. There
+# gcc and clang expand more than this preprocessor: with `#define O (x) F`,
+# `#define F(a) a O` and `#define G(a) a O a`, `G(F())` is `( x ) F ( x ) x O F` here and
+# `( x ) F ( x ) x ( x ) F F` in gcc and clang. No diagnostic is given for that.
 #
 # Unsupported (a diagnostic "unsupported: ..."): variadic macros, `#include` with a macro,
-# `#pragma`, `#line` and other directives outside the list below, digraphs, an unsigned
-# literal or a value of 2^63 or more in `#if`, `defined` produced by macro expansion in
+# `#pragma`, `#line` and other directives outside the list below, digraphs and `_Pragma`
+# in an active group, an unsigned literal or a value of 2^63 or more in `#if`, a character
+# constant as an operand of an arithmetic, relational, shift or bitwise operator in `#if`
+# (it is unsigned for the scaffold's target), `defined` produced by macro expansion in
 # `#if`, a directive inside the arguments of a macro call, and a function-like macro name
 # at the end of a text unit followed by `(` after a directive. Directives: `#include`,
 # `#define`, `#undef`, `#if`, `#ifdef`, `#ifndef`, `#elif`, `#else`, `#endif`, `#error`
@@ -224,7 +234,12 @@ let
         if isIdent t "__VA_ARGS__" then
           unsupported t "variadic macro"
         else if t.kind == "other" && match "['\"].*" t.text != null then
-          fail t "missing terminating ${substring 0 1 t.text} character"
+          fail t (
+            if substring 0 1 t.text == "'" then
+              "unterminated character literal"
+            else
+              "missing terminating '\"' character"
+          )
         else if isHash k then
           if k + 1 < nb && isParam (tok (k + 1)) then
             [
@@ -327,6 +342,8 @@ let
       fail hash "macro name missing"
     else if (head toks).kind != "ident" then
       fail (head toks) "macro names must be identifiers"
+    else if what == "test" && (head toks).text == "defined" then
+      fail (head toks) "'defined' cannot be used as a macro name"
     else if what != "test" && hasAttr (head toks).text reserved then
       fail (head toks) "'${(head toks).text}' cannot be ${
         if what == "define" then "defined" else "undefined"
@@ -354,9 +371,12 @@ let
       isFn = length toks > 1 && isPunct (elemAt toks 1) "(" && !(elemAt toks 1).ws;
       ps = macroParams (elemAt toks 1) (drop 2 toks);
     in
-    addMacro macros nameTok (
-      if isFn then mkMacro nameTok ps.params ps.rest else mkMacro nameTok null (drop 1 toks)
-    );
+    if !isFn && length toks > 1 && !(elemAt toks 1).ws then
+      fail (elemAt toks 1) "whitespace is required after the macro name"
+    else
+      addMacro macros nameTok (
+        if isFn then mkMacro nameTok ps.params ps.rest else mkMacro nameTok null (drop 1 toks)
+      );
 
   # The macros defined before the first file: __STDC__, __STDC_VERSION__ and defines.
   initialMacros =
@@ -378,6 +398,8 @@ let
           fail at "macro names must be identifiers ('${name}')"
         else if hasAttr name reserved then
           fail at "'${name}' cannot be defined as a macro"
+        else if builtins.any (t: isIdent t "_Pragma") lexed then
+          unsupported at "_Pragma"
         else
           addMacro macros (at // { text = name; }) (mkMacro at null lexed);
       base = {
@@ -396,6 +418,10 @@ let
         {
           name = "__STDC_VERSION__";
           value = "199901L";
+        }
+        {
+          name = "__STDC_HOSTED__";
+          value = "1";
         }
       ];
     in
@@ -437,22 +463,27 @@ let
 
   # The next token of a non-empty stack, and the stack after it (empty frames popped).
   peek = stack: elemAt stack.f.toks stack.f.i;
+  # ci is evaluated here, and the record is updated with // (inherit (stack) next would make
+  # a thunk that selects the field of the previous record), so taking many tokens one by
+  # one (the arguments of a call) does not build a chain of thunks.
   pop1 =
     stack:
     let
       f = stack.f;
       i = f.i + 1;
+      ci = if f.ci < f.nc && elemAt f.cands f.ci == f.i then f.ci + 1 else f.ci;
     in
     if i >= f.n then
       stack.next
     else
-      {
-        f = f // {
-          inherit i;
-          ci = if f.ci < f.nc && elemAt f.cands f.ci == f.i then f.ci + 1 else f.ci;
-        };
-        inherit (stack) next;
-      };
+      builtins.seq ci (
+        stack
+        // {
+          f = f // {
+            inherit i ci;
+          };
+        }
+      );
 
   # The arguments of a call of the macro named by nameTok, from the stack after its `(`.
   # -> { args; close; stack; } with close the `)` token. onOpen nameTok is the result when
@@ -471,22 +502,24 @@ let
             t = peek s.stack;
             rest = pop1 s.stack;
             close = isPunct t ")" && s.depth == 0;
+            depth =
+              if isPunct t "(" then
+                s.depth + 1
+              else if isPunct t ")" then
+                s.depth - 1
+              else
+                s.depth;
           in
           {
             node = {
               tok = t;
               sep = isPunct t "," && s.depth == 0;
             };
-            s = {
+            # depth is evaluated with the state, so it does not become a chain of thunks.
+            s = builtins.seq depth {
               stack = rest;
               done = close;
-              depth =
-                if isPunct t "(" then
-                  s.depth + 1
-                else if isPunct t ")" then
-                  s.depth - 1
-                else
-                  s.depth;
+              inherit depth;
             };
           };
       r = iterate step {
@@ -527,7 +560,7 @@ let
   pasteTwo =
     at: a: b:
     if a.kind == "placemarker" then
-      b
+      (if b.kind == "placemarker" then a else b // { ws = a.ws; })
     else if b.kind == "placemarker" then
       a
     else
@@ -561,7 +594,27 @@ let
         in
         foldl' (pasteTwo at) (elemAt toks s) (genList (k: elemAt toks (s + 2 * k + 2)) ((e - s - 1) / 2));
     in
-    filter (t: t.kind != "placemarker") (genList group ns);
+    genList group ns;
+
+  # The tokens toks without placemarkers; a token after placemarkers with whitespace before
+  # them gets whitespace before it (an empty argument keeps the space written before it).
+  dropMarkers =
+    toks:
+    let
+      isMarker = k: (elemAt toks k).kind == "placemarker";
+      kept = filter (k: !isMarker k) (range (length toks));
+      nk = length kept;
+    in
+    genList (
+      j:
+      let
+        k = elemAt kept j;
+        p = if j == 0 then -1 else elemAt kept (j - 1);
+        t = elemAt toks k;
+        carry = builtins.any (i: (elemAt toks i).ws) (genList (i: p + 1 + i) (k - p - 1));
+      in
+      if carry && !t.ws then t // { ws = true; } else t
+    ) nk;
 
   # The replacement of macro m called by nameTok with the arguments args, the hide set hs
   # added to every token, every token at the position of nameTok.
@@ -582,11 +635,14 @@ let
           let
             a = elemAt args x.param;
           in
-          if a == [ ] then [ placemarker ] else withWs x.ws a
+          if a == [ ] then [ (placemarker // { inherit (x) ws; }) ] else withWs x.ws a
         else
-          withWs x.ws (elemAt expanded x.param);
+          let
+            a = elemAt expanded x.param;
+          in
+          if a == [ ] then [ (placemarker // { inherit (x) ws; }) ] else withWs x.ws a;
       flat = concatLists (map piece m.items);
-      toks = if m.paste then pasteAll nameTok flat else flat;
+      toks = dropMarkers (if m.paste then pasteAll nameTok flat else flat);
       pos = {
         inherit (nameTok) file line col;
       };
@@ -630,12 +686,24 @@ let
               text = toString t.line;
             }
         );
-      emit = s: toks: dangling: {
-        node = toks;
-        s = s // {
-          inherit dangling;
+      # The step that outputs toks. A macro whose replacement is empty passes the whitespace
+      # before its name on (carry) to the next token output (s.pad), as for `#`.
+      emit =
+        s: toks: dangling: carry:
+        let
+          pad = s.pad or false;
+        in
+        {
+          node = if pad && toks != [ ] then [ (head toks // { ws = true; }) ] ++ drop 1 toks else toks;
+          s = s // {
+            inherit dangling;
+            pad = if toks != [ ] then false else pad || carry;
+          };
         };
-      };
+      # The step that replaces the macro name t by repl in front of stack.
+      replace =
+        s: t: stack: repl:
+        emit (s // { stack = push macros stack repl; }) [ ] null (repl == [ ] && (t.ws or false));
       # One macro name t at the top of the stack; rest is the stack after it.
       call =
         s: t: rest:
@@ -644,13 +712,11 @@ let
           hs = t.hs or { };
         in
         if hasAttr t.text hs then
-          emit (s // { stack = rest; }) [ t ] null
+          emit (s // { stack = rest; }) [ t ] null false
         else if m.kind == "file" || m.kind == "line" then
-          emit (s // { stack = rest; }) [ (special t m.kind) ] null
+          emit (s // { stack = rest; }) [ (special t m.kind) ] null false
         else if m.kind == "obj" then
-          emit (
-            s // { stack = push macros rest (substitute expandArg m t [ ] (hs // { ${t.text} = true; })); }
-          ) [ ] null
+          replace s t rest (substitute expandArg m t [ ] (hs // { ${t.text} = true; }))
         else if rest != null && isPunct (peek rest) "(" then
           let
             c = collectArgs onOpen t (pop1 rest);
@@ -664,9 +730,9 @@ let
           if !ok then
             fail t "macro '${t.text}' takes ${toString m.nparams} argument(s) but ${toString given} were given"
           else
-            emit (s // { stack = push macros c.stack (substitute expandArg m t c.args chs); }) [ ] null
+            replace s t c.stack (substitute expandArg m t c.args chs)
         else
-          emit (s // { stack = rest; }) [ t ] (if rest == null then t else null);
+          emit (s // { stack = rest; }) [ t ] (if rest == null then t else null) false;
       step =
         s:
         if s.stack == null then
@@ -684,14 +750,14 @@ let
                   if c >= f.n then
                     s.stack.next
                   else
-                    {
+                    s.stack
+                    // {
                       f = f // {
                         i = c;
                       };
-                      inherit (s.stack) next;
                     };
               }
-            ) (slice f.toks f.i c) null
+            ) (slice f.toks f.i c) null false
           else
             let
               # Evaluated here, so the stack does not become a chain of pop1 thunks.
@@ -879,6 +945,8 @@ let
           fail (
             if tk k == null then hash else tk k
           ) "expected '${s}' in preprocessor expression but found ${describe (tk k)}";
+      # Results are { value; i; char; } with i the index after the operand and char that it
+      # is a character constant (possibly in parentheses or a branch of `?:`).
       primary =
         k: live:
         let
@@ -888,10 +956,14 @@ let
             let
               x = primary (k + 1) live;
             in
-            {
-              value = if live then f x.value else 0;
-              inherit (x) i;
-            };
+            if x.char && !isPunct t "!" then
+              charOperand t
+            else
+              {
+                value = if live then f x.value else 0;
+                inherit (x) i;
+                char = false;
+              };
         in
         if t == null then
           fail hash "expected a value in preprocessor expression"
@@ -902,18 +974,20 @@ let
           builtins.seq v {
             value = v;
             i = k + 1;
+            char = t.kind == "char";
           }
         else if t.kind == "ident" then
           {
             value = 0;
             i = k + 1;
+            char = false;
           }
         else if isPunct t "(" then
           let
             e = conditional (k + 1) live;
           in
           {
-            inherit (e) value;
+            inherit (e) value char;
             i = expect e.i ")";
           }
         else if isPunct t "!" then
@@ -926,6 +1000,10 @@ let
           unary (v: if v == minInt then fail t "integer overflow in preprocessor expression" else -v)
         else
           fail t "token '${t.text}' is not valid in preprocessor expressions";
+      # Plain char is unsigned for the scaffold's target, so a character constant is
+      # unsigned there; the rules of unsigned arithmetic are not implemented.
+      charOperand =
+        op: unsupported op "character constant as an operand of '${op.text}' in a preprocessor expression";
       opOf =
         k:
         let
@@ -959,15 +1037,19 @@ let
                   bool (s.value != 0 || rhs.value != 0)
                 else
                   binaryValue op op.text s.value rhs.value;
+              logical = op.text == "&&" || op.text == "||" || op.text == "==" || op.text == "!=";
             in
             if op == null || prec < minPrec then
               null
+            else if !logical && (s.char || rhs.char) then
+              charOperand op
             else
               {
                 node = null;
                 s = builtins.seq value {
                   inherit value;
                   inherit (rhs) i;
+                  char = false;
                 };
               };
         in
@@ -983,6 +1065,7 @@ let
           {
             value = if c.value != 0 then x.value else y.value;
             inherit (y) i;
+            char = x.char || y.char;
           }
         else
           c;
@@ -1135,7 +1218,12 @@ let
     env: s: fr: hash: args:
     let
       h = includeName hash args;
-      dirs = (if h.quoted then [ fr.dir ] else [ ]) ++ env.includePaths;
+      # A name that starts with `/` is read as it is.
+      dirs =
+        if substring 0 1 h.name == "/" then
+          [ "" ]
+        else
+          (if h.quoted then [ fr.dir ] else [ ]) ++ env.includePaths;
       found = foldl' (
         acc: d:
         if acc != null then
@@ -1241,7 +1329,11 @@ let
         active = fr.conds == null || fr.conds.c.active;
         isLast = fr.u + 1 >= fr.n;
         first = head unit.toks;
-        digraphs = filter (t: t.kind == "punct" && hasAttr t.text L.digraphs) unit.toks;
+        # Digraphs and _Pragma, unsupported in an active group.
+        digraphs = filter (
+          t: (t.kind == "punct" && hasAttr t.text L.digraphs) || isIdent t "_Pragma"
+        ) unit.toks;
+        badText = t: if isIdent t "_Pragma" then "_Pragma" else "digraph '${t.text}'";
         onOpen =
           t:
           if isLast then
@@ -1255,7 +1347,7 @@ let
           if s.dangling != null && isPunct first "(" then
             unsupported first "call of the macro '${s.dangling.text}' across a preprocessing directive"
           else if digraphs != [ ] then
-            unsupported (head digraphs) "digraph '${(head digraphs).text}'"
+            unsupported (head digraphs) (badText (head digraphs))
           else
             # The expansion is run here, so its errors come in the order of the source.
             builtins.seq (length r.toks) {
@@ -1279,7 +1371,7 @@ let
         unsupported first "digraph '%:'"
       else if unit.dir then
         if active && digraphs != [ ] then
-          unsupported (head digraphs) "digraph '${(head digraphs).text}'"
+          unsupported (head digraphs) (badText (head digraphs))
         else
           {
             node = [ ];

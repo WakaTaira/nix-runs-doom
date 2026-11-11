@@ -403,6 +403,15 @@ let
     else
       b;
 
+  # The tag name as shown in a diagnostic: an anonymous tag of a preprocessed file without
+  # the token index that makes it unique (see cc/parse.nix).
+  shownName =
+    name:
+    let
+      m = builtins.match "(\\(anonymous at .*) #[0-9]+\\)" name;
+    in
+    if m == null then name else "${builtins.head m})";
+
   typeNames = {
     void = "void";
     char = "char";
@@ -425,7 +434,7 @@ let
     else if t.tag == "array" then
       "${showType t.of} [${if t.len == null then "" else toString t.len}]"
     else if t.tag == "struct" || t.tag == "union" then
-      "${t.tag} ${t.name}"
+      "${t.tag} ${shownName t.name}"
     else if t.tag == "fn" then
       "${showType t.ret} (${
         builtins.concatStringsSep ", " (map showType t.params ++ (if t.variadic then [ "..." ] else [ ]))
@@ -1694,8 +1703,8 @@ let
 
   # A static local: a variable at a fixed address in the data, placed after the file-scope
   # variables (see checkItems), with the data symbol `<function>'<name>'<line>'<col>`
-  # (`<function>'<name>'<seq>` in a preprocessed file; not a C identifier). Its type and initializer follow the rules of file-scope
-  # variables. -> { env; static = { sym; size; align; line; col; writesAt; }; } with
+  # (`<function>'<name>'<seq>` in a preprocessed file; not a C identifier). Its type and
+  # initializer follow the rules of file-scope variables. -> { env; static = { sym; size; align; line; col; writesAt; }; } with
   # writesAt the initial stores at a given address.
   staticVar =
     env: d:
@@ -1781,7 +1790,7 @@ let
   bindTag =
     env: n: internal:
     if hasAttr (tagKey n.name) env.local then
-      fail n "redefinition of '${n.kind} ${n.name}'"
+      fail n "redefinition of '${n.kind} ${shownName n.name}'"
     else
       env
       // {
@@ -2042,7 +2051,7 @@ let
     else if t.tag == "array" then
       resolveArray env at t
     else if t.tag == "enum" then
-      env.ctx.enums.${tagName env t} or (fail at "incomplete enum type 'enum ${t.name}'")
+      env.ctx.enums.${tagName env t} or (fail at "incomplete enum type 'enum ${shownName t.name}'")
     else if isRecord t then
       resolveRecord env at t
     else if t.tag == "fn" then
@@ -2065,7 +2074,7 @@ let
       layout = env.ctx.structs.${name} or null;
     in
     if layout != null && layout.kind != t.tag then
-      fail at "use of '${t.name}' with tag type that does not match previous declaration"
+      fail at "use of '${shownName t.name}' with tag type that does not match previous declaration"
     else if name == t.name then
       t
     else
@@ -2274,7 +2283,7 @@ let
       layout = structLayout (fileEnv acc) n;
     in
     if hasAttr n.name acc.ctx.structs then
-      fail n "redefinition of '${n.kind} ${n.name}'"
+      fail n "redefinition of '${n.kind} ${shownName n.name}'"
     else
       builtins.deepSeq layout (
         withCtx acc {
@@ -2498,7 +2507,7 @@ let
       } n.consts;
     in
     if hasAttr n.name acc.ctx.enums then
-      fail n "redefinition of 'enum ${n.name}'"
+      fail n "redefinition of 'enum ${shownName n.name}'"
     else
       withCtx r.acc {
         enums = r.acc.ctx.enums // {

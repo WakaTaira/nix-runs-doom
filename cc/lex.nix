@@ -627,16 +627,52 @@ let
     else
       { inherit text pos; };
 
-  # Translation phases 1 to 3 of the file named file with contents src: lines spliced,
-  # comments removed, preprocessing tokens. -> { toks; end; } with end the position after
-  # the last character. A token is { kind; text; file; line; col; ws; bol; } (kind as in
-  # ppKind, without comments; ws tells that whitespace or a comment precedes it, bol that
-  # it is the first token of a line). No token is checked here except that a comment must
-  # end, so the text of a skipped group may be anything else.
+  # The position (with file) of the first match of the regex re in text, or null.
+  firstAt =
+    file: re: text:
+    let
+      pieces = split re text;
+    in
+    if length pieces == 1 then
+      null
+    else
+      advance {
+        line = 1;
+        col = 1;
+      } (head pieces)
+      // {
+        inherit file;
+      };
+
+  # Translation phase 1 of the source src of the file named file: CR LF ends a line like
+  # LF. A CR that is not followed by LF is an error, and so is a backslash followed by
+  # spaces or tabs only up to the end of its line (gcc and clang join such lines with a
+  # warning; C does not), since both would change where lines end.
+  newlines =
+    file: src:
+    let
+      text = builtins.replaceStrings [ "\r\n" ] [ "\n" ] src;
+      cr = firstAt file "\r" text;
+      spaced = firstAt file "\\\\[ \t]+\n" text;
+    in
+    if cr != null then
+      fail cr "carriage return without a line feed"
+    else if spaced != null then
+      fail spaced "backslash and newline separated by space"
+    else
+      text;
+
+  # Translation phases 1 to 3 of the file named file with contents src: line ends
+  # (newlines), lines spliced, comments removed, preprocessing tokens. -> { toks; end; }
+  # with end the position after the last character. A token is
+  # { kind; text; file; line; col; ws; bol; } (kind as in ppKind, without comments; ws
+  # tells that whitespace or a comment precedes it, bol that it is the first token of a
+  # line). No token is checked here except that a comment must end, so the text of a
+  # skipped group may be anything else.
   ppLex =
     file: src:
     let
-      sp = splice src;
+      sp = splice (newlines file src);
       pieces = split ppRe sp.text;
       n = (length pieces - 1) / 2;
       first = {
