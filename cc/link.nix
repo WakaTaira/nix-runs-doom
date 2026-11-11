@@ -3,7 +3,7 @@
 # linkFiles call it.
 #
 #   link { units = [ { name; unit; } ]; dataBase; host; allowUndefined; }
-#     -> { <function> = ...; __data; __units; __init; }
+#     -> { <function> = ...; __data; __units; __tables; __init; }
 #
 # Each unit is checked and compiled on its own (cc/check.nix checkWith in link mode,
 # cc/emit.nix), with the data of the units placed in the given order: the first from
@@ -26,11 +26,25 @@
 #     undefined  the addresses of the variables placed by allowUndefined ({ } otherwise)
 #     init       mem: the memory with the initial values of every unit written
 #   __units.<unit> = { nix; }   the generated Nix source of the unit
+#   __tables = { nix; }         the generated Nix source of the tables (see below)
 #   __init = mem: the memory after __data.init, with the initial host state
 #            (host.init) under the key `host`
 # The functions of the units, those of the host and, with allowUndefined, the functions
-# that units call and nothing defines (which throw when called) are joined into one set X
-# that every unit reads its imported functions from (see cc/emit.nix).
+# that units call or use as values and nothing defines (which throw when called) are
+# joined into one set X that every unit reads its imported functions from (see
+# cc/emit.nix), with the tables in X.__tables.
+#
+# Function pointers (cc/check.nix, "Function pointers"): the functions that units use as
+# values are numbered from 1, in unit order and, within a unit, in the order of their
+# first uses (layout.fnvals), each function once: one with external linkage has one
+# number in all units, one with internal linkage one for its unit (numberFuncs). The
+# number reaches the checker lazily through link.funcNum, and finding it reads no address.
+# The tables are one Nix source (tablesSource), loaded like a unit, with one list for each
+# shape of the calls through function pointers of all units (cc/emit.nix tableList): at
+# index i the function numbered i, X.<name> for one with external linkage (typed by its
+# definition in a unit, or taken as it is when nothing defines it) and the __static.<name>
+# of its unit for one with internal linkage, or an adapter of it to the shape. The tables
+# stay lazy and are not part of __data.
 #
 # A host function f = { nargs; variadic ? false; call; } is called by the generated code
 # as `f_fn mem a1 ... aN` (and a list of the variable arguments when variadic): see
@@ -45,7 +59,10 @@
 #   duplicate definition of '<name>' in '<unit>' and '<unit>'
 #     (a variable or function with external linkage defined by two units)
 #   '<name>' in '<unit>' is also defined by the host
-#   <position>: undefined reference to '<name>'   (a used variable or a called function)
+#   <position>: unsupported: function '<name>' of the host used as a value
+#     at the first use as a value (in number order)
+#   <position>: undefined reference to '<name>'   (a used variable, or a function called
+#     or used as a value)
 #     at the import of the first unit, in unit order, that imports the name
 #   <position>: conflicting types for '<name>'
 #     at the first import, in unit order, that disagrees with the definition, or, without
@@ -70,7 +87,10 @@
 # (cc/parse.nix drops them).
 # Each import is compared with the definition, or, without one (host, undefined), with
 # the first import of the name; a host function also needs nargs parameters and the same
-# variadic, and a host variable the size and alignment of host.data. A name that nothing
+# variadic, and a host variable the size and alignment of host.data. The direct calls of
+# an imported function (calls of the import) must give as many arguments as a definition
+# that is not variadic has parameters, which matters for a declaration without a
+# prototype; its uses as values take any definition whose type agrees. A name that nothing
 # defines and that units import both as a variable and as a function conflicts at the
 # first import of the kind the first import does not have.
 # Of the errors of the units themselves (cc/check.nix), only those that their layouts
@@ -84,10 +104,12 @@ let
   B = import ../lib/bits.nix;
   R = import ./runtime.nix;
   inherit (builtins)
+    all
     any
     attrNames
     concatLists
     concatMap
+    concatStringsSep
     div
     elem
     elemAt
@@ -102,6 +124,7 @@ let
     map
     match
     removeAttrs
+    replaceStrings
     seq
     tail
     ;
@@ -250,18 +273,22 @@ let
   # ---- Placement ----
 
   # The units checked in order, each from the end of the one before rounded up to a
-  # multiple of 8. The next base is forced at every step, so the bases build no chain of
+  # multiple of 8, with funcNumOf <unit> the numbers of the functions that the unit uses as
+  # values. The next base is forced at every step, so the bases build no chain of
   # thunks. -> { units = [ { name; base; c; } ]; end; } with c the result of checkWith
   # and end the end of the data of the last unit.
   placeUnits =
-    dataBase: externAddr: units:
+    dataBase: externAddr: funcNumOf: units:
     foldl'
       (
         acc: u:
         let
           c = Ch.checkWith {
             dataBase = acc.next;
-            link = { inherit externAddr; };
+            link = {
+              inherit externAddr;
+              funcNum = funcNumOf u.name;
+            };
           } u.unit;
           end = acc.next + c.layout.size;
           next = alignUp end 8;
@@ -390,7 +417,12 @@ let
       first = head is;
       bad =
         if target.kind == "unit" then
-          (if (target.def ? ret) == isFunc then filter (i: !matches i target.def) is else is)
+          (
+            if (target.def ? ret) == isFunc then
+              filter (i: !matches i target.def || isFunc && !callsFit i target.def) is
+            else
+              is
+          )
         else if target.kind == "hostData" then
           (
             if isFunc then
@@ -415,6 +447,96 @@ let
     in
     if bad == [ ] then null else head bad;
 
+  # ---- Function pointers ----
+
+  # The key of the function fv (an entry of the fnvals of the layout of unit, see
+  # cc/check.nix checkWith) in the numbering: its name, or the unit and its name for one
+  # with internal linkage.
+  funcKey = unit: fv: if fv.internal then "${unit}\n${fv.name}" else fv.name;
+
+  # The functions that the units use as values, numbered from 1 in unit order and, in a
+  # unit, in the order of their first uses (the fnvals of each layout), each key once.
+  # -> { nums = { <key> = <number>; }; list = [ fv // { unit; } ] } with list in number
+  # order. The next number is forced at every step.
+  numberFuncs =
+    layouts:
+    foldl'
+      (
+        acc: l:
+        foldl' (
+          acc: fv:
+          let
+            key = funcKey l.unit fv;
+            n = length acc.list + 1;
+          in
+          if hasAttr key acc.nums then
+            acc
+          else
+            seq n {
+              nums = acc.nums // {
+                ${key} = n;
+              };
+              list = acc.list ++ [ (fv // { inherit (l) unit; }) ];
+            }
+        ) acc l.fnvals
+      )
+      {
+        nums = { };
+        list = [ ];
+      }
+      layouts;
+
+  # The Nix source of the tables of the shapes (see cc/emit.nix tableList) for the
+  # numbered functions of the resolved link r: `{ X, U, B, R }: { <shape> = [ ... ]; }`,
+  # with U the loaded units in order. A function with external linkage is X.<name>
+  # (typed by its definition in a unit; one that nothing defines, with allowUndefined, is
+  # taken as it is), one with internal linkage the __static.<name> of its unit.
+  tablesSource =
+    r: shapes:
+    let
+      fs = r.numbered.list;
+      ref = i: "f${toString (i + 1)}";
+      func =
+        i:
+        let
+          fv = elemAt fs i;
+          target = r.targetOf fv.name;
+        in
+        if fv.internal then
+          {
+            ref = ref i;
+            inherit (fv) ret params;
+          }
+        else if target.kind == "unit" then
+          {
+            ref = ref i;
+            inherit (target.def) ret params;
+          }
+        else
+          { ref = ref i; };
+      source =
+        i:
+        let
+          fv = elemAt fs i;
+        in
+        if fv.internal then
+          "(elemAt U ${toString r.unitIndex.${fv.unit}}).__static.${E.quoteAttr fv.name}"
+        else
+          "X.${E.quoteAttr fv.name}";
+      funcs = genList func (length fs);
+    in
+    "{ X, U, B, R }:\nlet\n  inherit (builtins) bitAnd elemAt seq;\n"
+    + concatStringsSep "" (genList (i: "  ${ref i} = ${source i};\n") (length fs))
+    + "in\n{\n"
+    + concatStringsSep "" (
+      map (sh: "  ${sh} = ${replaceStrings [ "\n" ] [ "\n  " ] (E.tableList sh funcs)};\n") shapes
+    )
+    + "}\n";
+
+  # The direct calls of the function import i give as many arguments as the definition def
+  # has parameters (a declaration without a prototype says nothing about them).
+  callsFit = i: def: def.variadic || all (n: n == length def.params) i.calls;
+
   # ---- The link ----
 
   # The units placed and their names resolved: the definitions, imports and addresses of
@@ -427,7 +549,7 @@ let
       allowUndefined,
     }:
     let
-      placed = placeUnits dataBase externAddr units;
+      placed = placeUnits dataBase externAddr funcNumOf units;
       layouts = map (u: u.c.layout // { unit = u.name; }) placed.units;
       unitIndex = listToAttrs (
         genList (i: {
@@ -491,6 +613,24 @@ let
       undefinedSymbols = listToAttrs undefinedPlaced.symbols;
       externAddr =
         n: symbols.${n} or undefinedSymbols.${n} or (linkError "undefined reference to '${n}'");
+
+      numbered = numberFuncs layouts;
+      # The functions that each unit uses as values, by name.
+      unitFnvals = listToAttrs (
+        map (l: {
+          name = l.unit;
+          value = listToAttrs (
+            map (fv: {
+              inherit (fv) name;
+              value = fv;
+            }) l.fnvals
+          );
+        }) layouts
+      );
+      funcNumOf =
+        unit: n:
+        numbered.nums.${funcKey unit unitFnvals.${unit}.${n}}
+          or (throw "cc: internal error: no number for '${n}' in '${unit}'");
     in
     {
       inherit
@@ -512,6 +652,7 @@ let
         symbols
         undefinedSymbols
         unitIndex
+        numbered
         ;
     };
 
@@ -543,6 +684,8 @@ let
         in
         if r.unitIndex.${v.unit} <= r.unitIndex.${f.unit} then f else v
       ) (filter (n: hasAttr n r.funcImports && (r.targetOf n).kind == "none") (attrNames r.varImports));
+      # The functions of the host that units use as values.
+      hostValues = filter (fv: !fv.internal && (r.targetOf fv.name).kind == "hostFunc") r.numbered.list;
       wideHostImports = filter (
         i: (r.targetOf i.name).kind == "hostFunc" && (isWide i.ret || any isWide i.params)
       ) (concatMap (n: r.funcImports.${n}) (attrNames r.funcImports));
@@ -558,6 +701,9 @@ let
       (map (d: "'${d.name}' in '${d.unit}' is also defined by the host") (
         filter (d: hasAttr d.name r.hostFuncs || hasAttr d.name r.hostData) r.defs
       ))
+      (map (
+        fv: "${posText fv}: unsupported: function '${fv.name}' of the host used as a value"
+      ) hostValues)
       (undefinedRefs r.varImports r.undefinedVars)
       (undefinedRefs r.funcImports r.undefinedFuncs)
       (conflicts false r.varImports)
@@ -638,8 +784,34 @@ let
             ;
         }
       ) compiled;
-      unitFuncs = foldl' (acc: m: acc // removeAttrs m [ "__data" ]) { } mods;
-      X = importedFunctions r // unitFuncs;
+      unitFuncs = foldl' (
+        acc: m:
+        acc
+        // removeAttrs m [
+          "__data"
+          "__static"
+        ]
+      ) { } mods;
+      # The shapes of the calls through function pointers in all units.
+      shapes = attrNames (
+        listToAttrs (
+          map (sh: {
+            name = sh;
+            value = null;
+          }) (concatMap (u: u.c.checked.tables) r.placed.units)
+        )
+      );
+      tablesCode = tablesSource r shapes;
+      tables = import (builtins.toFile "cc-tables.nix" tablesCode) {
+        inherit X B R;
+        U = mods;
+      };
+      X =
+        importedFunctions r
+        // unitFuncs
+        // {
+          __tables = tables;
+        };
       data = dataOf r mods;
       duplicateUnits = duplicates (map (u: u.name) args.units);
     in
@@ -656,6 +828,7 @@ let
               value.nix = u.code;
             }) compiled
           );
+          __tables.nix = tablesCode;
           __init =
             mem:
             data.init mem

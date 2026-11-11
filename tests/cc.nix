@@ -61,7 +61,9 @@ let
     else if k == "cast" then
       "(cast ${showType e.type} ${show e.expr})"
     else if k == "call" then
-      "(call ${e.name}${concatStringsSep "" (map (a: " " + show a) e.args)})"
+      "(call ${if e ? name then e.name else show e.callee}${
+        concatStringsSep "" (map (a: " " + show a) e.args)
+      })"
     else if k == "dot" then
       "(. ${show e.expr} ${e.name})"
     else if k == "arrow" then
@@ -1974,6 +1976,20 @@ in
     "(+ (- (post-- (index a b))) (! (~ (pre-- c))))"
   )
   (t "cc parse: call" (parsed "f(a, b + 1)") "(call f a (+ b 1))")
+  (t "cc parse: calls of expressions"
+    (map parsed [
+      "(*p)(a)"
+      "(f)(a)"
+      "p->g(a, b)"
+      "p[1](a)(b)"
+    ])
+    [
+      "(call (deref p) a)"
+      "(call f a)"
+      "(call (-> p g) a b)"
+      "(call (call (index p 1) a) b)"
+    ]
+  )
   (t "cc parse: binary position is the operator" (posOf (exprOf "a + b")) "1:41")
 
   # Parser: typedef names
@@ -7169,29 +7185,18 @@ in
       1
     ]
   )
-  (t "cc compile: function names as values, indirect calls and function pointer conversions throw" (
-    map
-      compileThrows
-      [
-        "int f(int x) { return x; } int g(void) { int (*p)(int) = f; return p == 0; }"
-        "int f(int x) { return x; } int g(void) { int (*p)(int) = &f; return p == 0; }"
-        "int f(int x) { return x; } int (*t[1])(int) = { f };"
-        "int g(int (*p)(int)) { return p(1); }"
-        "int g(int (*p)(int)) { return (*p)(1); }"
-        "struct s { int (*cb)(int); }; int g(struct s *q) { return q->cb(1); }"
-        "int g(int (*p)(int)) { return (int)p; }"
-        "int g(int (*p)(int)) { return (void *)p == 0; }"
-        "int g(int (*p)(int)) { void (*q)(void) = (void (*)(void))p; return q == 0; }"
-        "int g(int (*p)(int)) { int x = p; return x; }"
-        "int g(int (*p)(int)) { void *v = p; return v == 0; }"
-        "int g(int (*p)(int), int (*q)(int)) { return p < q; }"
-        "int g(int (*p)(int), void (*q)(void)) { return p == q; }"
-        "int g(int (*p)(int)) { p = 1; return 0; }"
-        "int g(int (*p)(int)) { return p[0] == 0; }"
-        "int g(int (*p)(int)) { return p + 1 == 0; }"
-        "typedef int F(int);"
-      ]
-  ) (genList (_: true) 17))
+  (t "cc compile: implicit conversions, ordering and arithmetic of function pointers throw" (map
+    compileThrows
+    [
+      "int g(int (*p)(int)) { int x = p; return x; }"
+      "int g(int (*p)(int), int (*q)(int)) { return p < q; }"
+      "int g(int (*p)(int), void (*q)(void)) { return p == q; }"
+      "int g(int (*p)(int)) { p = 1; return 0; }"
+      "int g(int (*p)(int)) { return p[0] == 0; }"
+      "int g(int (*p)(int)) { return p + 1 == 0; }"
+      "typedef int F(int);"
+    ]
+  ) (genList (_: true) 7))
 
   # Declarations without a prototype: `()`
   (t "cc parse: `()` marks a function declarator without a prototype, but not in a definition"
@@ -7274,6 +7279,275 @@ in
       "int g(int (*p)(int, ...)) { int (*q)() = p; return 0; }"
     ]
   ) (genList (_: true) 3))
+
+  # Function pointers: values, numbers and calls through them
+  (t "cc run: a function pointer initialized with a function is called" (dret
+    "int add1(int x) { return x + 1; } int (*fp)(int) = add1; int f(void) { return fp(41); }"
+    "f"
+    [ ]
+  ) 42)
+  (t "cc run: handlers in a struct array are called in order and a null one is skipped" (dret ''
+    int trail;
+    void a(void) { trail = trail * 10 + 1; }
+    void b(void) { trail = trail * 10 + 2; }
+    struct S { int k; void (*h)(void); } t[] = { {1, a}, {2, b}, {3, 0} };
+    int f(void) { int i; for (i = 0; i < 3; i++) if (t[i].h) t[i].h(); return trail; }
+  '' "f" [ ]) 12)
+  (t "cc run: (*fp)(x), fp(x) and the other forms of the called expression agree" (dret ''
+    int add1(int x) { return x + 1; }
+    struct box { int (*op)(int); } bx = { add1 };
+    int (*arr[2])(int) = { 0, add1 };
+    int f(int x) {
+      int (*fp)(int) = add1;
+      struct box *pb = &bx;
+      return (*fp)(x) * 100000 + fp(x) * 10000 + (**fp)(x) * 1000
+        + pb->op(x) * 100 + arr[1](x) * 10 + (*add1)(x);
+    }
+  '' "f" [ 0 ]) 111111)
+  (t "cc run: a function passed as an argument is called" (dret
+    "int add1(int x) { return x + 1; } int apply(int (*g)(int), int v) { return g(v); } int f(void) { return apply(add1, 1); }"
+    "f"
+    [ ]
+  ) 2)
+  (t "cc run: a 2-argument function called through a 1-argument member of a union gets 0" (dret ''
+    int got;
+    void two(int a, int b) { got = a * 100 + b; }
+    typedef void (*p1)(int);
+    typedef void (*p2)(int, int);
+    union act { p1 one; p2 both; } u;
+    int f(void) { u.both = two; u.both(3, 4); int before = got; u.one(7); return before * 10000 + got; }
+  '' "f" [ ]) 3040700)
+  (t "cc run: a 1-argument function called through a 2-argument type drops the extra one" (dret ''
+    int one(int a) { return a * 3; }
+    int f(void) { int (*q)(int, int) = (int (*)(int, int))one; return q(5, 9) * 100 + one(5); }
+  '' "f" [ ]) 1515)
+  (t "cc run: a void function read as int gives 0, a value read as void keeps its side effects" (dret
+    ''
+      int n;
+      void bump(void) { n = n + 1; }
+      int val(void) { n = n + 10; return 99; }
+      int f(void) {
+        int (*g)(void) = (int (*)(void))bump;
+        void (*h)(void) = (void (*)(void))val;
+        int r = g();
+        h();
+        return r * 1000 + n;
+      }
+    ''
+    "f"
+    [ ]
+  ) 11)
+  (t "cc run: function pointers from integers and null compare by number" (dret ''
+    typedef void (*actionf)();
+    actionf m = (actionf)(-1);
+    void a(void) { }
+    int f(void) {
+      actionf z = 0;
+      actionf p = a;
+      return (m == (actionf)(-1)) * 100000 + ((unsigned)m == 4294967295u) * 10000
+        + (z == 0) * 1000 + (!z) * 100 + (!p) * 10 + (p != 0) + (p == m) * 1000000;
+    }
+  '' "f" [ ]) 111101)
+  (t "cc run: a function pointer kept in a void pointer calls the same function" (dret ''
+    int add1(int x) { return x + 1; }
+    int add2(int x) { return x + 2; }
+    void *keep;
+    int f(void) {
+      keep = add2;
+      void *v = (void *)add1;
+      int (*g)(int) = keep;
+      int (*h)(int) = (int (*)(int))v;
+      return g(9) * 100 + h(9);
+    }
+  '' "f" [ ]) 1110)
+  (t "cc run: function values are numbered in the order of their first uses from 1"
+    (
+      let
+        d = dcallSyms ''
+          void a(void) { }
+          static void b(void) { }
+          void (*first)(void) = b;
+          void (*second)(void) = a;
+          void (*again)(void) = b;
+          int f(void) { void (*p)(void) = &a; return p == second; }
+        '' "f" [ ];
+      in
+      [
+        d.ret
+        (M.loadWord d.mem d.syms.first)
+        (M.loadWord d.mem d.syms.second)
+        (M.loadWord d.mem d.syms.again)
+      ]
+    )
+    [
+      1
+      1
+      2
+      1
+    ]
+  )
+  (t "cc run: a call through a null function pointer throws"
+    [
+      (!(tryEval (dret "int (*fp)(int); int f(void) { return fp(1); }" "f" [ ])).success)
+      (dret "int (*fp)(int); int f(void) { return fp == 0; }" "f" [ ])
+    ]
+    [ true 1 ]
+  )
+  (t "cc run: a pointer that holds no number calls through an index past the table"
+    (
+      let
+        src = "int (*fp)(void) = (int (*)(void))(-1); int f(void) { return fp(); }";
+        d = dcallSyms "int (*fp)(void) = (int (*)(void))(-1); int g(void) { return 0; }" "g" [ ];
+      in
+      [
+        (M.loadWord d.mem d.syms.fp)
+        (contains "(elemAt tab's (M.loadWord mem 4194304)) mem;" (Cc.compile src))
+        (contains "tab's = [\n    (throw \"cc: call through a null function pointer\")\n  ];" (
+          Cc.compile src
+        ))
+      ]
+    )
+    [
+      4294967295
+      true
+      true
+    ]
+  )
+  (t "cc run: an argument converts to the parameter of the called function as a cast does"
+    (
+      let
+        d = dcallSyms ''
+          int seen; int neg;
+          void f(int x) { seen = x; neg = x < 0; }
+          int g(void) { void (*p)(unsigned) = (void (*)(unsigned))f; p(4294967295u); return seen * 10 + neg; }
+        '' "g" [ ];
+      in
+      [
+        d.ret
+        (M.loadWord d.mem d.syms.seen)
+      ]
+    )
+    [
+      (-9)
+      4294967295
+    ]
+  )
+  (t "cc run: return values convert to the return type of the pointer"
+    (dretAll
+      ''
+        int big(void) { return 300; }
+        int b200(void) { return 200; }
+        int neg1(int x) { return -x; }
+        long long sq(long long x) { return x * x; }
+        int u8(void) { unsigned char (*p)(void) = (unsigned char (*)(void))big; return p(); }
+        int s8(void) { signed char (*p)(void) = (signed char (*)(void))b200; return p(); }
+        int s16(void) { short (*p)(void) = (short (*)(void))big; return p() + (short)70000 - 4464; }
+        int ll(void) { long long (*p)(int) = (long long (*)(int))neg1; return p(5) == -5; }
+        int llsq(void) { long long (*p)(long long) = sq; return p(100000) == 10000000000LL; }
+      ''
+      [
+        [ "u8" ]
+        [ "s8" ]
+        [ "s16" ]
+        [ "ll" ]
+        [ "llsq" ]
+      ]
+    )
+    [
+      44
+      (-56)
+      300
+      1
+      1
+    ]
+  )
+  (t "cc run: a pointer without a prototype calls with the promoted arguments" (dret ''
+    int got;
+    void two(int a, int b) { got = got * 1000 + a * 10 + b; }
+    void (*p)() = two;
+    int f(void) { char c = 200; p(1, 2); p(c); return got; }
+  '' "f" [ ]) 14000)
+  (t "cc run: a pointer to a function used as a value elsewhere, in sizeof and in a switch"
+    (dretAll
+      ''
+        int add1(int x) { return x + 1; }
+        char buf[sizeof(&add1) + sizeof add1(1)];
+        int (*fp)(int) = add1;
+        int f(void) { switch (fp == add1) { case 1: return sizeof buf; default: return 0; } }
+        int h(void) { int (*q)(int) = *fp; return q == fp; }
+      ''
+      [
+        [ "f" ]
+        [ "h" ]
+      ]
+    )
+    [
+      8
+      1
+    ]
+  )
+  (t "cc run: function pointers through the preprocessor"
+    (
+      let
+        src = ''
+          int add1(int x) { return x + 1; }
+          static int dbl(int x) { return x * 2; }
+          int (*ops[2])(int) = { dbl, add1 };
+          int f(int x) { return ops[0](x) * 100 + ops[1](x); }
+        '';
+      in
+      [
+        (sameAsMacro src)
+        (head (
+          dretAllWith loadAsMacro src [
+            [
+              "f"
+              5
+            ]
+          ]
+        ))
+      ]
+    )
+    [
+      true
+      1006
+    ]
+  )
+  (t
+    "cc compile: a call through a function pointer is one table lookup, a matching element the function itself"
+    (
+      let
+        code = Cc.compile ''
+          int add1(int x) { return x + 1; }
+          void v(int x) { }
+          int f(int (*g)(int)) { return g(3); }
+          int k(void) { return f(add1) + f((int (*)(int))v); }
+        '';
+      in
+      [
+        (contains "r_1 = (elemAt tab'ss g_0) mem 3;" code)
+        (contains "tab'ss = [\n    (throw \"cc: call through a null function pointer\")\n    add1_fn\n    (mem: a0: let m = v_fn mem a0; in seq m { mem = m; ret = 0; })\n  ];" code)
+      ]
+    )
+    [
+      true
+      true
+    ]
+  )
+  (t "cc compile: function values and calls through pointers that are unsupported or wrong throw" (map
+    compileThrows
+    [
+      "int g(int (*p)(int, ...)) { return p(1); }"
+      "int g(double (*p)(int)) { p(1); return 0; }"
+      "struct s { int a; }; int g(struct s (*p)(void)) { p(); return 0; }"
+      "void a(void) { } void f(void) { a = 0; }"
+      "static void s(void); void (*p)(void) = s;"
+      "void e(void); int f(void) { void (*p)(void) = e; return p == 0; }"
+      "int g(int (*p)(int)) { return p(1, 2); }"
+      "int g(int x) { return x(1); }"
+      "int g(int *x) { return (*x)(1); }"
+    ]
+  ) (genList (_: true) 9))
 
   # Variadic prototypes
   (t "cc run: a variadic prototype is accepted" (ret

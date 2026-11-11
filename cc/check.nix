@@ -9,13 +9,17 @@
 # defs; } ]; funcs = [ { name; ret; params; variadic; lsig; defs; } ]; } the definitions
 # with external linkage.
 #
-# Link mode (link = { externAddr; }, for cc/link.nix): externAddr maps the name of a
-# variable that the unit uses and does not define to its address (lazily; layout never
-# calls it). Such variables and the functions with external linkage that the unit calls
-# and does not define are not errors but imports:
+# Link mode (link = { externAddr; funcNum; }, for cc/link.nix): externAddr maps the name of
+# a variable that the unit uses and does not define to its address, and funcNum the name
+# of a function that the unit uses as a value to its number (see "Function pointers"),
+# both lazily (layout never calls them). Such variables and the functions with external
+# linkage that the unit calls or uses as values and does not define are not errors but
+# imports:
 #   imports = { vars = [ { name; type; size; align; ltype; defs; line; col; file?; } ];
-#               funcs = [ { name; ret; params; variadic; lsig; defs; line; col; file?; } ]; }
-# one per name (sorted), at its first use; the type of a variable merges the declarations
+#               funcs = [ { name; ret; params; variadic; lsig; defs; calls; line; col;
+#                           file?; } ]; }
+# one per name (sorted), at its first use, with calls the numbers of arguments of the
+# direct calls of a function (none for one only used as a value); the type of a variable merges the declarations
 # of the unit (an array length when one gives it), with size and align from objectExtent.
 # For the linker's comparison of types between units, ltype is the type of a variable and
 # lsig = { ret; params; variadic; unspecified; } the signature of a function with enum
@@ -25,8 +29,16 @@
 # calls of a function through declarations that disagree (a call without arguments through
 # a declaration without a prototype disagrees with a prototype that has parameters), and a
 # call to a function with internal linkage that is declared but not defined stay errors
-# (see linkUnit), raised when imports or checked is evaluated. checked also has
-# link = { funcs; }, the names of the imported functions. Without link, imports are empty.
+# (see linkUnit), raised when imports or checked is evaluated, and so is the use as a value
+# of a function with internal linkage that is declared but not defined. checked also has
+# link = { funcs; statics; }, the names of the imported functions and of the functions
+# with internal linkage that the unit uses as values. Without link, imports are empty.
+# layout also has fnvals = [ { name; internal; line; col; file?; ret?; params?; } ], the
+# functions that the unit uses as values in the order of their first uses (in link mode;
+# empty otherwise), internal telling one with internal linkage, which also has its return
+# and parameter types. checked also has tables, the shapes of the calls through function
+# pointers (sorted, each once), and, outside link mode, fnvals = [ { name; ret; params; } ],
+# the functions used as values in number order.
 #
 # Errors are thrown as "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for
 # a preprocessed file or a named unit of a link, whose nodes have `file`), and as
@@ -51,10 +63,8 @@
 #
 # Bit-fields are supported in the form whose layout equals one of plain unsigned members
 # (see bitField): they are such members (unsigned char, unsigned short, or the declared
-# type for a width of 32), except that `&` and `sizeof` reject them. A function pointer is
-# a 4-byte pointer that can be copied, passed, returned, compared with == and != and
-# tested; taking a function's address, calling through a pointer and converting between a
-# function pointer and another type (but a null pointer constant) are unsupported. A
+# type for a width of 32), except that `&` and `sizeof` reject them. Function pointers
+# hold the numbers of functions (see "Function pointers" below). A
 # function type without a prototype agrees with any function type that is not variadic and
 # returns a type that agrees with its own (typesAgree): in the declarations of a variable,
 # and of a function, whose signature is then the composite one (a declaration without a
@@ -101,6 +111,11 @@
 #   { kind = "old"; }                            the target's value before an assignment;
 #                                                appears only inside an assign's value
 #   { kind = "call"; name; args; }               args converted to the parameter types
+#   { kind = "call"; callee; table; args; }      a call through the function pointer callee
+#                                                (see "Function pointers"): table is its
+#                                                shape; type is the return type, or for
+#                                                one narrower than 4 bytes its class type
+#                                                (the node is then inside a "cast" to it)
 #   { kind = "call"; name; args; va; }           a call to a variadic function (link
 #                                                mode): va the variable arguments after
 #                                                the default argument promotions (char
@@ -134,7 +149,7 @@
 # `x op= y`, `++x` and `x--` are "assign" nodes whose value computes from "old".
 # Arrays, structs and unions are objects in memory: while an expression is checked they are
 # "deref" nodes of array, struct or union type (the address in expr), which never reach
-# the typed tree. An array used as a value decays to a pointer to its first element; a
+# the typed tree, and so are function designators (see "Function pointers"). An array used as a value decays to a pointer to its first element; a
 # struct or union is only used through its members, its address and sizeof. A string
 # literal is such an array object of type char[N] (N counts the 0 at the end) at a
 # constant address; its contents are read from memory, never folded, so it is not part
@@ -201,6 +216,35 @@
 # rest of the array keeps 0, the array may leave out the 0 at the end, and an array
 # without a length takes N. A literal there and in the operand of sizeof needs no storage;
 # every other one does, which is decided from the syntax tree and the types only.
+#
+# Function pointers
+# -----------------
+# The value of a function pointer is the number of a function (from 1; 0 is the null
+# pointer), stored in memory as a 4-byte word. A function name used as a value (also with
+# `&`, and in an initializer) is a "deref" node of the function type (a function
+# designator) whose address is a pointer "lit" with the number, which the value decays to;
+# `*` of a function pointer gives such a designator, so `*fp`, `**fp` and `&*fp` are fp.
+# The number comes from ctx.fnNum: in link mode the linker's (link.funcNum), otherwise
+# that of a link of this unit alone: the functions used as values ("fnval" uses, see
+# usesOf) numbered from 1 in the order of their first uses (fnvalsIn), which reads no
+# address and no number. Where expressions are only typed (typeOnlyEnv) the address is a
+# "symbol", so the number is never read there. A variadic function used as a value, and
+# one that is declared but not defined (outside link mode, or with internal linkage), are
+# unsupported.
+# A function pointer converts by a cast to and from any integer and pointer type, keeping
+# the number, and by assignment from a type that agrees with its own, a null pointer
+# constant and `void *`, and to `void *`; == and != compare numbers, the other comparisons
+# and pointer arithmetic are unsupported.
+# A call of any expression of function pointer type (a variable `fp(x)`, `(*fp)(x)`,
+# `s->f(x)`, `a[i](x)`) converts the arguments to the parameter types of the pointed-to
+# type, or, for a type without a prototype, applies the default argument promotions and
+# takes any number. Its shape is the class of the return type ("v" for void) followed by
+# that of each converted argument, the class of a type being "s" (signed 32-bit: signed
+# char, short, int, long), "u" (unsigned 32-bit: char, unsigned types, pointers) or "l"
+# (long long), with the class types int, unsigned int and long long (shapeOf). A call to
+# a name that is a function stays a direct call. A call through a pointer to a variadic
+# function type, or to one with a floating-point, va_list, struct or union parameter or
+# return value, is unsupported.
 let
   B = import ../lib/bits.nix;
   inherit (builtins)
@@ -526,6 +570,8 @@ let
       sizeOf
       fits
       wrapTo
+      classOf
+      classTypes
       ;
   };
 
@@ -545,6 +591,7 @@ let
   # A floating-point object: a float or double, or an array of them.
   hasFloat = t: isFloat t || isArray t && hasFloat t.of;
   isFnPtr = t: isPtr t && t.to.tag == "fn";
+  isVoidPtr = t: isPtr t && isVoid t.to;
   # Two resolved types of one unit agree: they are equal, but that a function type without
   # a prototype (unspecified) agrees with any function type that is not variadic and whose
   # return type agrees with its own, also through pointers, arrays (of the same length)
@@ -909,8 +956,8 @@ let
     if decides n.lhs || decides n.rhs then litAt n tInt (if isAnd then 0 else 1) else symbolAt n tInt;
 
   # Conversion as by assignment (also for arguments and return values). A function
-  # pointer converts only from a type that agrees with its own (typesAgree) and from a null
-  # pointer constant.
+  # pointer converts only from a type that agrees with its own (typesAgree), from a null
+  # pointer constant and from `void *`, and only to such a type and to `void *`.
   assignConv =
     at: t: x:
     if isFnPtr t || isFnPtr x.type then
@@ -918,6 +965,8 @@ let
         if typesAgree t x.type then
           mkCast t x
         else if isFnPtr t && isNullFn x then
+          mkCast t x
+        else if isVoidPtr t || isVoidPtr x.type then
           mkCast t x
         else
           unsupported at "conversion from '${showType x.type}' to '${showType t}'"
@@ -1007,6 +1056,8 @@ let
     in
     if isArray x.type then
       mkCast (ptrTo x.type.of) x.expr
+    else if x.type.tag == "fn" then
+      x.expr
     else if isRecord x.type then
       unsupported e "${x.type.tag} value"
     else if isFloat x.type then
@@ -1058,12 +1109,16 @@ let
     if ctx.link != null && !(hasAttr sym ctx.addrs) then ctx.link.externAddr sym else ctx.addrs.${sym};
 
   # ---- References for the linker ----
-  # In link mode (ctx.link), every statement node and file-scope object carries `uses`:
-  # the references of its expressions to file-scope variables and functions, as
-  #   { use = "var"; name; line; col; ... }  or
-  #   { use = "func"; name; sig; nargs; line; col; ... }
+  # Every statement node and file-scope object carries `uses`: the references of its
+  # expressions to file-scope variables and functions (outside link mode, ctx.link, only
+  # the "fnval" ones), as
+  #   { use = "var"; name; line; col; ... },
+  #   { use = "func"; name; sig; nargs; line; col; ... }  or
+  #   { use = "fnval"; name; sig; line; col; ... }
   # with the position of the identifier (posOf), sig the signature in scope (env.funcs) and
-  # nargs the number of arguments of the call.
+  # nargs the number of arguments of the call: "func" for a direct call, "fnval" for a
+  # function name used as a value (see "Function pointers"). A call through a function
+  # pointer makes no use of a name of its own (a variable called is a "var" use).
   # They are found in the syntax tree with the names in scope where the expression is
   # checked, resolved as identExpr and callExpr resolve them, so that finding them reads no
   # address (constant folding of addresses decides the shape of the typed tree). Operands
@@ -1130,10 +1185,33 @@ let
               // at
             )
           ]
+        else if !isObject && hasAttr name env.funcs then
+          [
+            (
+              {
+                use = "fnval";
+                inherit name;
+                sig = env.funcs.${name};
+                defs = scopeDefs env.ctx;
+              }
+              // at
+            )
+          ]
         else
           [ ]
       )
-    else if isObject || !hasAttr name env.funcs then
+    else if x ? callee then
+      [ ]
+    else if isObject then
+      # A call of a variable (a function pointer) uses the variable.
+      useOf env (
+        {
+          kind = "ident";
+          inherit name;
+        }
+        // at
+      )
+    else if !hasAttr name env.funcs then
       [ ]
     else
       [
@@ -1149,8 +1227,10 @@ let
         )
       ];
 
-  # { uses } for a node whose references are uses, in link mode; { } otherwise.
-  withUses = env: uses: if env.ctx.link == null then { } else { inherit uses; };
+  # { uses } for a node whose references are uses (only the "fnval" ones outside link mode).
+  withUses = env: uses: {
+    uses = if env.ctx.link == null then filter (u: u.use == "fnval") uses else uses;
+  };
   # The same for the expressions exprs (null for none) checked in env.
   linkUses = env: exprs: withUses env (concatMap (usesOf env) exprs);
 
@@ -1214,9 +1294,36 @@ let
     else if hasAttr name ctx.globals then
       objectAt ctx e ctx.globals.${name}.type name
     else if hasAttr name env.funcs then
-      unsupported e "function '${name}' used as a value"
+      funcDesignator env e name
     else
       fail e "use of undeclared identifier '${name}'";
+
+  # The function type of the signature f (env.funcs).
+  fnTypeOf = f: {
+    tag = "fn";
+    inherit (f)
+      ret
+      params
+      variadic
+      unspecified
+      ;
+  };
+
+  # The function name used in the expression e: a "deref" node of function type whose
+  # address is the number of the function (see "Function pointers"), a "symbol" where
+  # expressions are only typed (see typeOnlyEnv), so that the number is never read there.
+  funcDesignator =
+    env: e: name:
+    let
+      f = env.funcs.${name};
+      p = ptrTo (fnTypeOf f);
+    in
+    if f.variadic then
+      unsupported e "variadic function '${name}' used as a value"
+    else
+      node e "deref" p.to {
+        expr = if env.ctx.typeOnly then symbolAt e p else litAt e p (env.ctx.fnNum name);
+      };
 
   # Whether the signature f has a floating-point parameter or return value.
   sigHasFloat = f: isFloat f.ret || any isFloat f.params;
@@ -1224,6 +1331,9 @@ let
   sigHasVaList = f: hasVaList f.ret || any hasVaList f.params;
 
   callExpr =
+    env: e: if e ? callee then indirectCall env e (valueOf env e.callee) else directCall env e;
+
+  directCall =
     env: e:
     let
       f = env.funcs.${e.name};
@@ -1246,7 +1356,15 @@ let
     in
     if hasAttr e.name env.vars || hasAttr e.name env.ctx.globals || hasAttr e.name env.ctx.consts then
       if objType != null && isFnPtr objType then
-        unsupported e "call through the function pointer '${e.name}'"
+        indirectCall env e (
+          valueOf env (
+            {
+              kind = "ident";
+              inherit (e) name;
+            }
+            // posOf e
+          )
+        )
       else
         fail e "called object '${e.name}' is not a function"
     else if !hasAttr e.name env.funcs then
@@ -1270,6 +1388,70 @@ let
         // (if f.variadic then { va = genList vaArg (m - n); } else { })
       );
 
+  # A call through the function pointer p (typed): the arguments converted to the parameter
+  # types of its function type, or, for a type without a prototype, promoted (see
+  # "Function pointers").
+  indirectCall =
+    env: e: p:
+    let
+      ft = p.type.to;
+      n = length ft.params;
+      m = length e.args;
+      arg =
+        i:
+        let
+          a = elemAt e.args i;
+          x = rv env a;
+        in
+        if ft.unspecified then mkCast (promote x.type) x else assignConv a (elemAt ft.params i) x;
+      args = genList arg m;
+      shape = shapeOf ft.ret (map (a: a.type) args);
+      # A narrower return value comes in its class and is converted at the call.
+      call = node e "call" (if isVoid ft.ret || sizeOf ft.ret >= 4 then ft.ret else classType ft.ret) {
+        callee = p;
+        table = shape;
+        inherit args;
+      };
+    in
+    if !isFnPtr p.type then
+      fail e "called object type '${showType p.type}' is not a function or function pointer"
+    else if ft.variadic then
+      unsupported e "call through a pointer to the variadic function type '${showType ft}'"
+    else if sigHasVaList ft then
+      unsupported e "'va_list'"
+    else if sigHasFloat ft then
+      unsupported e "call through a function pointer with a floating-point parameter or return value"
+    else if isRecord ft.ret || any isRecord ft.params then
+      unsupported e "call through a function pointer with a struct or union parameter or return value"
+    else if !ft.unspecified && n != m then
+      fail e "function pointer of type '${showType p.type}' takes ${toString n} argument(s) but ${toString m} were given"
+    else if isVoid ft.ret then
+      call
+    else
+      mkCast ft.ret call;
+
+  # The class of the representation of a value of the scalar type t in an indirect call:
+  # "s" signed 32-bit, "u" unsigned 32-bit (pointers included), "l" long long.
+  classOf =
+    t:
+    if t.tag == "llong" then
+      "l"
+    else if isPtr t || isUnsigned t then
+      "u"
+    else
+      "s";
+  # The type that holds every value of the class of t: int, unsigned int or long long.
+  classType = t: classTypes.${classOf t};
+  classTypes = {
+    s = tInt;
+    u = tUInt;
+    l = tLLong;
+  };
+  # The shape of an indirect call (see "Function pointers") returning ret with arguments of
+  # the types params: the class of ret ("v" for void) and of each parameter.
+  shapeOf =
+    ret: params: (if isVoid ret then "v" else classOf ret) + concatStringsSep "" (map classOf params);
+
   castExpr =
     env: e:
     let
@@ -1286,8 +1468,6 @@ let
       unsupported e "'va_list'"
     else if isFloat t then
       unsupported e "conversion to '${showType t}'"
-    else if (isFnPtr t || isFnPtr x.type) && !typesAgree t x.type && !(isFnPtr t && isNullFn x) then
-      unsupported e "cast from '${showType x.type}' to '${showType t}'"
     else
       mkCast t x;
 
@@ -1321,7 +1501,7 @@ let
     if !isPtr p.type then
       fail at "indirection requires a pointer operand ('${showType p.type}' invalid)"
     else if t.tag == "fn" then
-      unsupported at "dereference of a function pointer"
+      node at "deref" t { expr = p; }
     else if isVoid t then
       fail at "dereference of a 'void *' pointer"
     else if isScalar t && sizeOf t == 8 then
@@ -1769,6 +1949,8 @@ let
       unsupported e "${x.type.tag} assignment"
     else if isFloat x.type then
       unsupported e "floating-point value"
+    else if x.type.tag == "fn" then
+      fail e "non-object type '${showType x.type}' is not assignable"
     else if x.kind == "var" || x.kind == "deref" then
       x
     else
@@ -3670,6 +3852,7 @@ let
           typeOnly = false;
           inherit addrs link;
           strings = strings.addrs;
+          fnNum = if link != null then link.funcNum else localNum;
         };
         size = 0;
         objects = [ ];
@@ -3686,6 +3869,15 @@ let
         }) placed.objects
       );
       strings = placeStrings dataBase placed.size (stringUses items placed.objects);
+      # Outside link mode, the functions are numbered as a link of this unit alone numbers
+      # them (see "Function pointers").
+      localNums = listToAttrs (
+        imap0 (i: u: {
+          inherit (u) name;
+          value = i + 1;
+        }) (fnvalsIn (unitUses r))
+      );
+      localNum = name: localNums.${name} or (throw "cc: internal error: no number for '${name}'");
     in
     builtins.seq (checkBlockLinks r) (
       r
@@ -3733,6 +3925,21 @@ let
 
   # The first of the nodes xs in the source (see before).
   earliest = xs: foldl' (a: b: if before b a then b else a) (head xs) xs;
+
+  # The references of the checked unit r (see usesOf): those of its file-scope objects and
+  # of its function bodies.
+  unitUses = r: concatMap (o: o.uses or [ ]) r.objects ++ concatMap (f: usesIn f.body) r.defs;
+
+  # The functions used as values in the uses, each as its first "fnval" use, in the order
+  # of their first uses.
+  fnvalsIn =
+    uses:
+    let
+      g = groupBy (u: u.name) (filter (u: u.use == "fnval") uses);
+    in
+    sort before (map (n: earliest g.${n}) (attrNames g));
+
+  imap0 = f: xs: genList (i: f i (elemAt xs i)) (length xs);
 
   # The position of the use u in an import: { line; col; } and file when it has one.
   useAt = u: { inherit (u) line col; } // (if u ? file then { inherit (u) file; } else { });
@@ -3790,26 +3997,34 @@ let
   linkUnit =
     r:
     let
-      uses = concatMap (o: o.uses or [ ]) r.objects ++ concatMap (f: usesIn f.body) r.defs;
+      uses = unitUses r;
       merged = mergeExterns r.ctx.globals (concatMap (f: declsIn "externs" f.body) r.defs);
       usesOfKind = k: groupBy (u: u.name) (filter (u: u.use == k) uses);
       varUses = usesOfKind "var";
       funcUses = usesOfKind "func";
+      valUses = usesOfKind "fnval";
+      # The direct calls and the uses as values of each function.
+      fnUses = groupBy (u: u.name) (filter (u: u.use == "func" || u.use == "fnval") uses);
       fileFunc = n: r.funcs.${n} or null;
-      undefinedFuncs =
-        linkage:
+      linkageOfFunc = n: if fileFunc n == null then "external" else (fileFunc n).linkage;
+      undefinedIn =
+        byName: linkage:
         filter (
           n:
           let
             f = fileFunc n;
           in
-          !(f != null && f.defined) && (if f == null then "external" else f.linkage) == linkage
-        ) (attrNames funcUses);
-      internalCalls = concatMap (n: funcUses.${n}) (undefinedFuncs "internal");
-      # The signature that the calls of n must have: the file-scope one, or without one
-      # that of the first call.
-      sigFor = n: if fileFunc n != null then fileFunc n else (earliest funcUses.${n}).sig;
-      conflicts = filter (u: !callAgrees (sigFor u.name) u) (concatLists (attrValues funcUses));
+          !(f != null && f.defined) && linkageOfFunc n == linkage
+        ) (attrNames byName);
+      undefinedFuncs = undefinedIn fnUses;
+      internalCalls = concatMap (n: funcUses.${n}) (undefinedIn funcUses "internal");
+      internalValues = concatMap (n: valUses.${n}) (undefinedIn valUses "internal");
+      # The signature that the calls and values of n must have: the file-scope one, or
+      # without one that of the first use.
+      sigFor = n: if fileFunc n != null then fileFunc n else (earliest fnUses.${n}).sig;
+      useAgrees =
+        u: if u.use == "func" then callAgrees (sigFor u.name) u else sameSig (sigFor u.name) u.sig;
+      conflicts = filter (u: !useAgrees u) (concatLists (attrValues fnUses));
       # The type definitions of the unit at its end, with those in scope at a block-scope
       # declaration (local, or null at file scope): a tag of the file may be completed
       # after the block, and a block-scope tag has an internal name of its own.
@@ -3848,9 +4063,11 @@ let
             variadic
             lsig
             ;
-          defs = defsWith (if fileFunc n != null then null else (earliest funcUses.${n}).defs);
+          defs = defsWith (if fileFunc n != null then null else (earliest fnUses.${n}).defs);
+          # The numbers of arguments of the direct calls.
+          calls = map (u: u.nargs) (funcUses.${n} or [ ]);
         }
-        // useAt (earliest funcUses.${n});
+        // useAt (earliest fnUses.${n});
     in
     {
       checks =
@@ -3860,13 +4077,31 @@ let
           fail (earliest conflicts) "conflicting types for '${(earliest conflicts).name}'"
         else if internalCalls != [ ] then
           unsupported (earliest internalCalls) "call to function '${(earliest internalCalls).name}' that is declared but not defined"
+        else if internalValues != [ ] then
+          undefinedValue (earliest internalValues)
         else
           true;
       imports = {
         vars = map importVar (filter (n: !(r.ctx.globals.${n}.defined or false)) (attrNames varUses));
         funcs = map importFunc (undefinedFuncs "external");
       };
+      fnvals = map (
+        u:
+        let
+          internal = linkageOfFunc u.name == "internal";
+        in
+        {
+          inherit (u) name;
+          inherit internal;
+        }
+        // useAt u
+        // (if internal then { inherit (fileFunc u.name) ret params; } else { })
+      ) (fnvalsIn uses);
     };
+
+  # The error of the "fnval" use u of a function that is not defined where it must be.
+  undefinedValue =
+    u: unsupported u "function '${u.name}' used as a value that is declared but not defined";
 
   # The definitions with external linkage of the checked unit r (see checkWith).
   exportsOf = r: {
@@ -3929,7 +4164,12 @@ let
     let
       r = checkItems dataBase link unit.items;
       lu = linkUnit r;
-      calls = collect (x: kindOf x == "call") (_: false) r.defs;
+      allCalls = collect (x: kindOf x == "call") (_: false) r.defs;
+      calls = filter (c: c ? name) allCalls;
+      # The shapes of the calls through function pointers (sorted, each once).
+      tables = attrNames (groupBy (x: x) (map (c: c.table) (filter (c: c ? table) allCalls)));
+      fnvals = fnvalsIn (unitUses r);
+      undefinedValues = filter (u: !(r.funcs.${u.name}.defined or false)) fnvals;
       undefinedCalls = filter (c: !(hasAttr c.name r.funcs) || !r.funcs.${c.name}.defined) calls;
       # A call through a block-scope declaration, or through one without a prototype, that
       # the file-scope one contradicts.
@@ -3976,9 +4216,11 @@ let
             }
           else
             builtins.seq lu.checks lu.imports;
+        fnvals = if link == null then [ ] else lu.fnvals;
       };
       result = {
         funcs = r.defs;
+        inherit tables;
         data = {
           base = dataBase;
           inherit size;
@@ -3987,7 +4229,22 @@ let
           inits = filter (w: w.value != 0) (objectInits ++ stringInits);
         };
       }
-      // (if link == null then { } else { link.funcs = map (f: f.name) layout.imports.funcs; });
+      // (
+        if link == null then
+          {
+            fnvals = map (u: {
+              inherit (u) name;
+              inherit (r.funcs.${u.name}) ret params;
+            }) fnvals;
+          }
+        else
+          {
+            link = {
+              funcs = map (f: f.name) layout.imports.funcs;
+              statics = map (u: u.name) (filter (u: u.internal) lu.fnvals);
+            };
+          }
+      );
       single =
         if externs != [ ] then
           unsupported extern.at "extern variable '${head externs}' without a definition"
@@ -4001,6 +4258,8 @@ let
           fail (head conflicts) "conflicting types for '${(head conflicts).name}'"
         else if undefinedCalls != [ ] then
           unsupported (head undefinedCalls) "call to function '${(head undefinedCalls).name}' that is declared but not defined"
+        else if undefinedValues != [ ] then
+          undefinedValue (head undefinedValues)
         else if stringOverflows != [ ] then
           stringOverflowFail
         else

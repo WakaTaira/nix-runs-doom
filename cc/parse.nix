@@ -144,7 +144,10 @@
 #       joined, see cc/lex.nix); bytes are the byte values without the terminating 0;
 #       position: the first literal
 #   { kind = "ident"; name; }                              variable; position: the name
-#   { kind = "call"; name; args = [ <expression> ]; }      direct call; position: the name
+#   { kind = "call"; name; args = [ <expression> ]; }      call of a name (a function, or
+#       a variable holding a function pointer); position: the name
+#   { kind = "call"; callee; args = [ <expression> ]; }    call of any other expression
+#       (`(*fp)(x)`, `s->f(x)`, `a[i](x)`); position: that of callee
 #   { kind = "cast"; type; expr; }                         position: the `(`
 #   { kind = "unary"; op; expr; }                          op: "-" "~" "!"; position: op
 #   { kind = "deref"; expr; }                              `*e`; position: the `*`
@@ -1767,16 +1770,15 @@ let
             i = expect idx.i "]";
           }
         else if x == "(" then
-          if e.node.kind == "ident" then
-            postfixOps tn {
-              node = mk e.node "call" {
-                inherit (e.node) name;
+          postfixOps tn {
+            node = mk e.node "call" (
+              (if e.node.kind == "ident" then { inherit (e.node) name; } else { callee = e.node; })
+              // {
                 args = args.list;
-              };
-              inherit (args) i;
-            }
-          else
-            unsupported t "indirect call"
+              }
+            );
+            inherit (args) i;
+          }
         else if x == "++" || x == "--" then
           postfixOps tn {
             node = mk t "postfix" {

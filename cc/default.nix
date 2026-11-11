@@ -16,8 +16,9 @@
 #                 allowUndefined ? false; }
 #                            -> attrs              compile the preprocessed C sources and
 #                                                  link them (cc/link.nix): the functions
-#                                                  with external linkage, __data, __units
-#                                                  and __init (apply it to the memory first);
+#                                                  with external linkage, __data, __units,
+#                                                  __tables and __init (apply it to the
+#                                                  memory first);
 #                                                  errors of a unit are at
 #                                                  <name>:<line>:<col>
 #   linkFiles   { files; read; includePaths ? [ ]; defines ? { }; dataBase ? <default>;
@@ -33,7 +34,9 @@
 # new memory, or { mem; ret; } when it returns a value. `__data.init` (see cc/emit.nix)
 # writes the initial values of the file-scope variables and static locals and the contents
 # of the string literals (placed after them, listed in `__data.strings`); apply it to the
-# memory first.
+# memory first. A function pointer holds the number of a function, and a call through one
+# picks the function from a table (see cc/check.nix and cc/emit.nix); a single file
+# numbers its functions as a link of it alone does.
 let
   Pp = import ./pp.nix;
   L = import ./lex.nix;

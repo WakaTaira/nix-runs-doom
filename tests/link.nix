@@ -1864,12 +1864,12 @@ in
   (t "cc link: a declaration without a prototype agrees with a non-variadic definition"
     [
       (ret (lk [
-        (u "a" "int h(); extern int (*hp)(); int get(int c) { if (c) return h(); return hp == 0; }")
+        (u "a" "int h(); extern int (*hp)(); int (*hv)() = h; int get(void) { return hp == 0; }")
         (u "b" "int h(int a, int b) { return a + b; } int (*hp)(int, int);")
-      ]) "get" [ 0 ])
+      ]) "get" [ ])
       (ret
         (lk [
-          (u "a" "int h(); extern int (*hp)(); int get(int c) { if (c) return h(); return hp == 0; }")
+          (u "a" "int h(); extern int (*hp)(); int (*hv)() = h; int get(void) { return hp == 0; }")
           (u "b" "int h(int a, int b) { return a + b; } int (*hp)(int, int);")
         ])
         "h"
@@ -1906,6 +1906,227 @@ in
       true
       true
       true
+    ]
+  )
+
+  # Function pointers
+  (t "cc link: a function declared without a prototype in one unit is called through its value"
+    [
+      (ret (lk [
+        (u "a" "void h(); void (*hv)() = h; int box; int run(void) { hv(&box); return box; }")
+        (u "b" "void h(int *p) { *p = 7; }")
+      ]) "run" [ ])
+      (contains "  vu = [\n    (throw \"cc: call through a null function pointer\")\n    f1\n  ];"
+        (lk [
+          (u "a" "void h(); void (*hv)() = h; int box; int run(void) { hv(&box); return box; }")
+          (u "b" "void h(int *p) { *p = 7; }")
+        ]).__tables.nix
+      )
+    ]
+    [
+      7
+      true
+    ]
+  )
+  (t "cc link: values of one external function are equal across units, of two static ones not"
+    (
+      let
+        l = lk [
+          (u "a" "int ext(void); static int st(void) { return 1; } int (*ea)(void) = ext; int (*sa)(void) = st;")
+          (u "b" ''
+            int ext(void) { return 5; }
+            static int st(void) { return 2; }
+            int (*eb)(void) = ext;
+            int (*sb)(void) = st;
+            extern int (*ea)(void);
+            extern int (*sa)(void);
+            int cmp(void) { return (ea == eb) * 10 + (sa == sb); }
+            int calls(void) { return ea() * 100 + sa() * 10 + sb(); }
+          '')
+        ];
+        m = l.__init M.empty;
+        word = n: M.loadWord m l.__data.symbols.${n};
+      in
+      [
+        (runCalls l [
+          [ "cmp" ]
+          [ "calls" ]
+        ])
+        (map word [
+          "ea"
+          "sa"
+          "eb"
+          "sb"
+        ])
+      ]
+    )
+    [
+      [
+        10
+        512
+      ]
+      [
+        1
+        2
+        1
+        3
+      ]
+    ]
+  )
+  (t "cc link: the tables hold the functions of the shape and adapters for the others"
+    (
+      let
+        l = lk [
+          (u "a" ''
+            int k(int a, int b);
+            static int s1(int x) { return x * 3; }
+            int (*p1)(int) = s1;
+            int run(void) { int (*q)(int) = (int (*)(int))k; return p1(5) * 100 + q(7); }
+          '')
+          (u "b" "int k(int a, int b) { return a + b; }")
+        ];
+      in
+      [
+        (ret l "run" [ ])
+        l.__tables.nix
+      ]
+    )
+    [
+      1507
+      ''
+        { X, U, B, R }:
+        let
+          inherit (builtins) bitAnd elemAt seq;
+          f1 = (elemAt U 0).__static.s1;
+          f2 = X.k;
+        in
+        {
+          ss = [
+            (throw "cc: call through a null function pointer")
+            f1
+            (mem: a0: f2 mem a0 0)
+          ];
+        }
+      ''
+    ]
+  )
+  (t "cc link: a function of the host or a variadic function used as a value throws"
+    [
+      (throws (lk [ (u "a" "int puts(const char *s); int (*p)(const char *) = puts;") ]))
+      (passes (lk [ (u "a" "int puts(const char *s); int f(void) { return puts(\"x\"); }") ]))
+      (throws (
+        lkWith { allowUndefined = true; } [ (u "a" "int v(int a, ...); int (*p)(int, ...) = v;") ]
+      ))
+      (passes (
+        lkWith { allowUndefined = true; } [ (u "a" "int v(int a, ...); int (*p)(int, ...) = 0;") ]
+      ))
+    ]
+    [ true true true true ]
+  )
+  (t
+    "cc link: a direct call through a declaration without a prototype needs the parameters of the definition"
+    [
+      (throws (lk [
+        (u "a" "int tick(); int f(void) { return tick(); }")
+        (u "b" "int tick(int a) { return a; }")
+      ]))
+      (ret (lk [
+        (u "a" "int tick(); int f(void) { return tick(); }")
+        (u "b" "int tick(void) { return 4; }")
+      ]) "f" [ ])
+      (passes (lk [
+        (u "a" "int tick(); int (*t)() = tick;")
+        (u "b" "int tick(int a) { return a; }")
+      ]))
+    ]
+    [
+      true
+      4
+      true
+    ]
+  )
+  (t "cc link: a function used as a value that nothing defines"
+    [
+      (throws (lk [ (u "a" "void gone(void); void (*p)(void) = gone;") ]))
+      (throws (lk [ (u "a" "static void gone(void); void (*p)(void) = gone; void f(void) { }") ]))
+      (passes (
+        lkWith { allowUndefined = true; } [
+          (u "a" "void gone(void); void (*p)(void) = gone; int f(void) { return p != 0; }")
+        ]
+      ))
+      (ret (lkWith { allowUndefined = true; } [
+        (u "a" "void gone(void); void (*p)(void) = gone; int f(void) { return p != 0; }")
+      ]) "f" [ ])
+      (throws (
+        afterCalls (lkWith { allowUndefined = true; } [
+          (u "a" "void gone(void); void (*p)(void) = gone; int f(void) { p(); return 0; }")
+        ]) [ [ "f" ] ]
+      ))
+    ]
+    [ true true true 1 true ]
+  )
+  (t "cc link: a single file numbers and calls like a link of it alone"
+    (
+      let
+        src = ''
+          int add1(int x) { return x + 1; }
+          static int dbl(int x) { return x * 2; }
+          char buf[sizeof(&add1)];
+          int (*ops[3])(int) = { dbl, 0, add1 };
+          int pick(int i, int x) { if (ops[i] == 0) return -1; return ops[i](x) + sizeof buf; }
+          int num(int i) { return (int)ops[i]; }
+        '';
+        calls = [
+          [
+            "pick"
+            0
+            5
+          ]
+          [
+            "pick"
+            1
+            5
+          ]
+          [
+            "pick"
+            2
+            5
+          ]
+          [
+            "num"
+            0
+          ]
+          [
+            "num"
+            2
+          ]
+        ];
+        single =
+          let
+            f = Cc.load src;
+          in
+          map (c: (foldl' (g: a: g a) (f.${head c} (f.__data.init M.empty)) (tail c)).ret) calls;
+      in
+      [
+        single
+        (runCalls (lk [ (u "a" src) ]) calls)
+      ]
+    )
+    [
+      [
+        14
+        (-1)
+        10
+        1
+        2
+      ]
+      [
+        14
+        (-1)
+        10
+        1
+        2
+      ]
     ]
   )
 ]

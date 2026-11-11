@@ -9,8 +9,10 @@
 # with link, which has `link`) the output is
 #   { M, B, R, X }: { <C function name> = <Nix function>; ...; __data = <data>; }
 # with only the functions with external linkage in the set (the static ones stay in the
-# let), and each imported function f bound as `f_fn = X.f;`: X holds the functions of the
-# other units and of the host (cc/link.nix), called like the unit's own. __data describes
+# let, and those that the unit uses as values are also in `__static = { <name> = ...; }`
+# when there are any), and each imported function f bound as `f_fn = X.f;`: X holds the
+# functions of the other units and of the host (cc/link.nix), called like the unit's own,
+# and the tables of the calls through function pointers in X.__tables. __data describes
 # the file-scope variables, static locals and string literals (cc/check.nix, "Data"):
 #   { base; size; symbols = { <C name> = <address>; ... };
 #     strings = [ { addr; size; } ... ]; init = mem: <mem>; }
@@ -22,6 +24,16 @@
 #     when it returns a value. A call to a variadic function (link mode) is
 #     `<f>_fn mem <fixed arguments> [ <variable arguments> ]`, the list empty when there are
 #     none, its elements in the representation of their (promoted) types.
+#   - A call through a function pointer (cc/check.nix, "Function pointers") is
+#     `(elemAt tab'<shape> <pointer>) mem <arguments>`, with the pointer, then the
+#     arguments, evaluated left to right, and no test of the number: 0 gives the element
+#     that throws "cc: call through a null function pointer", and a number past the table
+#     fails in elemAt. When the unit has such calls, the let also has
+#     `inherit (builtins) elemAt seq;` and `tab'<shape>` for each shape of its calls: in
+#     link mode `X.__tables.<shape>`, otherwise the list of tableList built from the
+#     functions of checked.fnvals (each `<name>_fn`). A table holds at index i the function
+#     numbered i, or an adapter of it to the shape (see tableList and adapter, which
+#     cc/link.nix also uses).
 #   - Locals become let bindings, with a new name for each assignment. Assigning a plain
 #     name or a non-negative constant only renames.
 #   - A loop becomes `R.loop cond body vars`, or `R.loopDo body vars` (no condition to
@@ -177,8 +189,9 @@
 #
 # Generated names are `<C name>_<n>` (parameters `<C name>_0`) with n unique within a
 # function, and `<C name>_fn` for functions, so they collide neither with each other nor
-# with M, B, R, mem, wrapInt and the builtins the output uses. The attribute __data
-# cannot clash with a C function, since identifiers starting with `__` are reserved in C.
+# with M, B, R, mem, wrapInt and the builtins the output uses. The attributes __data and
+# __static cannot clash with a C function, since identifiers starting with `__` are
+# reserved in C, and a table `tab'<shape>` contains a '.
 # In the loop, join and switch sets a variable is its C name, with ' appended to mem and
 # exit; the generated fields st', ret', done' and v' contain a ', so they cannot clash. A
 # variable declared in a switch body that hides one the sections assign is `<C name>'<n>`,
@@ -209,6 +222,7 @@ let
     removeAttrs
     replaceStrings
     sort
+    stringLength
     substring
     tail
     ;
@@ -879,8 +893,33 @@ let
       );
 
   # A call to a variadic function (link mode, which has e.va) passes the variable
-  # arguments as one list after the fixed ones, all evaluated left to right.
-  call =
+  # arguments as one list after the fixed ones, all evaluated left to right. A call through
+  # a function pointer (e.callee) takes the function from the table of its shape (see
+  # "Function pointers"), after evaluating the pointer and then the arguments.
+  call = s: e: if e ? callee then indirectCall s e else directCall s e;
+
+  indirectCall =
+    s: e:
+    let
+      r = exprs s ([ e.callee ] ++ e.args);
+      isVoid = T.isVoid e.type;
+      f = fresh r.s (if isVoid then "mem" else "r");
+      code = app "(elemAt ${tableName e.table} ${wrap 0 (head r.cs)})" ([ (atom r.s.mem) ] ++ tail r.cs);
+    in
+    {
+      s = f.s // {
+        mem = if isVoid then f.name else "${f.name}.mem";
+      };
+      binds = r.binds ++ [
+        {
+          inherit (f) name;
+          inherit (code) code;
+        }
+      ];
+      c = if isVoid then null else atom "${f.name}.ret";
+    };
+
+  directCall =
     s: e:
     let
       va = e.va or null;
@@ -3493,20 +3532,109 @@ let
       link = checked.link or null;
       exported =
         if link == null then checked.funcs else filter (f: f.linkage == "external") checked.funcs;
+      tables = checked.tables or [ ];
+      statics = if link == null then [ ] else link.statics;
     in
     "{ M, B, R${
       if link == null then "" else ", X"
     } }:\nlet\n  inherit (builtins) bitAnd bitOr bitXor div;\n  inherit (R) wrapInt;\n"
+    + (if tables == [ ] then "" else "  inherit (builtins) elemAt seq;\n")
     + (if link == null then "" else importBinds link.funcs)
+    + concatStringsSep "" (map (tableBind link checked) tables)
     + concatStringsSep "" (map func checked.funcs)
     + "in\n{\n"
     + concatStringsSep "" (map (f: "  ${quoteAttr f.name} = ${f.name}_fn;\n") exported)
+    + (
+      if statics == [ ] then
+        ""
+      else
+        "  __static = {\n"
+        + concatStringsSep "" (map (n: "    ${quoteAttr n} = ${n}_fn;\n") statics)
+        + "  };\n"
+    )
     + dataAttr checked.data
     + "}\n";
 
   # Link mode: the bindings of the imported functions (names) to their functions in X.
   importBinds = names: concatStringsSep "" (map (n: "  ${n}_fn = X.${quoteAttr n};\n") names);
+
+  # ---- Function pointers ----
+
+  # The name of the table of the shape (see cc/check.nix shapeOf) in the generated code.
+  tableName = shape: "tab'${shape}";
+
+  # The binding of the table of shape: from X (link mode), or built here from the numbered
+  # functions of the unit (checked.fnvals), each called as `<name>_fn`.
+  tableBind =
+    link: checked: shape:
+    "  ${tableName shape} = ${
+        if link != null then
+          "X.__tables.${shape}"
+        else
+          indent (
+            tableList shape (
+              map (f: {
+                ref = "${f.name}_fn";
+                inherit (f) ret params;
+              }) checked.fnvals
+            )
+          )
+      };\n";
+
+  # The Nix source of the table of shape for the functions funcs, numbered from 1 in
+  # order: [ { ref; ret; params; } ], ref the source of the function and ret and params
+  # its return and parameter types, or [ { ref; } ] for a function of unknown type, which
+  # is taken as it is. Element 0 throws (a call through a null pointer). An element is the
+  # function itself when its signature has the shape, otherwise a function of the shape
+  # (adapter) that calls it.
+  tableList =
+    shape: funcs:
+    "[\n"
+    + concatStringsSep "" (
+      map (x: "  ${x}\n") (
+        [ ''(throw "cc: call through a null function pointer")'' ]
+        ++ map (f: if f ? ret then adapter shape f else f.ref) funcs
+      )
+    )
+    + "]";
+
+  # The element of the table of shape for the function f = { ref; ret; params; }: f.ref
+  # when the classes of its return and parameter types are those of shape, otherwise
+  # `(mem: a0: ... a<n-1>: <body>)` with n the parameters of the shape. The body calls f
+  # with the arguments of the shape converted to its parameter types as a cast converts
+  # them (0 for the parameters the shape lacks, and the extra arguments dropped), and
+  # converts its result the same way to the class of the shape: the memory alone when the
+  # shape returns void, and ret 0 when f returns void and the shape a value.
+  adapter =
+    shape: f:
+    let
+      want = substring 0 1 shape;
+      wantParams = genList (i: substring (i + 1) 1 shape) (stringLength shape - 1);
+      have = if T.isVoid f.ret then "v" else T.classOf f.ret;
+      n = length wantParams;
+      args = genList (
+        i:
+        let
+          p = elemAt f.params i;
+        in
+        if i < n then convert (T.classTypes.${elemAt wantParams i}) p (atom "a${toString i}") else num 0
+      ) (length f.params);
+      call = app f.ref ([ (atom "mem") ] ++ args);
+      result =
+        if want == "v" then
+          (if have == "v" then call.code else "(${call.code}).mem")
+        else if have == "v" then
+          "let m = ${call.code}; in seq m { mem = m; ret = 0; }"
+        else if have == want then
+          call.code
+        else
+          "let r = ${call.code}; in { inherit (r) mem; ret = ${
+            (convert f.ret T.classTypes.${want} (atom "r.ret")).code
+          }; }";
+      lambda = concatStringsSep " " ([ "mem:" ] ++ genList (i: "a${toString i}:") n);
+    in
+    if have == want && map T.classOf f.params == wantParams then f.ref else "(${lambda} ${result})";
 in
 {
-  inherit emit;
+  inherit emit tableList quoteAttr;
 }
