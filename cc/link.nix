@@ -52,9 +52,10 @@
 #     one, with the first import of the name (see below)
 #   <position>: unsupported: host function '<name>' with a 64-bit, floating-point or
 #     struct parameter or return value
-# Types of variables agree when they are compatible, or arrays of compatible element
-# types of which one has no length; functions when the return types, the parameter types
-# and variadic are. Types are compared by structure (C99 6.2.7, see sameType): two
+# Types of variables agree when they are compatible; functions when the return types, the
+# parameter types and variadic are. Types are compared by structure (C99 6.2.7, see
+# sameType): two arrays are compatible when their element types are and, if both have a
+# length, the lengths are equal (also inside pointers, members and parameters); two
 # structs, or two unions, are compatible when their tags are equal if both have one and,
 # when both are complete, they have the same size and alignment and the same members (in
 # order for a struct) with the same names, offsets, bit-field widths and compatible types;
@@ -140,7 +141,8 @@ let
     else if a.tag == "ptr" then
       sameType da db seen a.to b.to
     else if a.tag == "array" then
-      (if a.len == b.len then sameType da db seen a.of b.of else null)
+      # An array without a length is compatible with any length (C99 6.7.5.2p6).
+      (if a.len == b.len || a.len == null || b.len == null then sameType da db seen a.of b.of else null)
     else if a.tag == "fn" then
       sameSig da db seen a b
     else if a.tag == "struct" || a.tag == "union" then
@@ -220,20 +222,8 @@ let
     else
       sameType da db seen f.ltype g.ltype;
 
-  # The variables (imports or exports) a and b agree: the same type, or arrays of the same
-  # element type of which one has no length.
-  varTypesMatch =
-    a: b:
-    let
-      x = a.ltype;
-      y = b.ltype;
-    in
-    (
-      if x.tag == "array" && y.tag == "array" && (x.len == null || y.len == null) then
-        sameType a.defs b.defs { } x.of y.of
-      else
-        sameType a.defs b.defs { } x y
-    ) != null;
+  # The variables (imports or exports) a and b agree: their types are compatible.
+  varTypesMatch = a: b: sameType a.defs b.defs { } a.ltype b.ltype != null;
 
   # The functions (imports or exports) a and b agree.
   sigsMatch = a: b: sameSig a.defs b.defs { } a.lsig b.lsig != null;

@@ -948,6 +948,37 @@ in
     ])
     (linkPair)
   ]) (genList (_: true) 12))
+  (t "cc link 11: an array without a length agrees with any length inside other types"
+    [
+      (ret (lk [
+        (u "a" "typedef int A[]; struct s { A *p; }; extern struct s v; int f(void) { return v.p != 0; }")
+        (u "b" "typedef int A[4]; struct s { A *p; }; struct s v;")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "typedef int A[]; struct s { A *p; }; extern struct s v; int f(void) { return v.p != 0; }")
+        (u "b" "typedef int A[4]; struct s { A *p; }; A arr; struct s v = { &arr };")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "typedef int A[]; extern A *q; int f(void) { return q != 0; }")
+        (u "b" "typedef int A[2]; A *q;")
+      ]) "f" [ ])
+      (throws (lk [
+        (u "a" "typedef int A[3]; struct s { A *p; }; extern struct s v; int f(void) { return v.p != 0; }")
+        (u "b" "typedef int A[4]; struct s { A *p; }; struct s v;")
+      ]))
+      (throws (lk [
+        (u "a" "typedef int A[3]; extern A *q; int f(void) { return q != 0; }")
+        (u "b" "typedef int A[2]; A *q;")
+      ]))
+    ]
+    [
+      0
+      1
+      0
+      true
+      true
+    ]
+  )
   (t "cc link 12: linkage within a file (static first is internal, static later throws)"
     [
       (runCalls
