@@ -205,6 +205,16 @@ let
             ret = dataEnd;
           };
         };
+        # Returns its argument and keeps it in the state.
+        echo = {
+          nargs = 1;
+          call = w: args: {
+            world = w // {
+              last = head args;
+            };
+            ret = head args;
+          };
+        };
         vh = {
           nargs = 1;
           variadic = true;
@@ -249,6 +259,14 @@ let
     '')
     (u "b" "int bump(void); int bb(void) { return bump(); }")
   ];
+
+  # The value that f returns when the host function echo, declared with the return type
+  # rt, returns the argument arg.
+  echoAs =
+    rt: arg:
+    ret (withHost [
+      (u "a" "${rt} echo(int); int f(void) { return echo(${arg}); }")
+    ]) "f" [ ];
 
   # A unit whose layout uses a variable it does not define, through folded constants and
   # an initializer.
@@ -881,6 +899,84 @@ in
           (-2)
         ]
       ]
+    ]
+  )
+  (t "cc link 23: a host function gets its fixed arguments as unsigned 32-bit values"
+    (
+      let
+        l = withHost [ (u "a" "unsigned echo(int); unsigned f(void) { return echo(-1); }") ];
+        r = l.f (l.__init M.empty);
+      in
+      [
+        r.ret
+        r.mem.host.last
+      ]
+    )
+    [
+      4294967295
+      4294967295
+    ]
+  )
+  (t "cc link 23: a host function's result is converted to a narrower return type like a cast"
+    [
+      (echoAs "char" "511")
+      (echoAs "signed char" "511")
+      (echoAs "unsigned char" "-1")
+      (echoAs "short" "98304")
+      (echoAs "unsigned short" "-1")
+      (echoAs "int" "-1")
+    ]
+    [
+      255
+      (-1)
+      255
+      (-32768)
+      65535
+      (-1)
+    ]
+  )
+  (t "cc link 11: host data and host functions declared against the host's table"
+    [
+      (throws (withHost [ (u "a" "extern int hv[]; int f(void) { return hv[0]; }") ]))
+      (throws (withHost [ (u "a" "extern char hv; int f(void) { return hv; }") ]))
+      (throws (withHost [ (u "a" "int twice(int, int); int f(void) { return twice(1, 2); }") ]))
+      (throws (withHost [ (u "a" "int twice(void); int f(void) { return twice(); }") ]))
+      (ret (withHost [ (u "a" "extern int hv[1]; int f(void) { return hv[0] + 1; }") ]) "f" [ ])
+    ]
+    [
+      true
+      true
+      true
+      true
+      1
+    ]
+  )
+  (t "cc link 33: a name that nothing defines, imported as a variable and as a function"
+    (
+      let
+        lkU = lkWith { allowUndefined = true; };
+        asVar = u "a" "extern int x; int fa(void) { return x; }";
+        asFunc = u "b" "int x(void); int fb(void) { return x(); }";
+      in
+      [
+        (throws (lkU [
+          asVar
+          asFunc
+        ]))
+        (throws (lkU [
+          asFunc
+          asVar
+        ]))
+        (passes (lkU [
+          asVar
+          (u "b" "extern int x; int fb(void) { return x; }")
+        ]))
+      ]
+    )
+    [
+      true
+      true
+      true
     ]
   )
   (t "cc link 31: the layout of a unit reads no address of the variables it imports"

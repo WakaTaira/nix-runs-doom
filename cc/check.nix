@@ -24,9 +24,9 @@
 #
 # Errors are thrown as "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for
 # a preprocessed file, whose nodes have `file`), and as
-# "cc: <line>:<col>: unsupported: <what>" for valid C outside the supported subset. `types` holds the type helpers shared with the emitter,
-# `collect` the tree walker, and `constExpr` / `noConstHooks` the integer constant
-# expression evaluator (see there).
+# "cc: <line>:<col>: unsupported: <what>" for valid C outside the supported subset.
+# `types` holds the type helpers shared with the emitter, `collect` the tree walker, and
+# `constExpr` / `noConstHooks` the integer constant expression evaluator (see there).
 #
 # Types are those of cc/parse.nix, resolved: the length of an array is an integer (or null
 # when not given), an enum type is its compatible integer type (unsigned int when no
@@ -480,6 +480,7 @@ let
       isU8
       sizeOf
       fits
+      wrapTo
       ;
   };
 
@@ -966,27 +967,34 @@ let
   # The same for the expressions exprs (null for none) checked in env.
   linkUses = env: exprs: withUses env (concatMap (usesOf env) exprs);
 
-  # The uses of the typed statement n and the statements in it (see declsIn).
-  usesIn =
+  # The statements directly inside the typed statement n, but the initialization of a for
+  # (which usesIn walks and declsIn does not). Only statements are walked: their structure
+  # does not depend on the addresses of the data.
+  subStmts =
     n:
     let
       k = kindOf n;
     in
+    if k == "block" then
+      n.items
+    else if k == "if" then
+      [
+        n.thenStmt
+        n.elseStmt
+      ]
+    else if k == "while" || k == "do" || k == "for" then
+      [ n.body ]
+    else if k == "switch" then
+      n.skipped ++ concatLists n.sections
+    else
+      [ ];
+
+  # The uses of the typed statement n and the statements in it (see declsIn).
+  usesIn =
+    n:
     (n.uses or [ ])
-    ++ (
-      if k == "block" then
-        concatMap usesIn n.items
-      else if k == "if" then
-        usesIn n.thenStmt ++ usesIn n.elseStmt
-      else if k == "while" || k == "do" then
-        usesIn n.body
-      else if k == "for" then
-        usesIn n.init ++ usesIn n.body
-      else if k == "switch" then
-        concatMap usesIn (n.skipped ++ concatLists n.sections)
-      else
-        [ ]
-    );
+    ++ (if kindOf n == "for" then usesIn n.init else [ ])
+    ++ concatMap usesIn (subStmts n);
 
   # The array of the string literal e (a "strlit" node), at the address of its contents
   # (see placeStrings). A literal in the operand of sizeof has no storage, so the value
@@ -3017,29 +3025,11 @@ let
   defaultDataBase = 4194304; # 0x00400000
 
   # The field (statics or externs) of the block-scope declarations in the statement n
-  # and the statements in it, in source order. Only statements are walked: their structure
-  # does not depend on the addresses of the data, which the statics determine.
+  # and the statements in it (subStmts, which the addresses of the data, determined by the
+  # statics, do not change), in source order. The declaration of a for initialization
+  # declares no static or extern variable.
   declsIn =
-    field: n:
-    let
-      k = kindOf n;
-      sub = declsIn field;
-    in
-    if k == "block" then
-      concatMap sub n.items
-    else if k == "decl" then
-      n.${field} or [ ]
-    else if k == "if" then
-      sub n.thenStmt ++ sub n.elseStmt
-    else if k == "while" || k == "do" then
-      sub n.body
-    else if k == "for" then
-      # The declaration of a for initialization declares no static or extern variable.
-      sub n.body
-    else if k == "switch" then
-      concatMap sub (n.skipped ++ concatLists n.sections)
-    else
-      [ ];
+    field: n: if kindOf n == "decl" then n.${field} or [ ] else concatMap (declsIn field) (subStmts n);
 
   # The objects acc.objects followed by the static locals of the functions acc.defs in
   # source order, each at the next offset aligned for it. -> { size; objects; }

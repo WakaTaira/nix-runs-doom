@@ -1,15 +1,17 @@
 # C code generator: typed syntax tree (cc/check.nix) -> Nix source.
 #
-# Entry point: emit : { funcs; data; } -> string. The output is the source of a function
+# Entry point: emit : checked -> string, with checked the `checked` of the result of
+# cc/check.nix checkWith ({ funcs; data; }, and `link` in link mode). The output is the
+# source of a function
 #   { M, B, R }: { <C function name> = <Nix function>; ...; __data = <data>; }
 # with M = lib/mem.nix, B = lib/bits.nix and R = cc/runtime.nix. It imports nothing, so
-# it can be loaded from the store (cc/default.nix). In link mode (the result of
-# cc/check.nix checkWith with link, which has `link`) the output is
+# it can be loaded from the store (cc/default.nix). In link mode (checked of checkWith
+# with link, which has `link`) the output is
 #   { M, B, R, X }: { <C function name> = <Nix function>; ...; __data = <data>; }
 # with only the functions with external linkage in the set (the static ones stay in the
 # let), and each imported function f bound as `f_fn = X.f;`: X holds the functions of the
-# other units and of the host (cc/link.nix), called like the unit's own. __data describes the file-scope
-# variables, static locals and string literals (cc/check.nix, "Data"):
+# other units and of the host (cc/link.nix), called like the unit's own. __data describes
+# the file-scope variables, static locals and string literals (cc/check.nix, "Data"):
 #   { base; size; symbols = { <C name> = <address>; ... };
 #     strings = [ { addr; size; } ... ]; init = mem: <mem>; }
 # init writes the initial values that are not 0 (the contents of the string literals

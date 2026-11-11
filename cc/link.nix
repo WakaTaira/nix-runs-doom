@@ -35,17 +35,21 @@
 # A host function f = { nargs; variadic ? false; call; } is called by the generated code
 # as `f_fn mem a1 ... aN` (and a list of the variable arguments when variadic): see
 # wrapHost. Its result follows the declaration in the units: the memory for void,
-# otherwise { mem; ret; } with ret converted to a signed value for a signed integer type.
+# otherwise { mem; ret; } with ret converted to the declared return type as a cast to it
+# converts an unsigned 32-bit value (so a narrower type keeps the low bytes).
 #
 # Errors are thrown as "cc: link: <message>", with positions "<unit>:<line>:<col>" (the
-# file of the node instead of the unit for a preprocessed unit) at the first use in the
-# first unit that uses the name, in this order:
+# file of the node instead of the unit for a preprocessed unit) at the first use of the
+# name in a unit (the position of its import), in this order:
 #   duplicate unit '<name>'
 #   duplicate definition of '<name>' in '<unit>' and '<unit>'
 #     (a variable or function with external linkage defined by two units)
 #   '<name>' in '<unit>' is also defined by the host
 #   <position>: undefined reference to '<name>'   (a used variable or a called function)
+#     at the import of the first unit, in unit order, that imports the name
 #   <position>: conflicting types for '<name>'
+#     at the first import, in unit order, that disagrees with the definition, or, without
+#     one, with the first import of the name (see below)
 #   <position>: unsupported: host function '<name>' with a 64-bit, floating-point or
 #     struct parameter or return value
 # Types of variables agree when they are equal, or arrays of the same element type of
@@ -54,7 +58,11 @@
 # not compared. Each import is compared with the definition, or, without one (host,
 # undefined), with the first import of the name; a host function also needs nargs
 # parameters and the same variadic, and a host variable the size and alignment of
-# host.data. The errors of the units themselves (cc/check.nix) come first.
+# host.data. A name that nothing defines and that units import both as a variable and as
+# a function conflicts at the first import of the kind the first import does not have.
+# Of the errors of the units themselves (cc/check.nix), only those that their layouts
+# raise come first; the others (those of their expressions, for one) are raised when the
+# units are generated, after the link errors.
 let
   Ch = import ./check.nix;
   E = import ./emit.nix;
@@ -69,8 +77,10 @@ let
     concatMap
     div
     elem
+    elemAt
     filter
     foldl'
+    genList
     groupBy
     hasAttr
     head
@@ -218,7 +228,6 @@ let
     h: decl:
     let
       variadic = h.variadic or false;
-      signed = T.isInteger decl.ret && !T.isUnsigned decl.ret;
       result =
         r:
         let
@@ -233,7 +242,7 @@ let
           else
             {
               inherit mem;
-              ret = if signed then B.toSigned r.ret else r.ret;
+              ret = T.wrapTo decl.ret r.ret;
             }
         );
       run =
@@ -326,6 +335,12 @@ let
     let
       placed = placeUnits dataBase externAddr units;
       layouts = map (u: u.c.layout // { unit = u.name; }) placed.units;
+      unitIndex = listToAttrs (
+        genList (i: {
+          inherit (elemAt placed.units i) name;
+          value = i;
+        }) (length placed.units)
+      );
       tagged = f: concatMap (l: map (x: x // { inherit (l) unit; }) (f l)) layouts;
 
       defs = tagged (l: l.exports.vars ++ l.exports.funcs);
@@ -402,6 +417,7 @@ let
         dataEnd
         symbols
         undefinedSymbols
+        unitIndex
         ;
     };
 
@@ -423,6 +439,16 @@ let
         map (n: "${posText (head imports.${n})}: undefined reference to '${n}'") (
           if r.allowUndefined then [ ] else names
         );
+      # The names that nothing defines and that are imported both as a variable and as a
+      # function: the first import of the kind that the first import does not have.
+      kindConflicts = map (
+        n:
+        let
+          v = head r.varImports.${n};
+          f = head r.funcImports.${n};
+        in
+        if r.unitIndex.${v.unit} <= r.unitIndex.${f.unit} then f else v
+      ) (filter (n: hasAttr n r.funcImports && (r.targetOf n).kind == "none") (attrNames r.varImports));
       wideHostImports = filter (
         i: (r.targetOf i.name).kind == "hostFunc" && (isWide i.ret || any isWide i.params)
       ) (concatMap (n: r.funcImports.${n}) (attrNames r.funcImports));
@@ -442,6 +468,7 @@ let
       (undefinedRefs r.funcImports r.undefinedFuncs)
       (conflicts false r.varImports)
       (conflicts true r.funcImports)
+      (map (i: "${posText i}: conflicting types for '${i.name}'") kindConflicts)
       (map (
         i:
         "${posText i}: unsupported: host function '${i.name}' with a 64-bit, floating-point or struct parameter or return value"
