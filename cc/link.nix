@@ -314,7 +314,9 @@ let
 
   # ---- The link ----
 
-  link =
+  # The units placed and their names resolved: the definitions, imports and addresses of
+  # the link, everything that reads no generated code.
+  resolve =
     {
       units,
       dataBase,
@@ -322,7 +324,6 @@ let
       allowUndefined,
     }:
     let
-      unitNames = map (u: u.name) units;
       placed = placeUnits dataBase externAddr units;
       layouts = map (u: u.c.layout // { unit = u.name; }) placed.units;
       tagged = f: concatMap (l: map (x: x // { inherit (l) unit; }) (f l)) layouts;
@@ -381,77 +382,130 @@ let
       undefinedSymbols = listToAttrs undefinedPlaced.symbols;
       externAddr =
         n: symbols.${n} or undefinedSymbols.${n} or (linkError "undefined reference to '${n}'");
+    in
+    {
+      inherit
+        dataBase
+        host
+        allowUndefined
+        placed
+        layouts
+        defs
+        defsByName
+        varImports
+        funcImports
+        hostFuncs
+        hostData
+        targetOf
+        undefinedVars
+        undefinedFuncs
+        dataEnd
+        symbols
+        undefinedSymbols
+        ;
+    };
 
-      errors = concatLists [
-        (map (
-          n:
-          let
-            ds = defsByName.${n};
-          in
-          "duplicate definition of '${n}' in '${(head ds).unit}' and '${(head (tail ds)).unit}'"
-        ) (filter (n: length defsByName.${n} > 1) (attrNames defsByName)))
-        (map (d: "'${d.name}' in '${d.unit}' is also defined by the host") (
-          filter (d: hasAttr d.name hostFuncs || hasAttr d.name hostData) defs
-        ))
-        (map (n: "${posText (head varImports.${n})}: undefined reference to '${n}'") (
-          if allowUndefined then [ ] else undefinedVars
-        ))
-        (map (n: "${posText (head funcImports.${n})}: undefined reference to '${n}'") (
-          if allowUndefined then [ ] else undefinedFuncs
-        ))
-        (concatMap (
-          n:
-          let
-            i = conflictOf false (targetOf n) varImports.${n};
-          in
-          if i == null then [ ] else [ "${posText i}: conflicting types for '${n}'" ]
-        ) (attrNames varImports))
-        (concatMap (
-          n:
-          let
-            i = conflictOf true (targetOf n) funcImports.${n};
-          in
-          if i == null then [ ] else [ "${posText i}: conflicting types for '${n}'" ]
-        ) (attrNames funcImports))
-        (map
-          (
-            i:
-            "${posText i}: unsupported: host function '${i.name}' with a 64-bit, floating-point or struct parameter or return value"
-          )
-          (
-            filter (i: (targetOf i.name).kind == "hostFunc" && (isWide i.ret || any isWide i.params)) (
-              concatMap (n: funcImports.${n}) (attrNames funcImports)
-            )
-          )
-        )
-      ];
-      # The errors of the units that their layouts raise (cc/check.nix linkUnit) first.
-      verdict = seq (foldl' (acc: l: seq l.imports acc) true layouts) (
-        if errors == [ ] then true else linkError (head errors)
-      );
-
-      hostWrapped = listToAttrs (
+  # The link errors of the resolved link r, in the order of the header.
+  linkErrors =
+    r:
+    let
+      conflicts =
+        isFunc: imports:
         concatMap (
           n:
-          if (targetOf n).kind == "hostFunc" then
-            [
-              {
-                name = n;
-                value = wrapHost hostFuncs.${n} (head funcImports.${n});
-              }
-            ]
-          else
-            [ ]
-        ) (attrNames funcImports)
-      );
-      stubs = listToAttrs (
-        map (n: {
-          name = n;
-          value = undefinedFunc n;
-        }) (if allowUndefined then undefinedFuncs else [ ])
-      );
+          let
+            i = conflictOf isFunc (r.targetOf n) imports.${n};
+          in
+          if i == null then [ ] else [ "${posText i}: conflicting types for '${n}'" ]
+        ) (attrNames imports);
+      undefinedRefs =
+        imports: names:
+        map (n: "${posText (head imports.${n})}: undefined reference to '${n}'") (
+          if r.allowUndefined then [ ] else names
+        );
+      wideHostImports = filter (
+        i: (r.targetOf i.name).kind == "hostFunc" && (isWide i.ret || any isWide i.params)
+      ) (concatMap (n: r.funcImports.${n}) (attrNames r.funcImports));
+    in
+    concatLists [
+      (map (
+        n:
+        let
+          ds = r.defsByName.${n};
+        in
+        "duplicate definition of '${n}' in '${(head ds).unit}' and '${(head (tail ds)).unit}'"
+      ) (filter (n: length r.defsByName.${n} > 1) (attrNames r.defsByName)))
+      (map (d: "'${d.name}' in '${d.unit}' is also defined by the host") (
+        filter (d: hasAttr d.name r.hostFuncs || hasAttr d.name r.hostData) r.defs
+      ))
+      (undefinedRefs r.varImports r.undefinedVars)
+      (undefinedRefs r.funcImports r.undefinedFuncs)
+      (conflicts false r.varImports)
+      (conflicts true r.funcImports)
+      (map (
+        i:
+        "${posText i}: unsupported: host function '${i.name}' with a 64-bit, floating-point or struct parameter or return value"
+      ) wideHostImports)
+    ];
 
-      compiled = map (u: u // { code = E.emit u.c.checked; }) placed.units;
+  # The functions that the units of the resolved link r import from the host, wrapped,
+  # and, with allowUndefined, those that nothing defines.
+  importedFunctions =
+    r:
+    listToAttrs (
+      concatMap (
+        n:
+        if (r.targetOf n).kind == "hostFunc" then
+          [
+            {
+              name = n;
+              value = wrapHost r.hostFuncs.${n} (head r.funcImports.${n});
+            }
+          ]
+        else
+          [ ]
+      ) (attrNames r.funcImports)
+      ++ map (n: {
+        name = n;
+        value = undefinedFunc n;
+      }) (if r.allowUndefined then r.undefinedFuncs else [ ])
+    );
+
+  # The __data of the resolved link r with the loaded units mods (see the header).
+  dataOf = r: mods: {
+    base = r.dataBase;
+    size = r.dataEnd - r.dataBase;
+    inherit (r) symbols;
+    units = listToAttrs (
+      map (u: {
+        inherit (u) name;
+        value = {
+          inherit (u) base;
+          inherit (u.c.layout) size;
+          symbols = listToAttrs (
+            map (s: {
+              inherit (s) name;
+              value = s.addr;
+            }) u.c.layout.symbols
+          );
+        };
+      }) r.placed.units
+    );
+    strings = concatMap (m: m.__data.strings) mods;
+    undefined = r.undefinedSymbols;
+    init = mem: foldl' (m: mod: mod.__data.init m) mem mods;
+  };
+
+  link =
+    args:
+    let
+      r = resolve args;
+      errors = linkErrors r;
+      # The errors of the units that their layouts raise (cc/check.nix linkUnit) first.
+      verdict = seq (foldl' (acc: l: seq l.imports acc) true r.layouts) (
+        if errors == [ ] then true else linkError (head errors)
+      );
+      compiled = map (u: u // { code = E.emit u.c.checked; }) r.placed.units;
       mods = map (
         u:
         import (builtins.toFile "cc-unit.nix" u.code) {
@@ -464,34 +518,12 @@ let
         }
       ) compiled;
       unitFuncs = foldl' (acc: m: acc // removeAttrs m [ "__data" ]) { } mods;
-      X = hostWrapped // stubs // unitFuncs;
-
-      data = {
-        base = dataBase;
-        size = dataEnd - dataBase;
-        inherit symbols;
-        units = listToAttrs (
-          map (u: {
-            inherit (u) name;
-            value = {
-              inherit (u) base;
-              inherit (u.c.layout) size;
-              symbols = listToAttrs (
-                map (s: {
-                  inherit (s) name;
-                  value = s.addr;
-                }) u.c.layout.symbols
-              );
-            };
-          }) placed.units
-        );
-        strings = concatMap (m: m.__data.strings) mods;
-        undefined = undefinedSymbols;
-        init = mem: foldl' (m: mod: mod.__data.init m) mem mods;
-      };
+      X = importedFunctions r // unitFuncs;
+      data = dataOf r mods;
+      duplicateUnits = duplicates (map (u: u.name) args.units);
     in
-    if duplicates unitNames != [ ] then
-      linkError "duplicate unit '${head (duplicates unitNames)}'"
+    if duplicateUnits != [ ] then
+      linkError "duplicate unit '${head duplicateUnits}'"
     else
       seq verdict (
         unitFuncs
@@ -507,7 +539,7 @@ let
             mem:
             data.init mem
             // {
-              host = host.init { inherit symbols dataEnd; };
+              host = args.host.init { inherit (r) symbols dataEnd; };
             };
         }
       );
