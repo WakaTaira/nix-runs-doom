@@ -115,6 +115,37 @@ behaviour.
   (`unsupported: 'va_list'`, `unsupported: definition of a variadic function`). A format
   that needs more arguments than given throws `"libc: too few variadic arguments"`.
 
+### Function pointers are numbers
+
+- **What.** A function pointer holds the number of a function, not its address: from 1
+  in the order in which the functions are first used as values (unit by unit, then in
+  the order of the uses), and 0 is NULL. A function with external linkage has one number
+  in all units; a `static` function has its own (`cc/link.nix`, `cc/check.nix`). A call
+  through a pointer is `(elemAt <table> <number>) mem <args>`: one lookup in a list that
+  the linker generates for each shape, the representation classes of the return type and
+  of the parameters (signed 32-bit, unsigned 32-bit or pointer, `long long`, and void for
+  a return). A function whose signature has the shape of the call is the element itself;
+  any other is wrapped by an adapter (`cc/link.nix`) that fills a missing argument with 0,
+  drops an extra one and converts the arguments and the result like a cast. Element 0
+  throws `cc: call through a null function pointer`.
+- **Why.** Speed. A lookup by number costs 0.06 to 0.07 us more than a direct call
+  (measured over a million calls); a general call with a check of the argument count in
+  every call, or one through a list of arguments, costs several times that.
+- **Observable differences.**
+  - Converting a function pointer to an integer or to `void *` gives the number, and the
+    number converts back; it is not an address and no arithmetic on it means anything.
+  - A value that is no number of a function is not caught: calling `(actionf_v)(-1)`
+    stops the evaluation with an index error of `builtins.elemAt`, which
+    `builtins.tryEval` cannot catch (a range check would be paid by every call). Only
+    NULL has its own message.
+  - A parameter whose width differs from the one in the type of the pointer, in the same
+    class (a pointer to `()` that calls a function with an `unsigned short` parameter),
+    is not converted: the value goes through as it is. Parameters of another class are
+    converted, and a missing argument is 0.
+  - Doom's sources do not depend on these: function pointers are never used as
+    addresses, and a value that is no function (`(actionf_v)(-1)`) only serves as a mark
+    to compare with and is never called.
+
 ### The host state lives in the memory
 
 - **What.** The state of the host functions (the heap break, open files, output, clock,
