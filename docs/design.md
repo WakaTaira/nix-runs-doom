@@ -8,7 +8,10 @@ evaluation; nothing is built and no external process runs.
 
 ## Deliberate deviations from C for speed
 
-Compiled code follows C except in the points below. Most of them leave out a check or a
+Compiled code follows C except in the points below. The compiler is built to run Doom,
+not general C: these points break the C semantics on purpose to make the compiled code
+faster, on the ground that Doom's sources do not rely on the behaviour they break. A
+general C program that does rely on it may misbehave. Most of them leave out a check or a
 representation that every call or operation would pay for. A few are not about speed but
 follow from the same design; they say so. Each item names the files that define the
 behaviour.
