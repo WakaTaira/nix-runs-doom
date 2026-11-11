@@ -49,7 +49,11 @@
 # pointer and another type (but a null pointer constant) are unsupported. float and double
 # are known types with their size and alignment, but every floating-point value (and
 # variable, and the definition of or a call to a function with such a parameter or return
-# value) is unsupported, as are calls to a variadic function.
+# value) is unsupported, as are calls to a variadic function. __builtin_va_list (the
+# va_list of stdarg.h, see cc/parse.nix) may only be named in a typedef and in the
+# parameters of a function declaration: a variable, member, return type, cast or sizeof
+# of a type with it (hasVaList), the definition of a function with such a parameter and a
+# call to one are unsupported ('va_list').
 #
 # Typed syntax tree
 # -----------------
@@ -449,6 +453,7 @@ let
     llong = "long long";
     float = "float";
     double = "double";
+    valist = "__builtin_va_list";
   };
   showType =
     t:
@@ -498,6 +503,19 @@ let
   # A floating-point object: a float or double, or an array of them.
   hasFloat = t: isFloat t || isArray t && hasFloat t.of;
   isFnPtr = t: isPtr t && t.to.tag == "fn";
+  # __builtin_va_list (cc/parse.nix), or a pointer to or an array of it: only a typedef
+  # and the parameters of a function declaration may have such a type (the parameters of
+  # a function type are not looked into).
+  hasVaList =
+    t:
+    if t.tag == "valist" then
+      true
+    else if isPtr t then
+      hasVaList t.to
+    else if isArray t then
+      hasVaList t.of
+    else
+      false;
   # Sizes (and alignments) of the floating-point types; they are never read or written.
   floatSizes = {
     float = 4;
@@ -1033,6 +1051,8 @@ let
 
   # Whether the signature f has a floating-point parameter or return value.
   sigHasFloat = f: isFloat f.ret || any isFloat f.params;
+  # Whether the signature f has a parameter or return value of a va_list type (hasVaList).
+  sigHasVaList = f: hasVaList f.ret || any hasVaList f.params;
 
   callExpr =
     env: e:
@@ -1057,6 +1077,8 @@ let
       fail e "call to undeclared function '${e.name}'"
     else if f.variadic then
       unsupported e "call to the variadic function '${e.name}'"
+    else if sigHasVaList f then
+      unsupported e "'va_list'"
     else if sigHasFloat f then
       unsupported e "call to the function '${e.name}' with a floating-point parameter or return value"
     else if n != m then
@@ -1079,6 +1101,8 @@ let
       node e "cast" t { expr = x; }
     else if isVoid x.type then
       fail e.expr "void value used"
+    else if hasVaList t then
+      unsupported e "'va_list'"
     else if isFloat t then
       unsupported e "conversion to '${showType t}'"
     else if (isFnPtr t || isFnPtr x.type) && t != x.type && !(isFnPtr t && isNullFn x) then
@@ -1232,6 +1256,8 @@ let
       fail n "invalid application of 'sizeof' to a bit-field"
     else if isVoid t then
       fail n "invalid application of 'sizeof' to a void type"
+    else if hasVaList t then
+      unsupported n "'va_list'"
     else if !isComplete env.ctx t then
       fail n "invalid application of 'sizeof' to an incomplete type '${showType t}'"
     else
@@ -1761,7 +1787,9 @@ let
             r = declare acc.env d d.name t;
             init = if d.init == null then null else assignConv d.init t (rv r.env d.init);
           in
-          if isArray t then
+          if hasVaList t then
+            unsupported d "'va_list'"
+          else if isArray t then
             unsupported d "local array"
           else if isRecord t then
             unsupported d "local ${t.tag} variable"
@@ -1844,6 +1872,8 @@ let
     builtins.seq (checkLocal env d name) (
       if isVoid t then
         fail d "variable '${name}' has type 'void'"
+      else if hasVaList t then
+        unsupported d "'va_list'"
       else if hasAttr name env.funcs then
         fail d "redefinition of '${name}' as a different kind of symbol"
       else if prev != null && !compatible prev.type t then
@@ -1881,6 +1911,8 @@ let
     builtins.seq (checkLocal env d name) (
       if isVoid t0 then
         fail d "variable '${name}' has type 'void'"
+      else if hasVaList t0 then
+        unsupported d "'va_list'"
       else if hasLLong t0 then
         unsupported d "8-byte integer in a static variable"
       else if hasFloat t0 then
@@ -2308,6 +2340,8 @@ let
     in
     if isArray ret then
       fail item "function cannot return array type '${showType ret}'"
+    else if hasVaList ret then
+      unsupported item "'va_list'"
     else if isRecord ret then
       unsupported item "${ret.tag} returned by value"
     else
@@ -2341,7 +2375,9 @@ let
       } (genList (i: i) (length f.params));
       items = blockItems ps.env f.body.items;
     in
-    if sigHasFloat sig then
+    if sigHasVaList sig then
+      unsupported f "'va_list'"
+    else if sigHasFloat sig then
       unsupported f "definition of a function with a floating-point parameter or return value"
     else
       posOf f
@@ -2554,6 +2590,8 @@ let
       unsupported f "flexible array member"
     else if !isComplete env.ctx t then
       fail f "field '${f.name}' has incomplete type '${showType t}'"
+    else if hasVaList t then
+      unsupported f "'va_list'"
     else if hasLLong t then
       unsupported f "8-byte integer in a struct"
     else if isBit && n.kind == "union" then
@@ -2745,6 +2783,8 @@ let
         fail g "static declaration of '${name}' follows non-static declaration"
       else if isVoid t then
         fail g "variable '${name}' has type 'void'"
+      else if hasVaList t then
+        unsupported g "'va_list'"
       else if hasLLong t then
         unsupported g "8-byte integer in a global variable"
       else if isDef && hasFloat t then

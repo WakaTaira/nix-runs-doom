@@ -38,6 +38,8 @@
 #                                    a preprocessed file (index: of the keyword token)
 #   { tag = "union"; name; }         union, by tag (named like struct)
 #   { tag = "enum"; name; }          enum, by tag (named like struct)
+#   { tag = "valist"; }              __builtin_va_list, a type name predefined like a
+#                                    typedef (the va_list of stdarg.h)
 # `unsigned` and `unsigned int` are "uint"; `signed`, `signed int` and `int` are "int";
 # `long int` and `signed long` are "long"; `long long` (with optional `int`/`signed`) is
 # "llong"; `short`, `short int` and `signed short` are "short", `unsigned short` (with
@@ -1849,9 +1851,14 @@ let
         else
           fail t "expected an expression but found ${describe t}";
 
+      # __builtin_va_list is predefined like a typedef name (see the header).
       top = iterate external {
         i = 0;
-        tn = { };
+        tn = {
+          __builtin_va_list = {
+            tag = "valist";
+          };
+        };
       };
     in
     mk {

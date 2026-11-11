@@ -388,6 +388,64 @@ let
     };
   };
 
+  # The standard headers that the toolchain takes from clang and that the C compiler of
+  # cc/ needs besides the generated ones. va_list is __builtin_va_list, which cc/ knows as
+  # a type of its own (a list of the variable arguments, see cc/parse.nix).
+  stdHeaderFiles = {
+    "limits.h" = ''
+      #ifndef OWN_LIMITS_H
+      #define OWN_LIMITS_H
+      #define CHAR_BIT 8
+      #define SHRT_MAX 32767
+      #define SHRT_MIN (-32767 - 1)
+      #define INT_MAX 2147483647
+      #define INT_MIN (-2147483647 - 1)
+      #define UINT_MAX 4294967295U
+      #endif
+    '';
+    "stdarg.h" = ''
+      #ifndef OWN_STDARG_H
+      #define OWN_STDARG_H
+      typedef __builtin_va_list va_list;
+      #define va_start(ap, last) __builtin_va_start(ap, last)
+      #define va_arg(ap, type) __builtin_va_arg(ap, type)
+      #define va_end(ap) __builtin_va_end(ap)
+      #endif
+    '';
+    "stdbool.h" = ''
+      #ifndef OWN_STDBOOL_H
+      #define OWN_STDBOOL_H
+      #define bool _Bool
+      #define true 1
+      #define false 0
+      #define __bool_true_false_are_defined 1
+      #endif
+    '';
+    "stddef.h" = ''
+      #ifndef OWN_STDDEF_H
+      #define OWN_STDDEF_H
+      typedef unsigned int size_t;
+      typedef int ptrdiff_t;
+      typedef int wchar_t;
+      #define NULL ((void *)0)
+      #endif
+    '';
+    "stdint.h" = ''
+      #ifndef OWN_STDINT_H
+      #define OWN_STDINT_H
+      typedef signed char int8_t;
+      typedef unsigned char uint8_t;
+      typedef short int16_t;
+      typedef unsigned short uint16_t;
+      typedef int int32_t;
+      typedef unsigned int uint32_t;
+      typedef long long int64_t;
+      typedef int intptr_t;
+      typedef unsigned int uintptr_t;
+      #endif
+    '';
+  };
+
   byName = indexBy (e: e.name) checked;
   byNum = indexBy (e: toString e.num) checked;
 
@@ -576,6 +634,13 @@ let
       ${concatStringsSep "\n" (map check (attrNames h.protos))}
       #endif
     '';
+
+  headerFiles = listToAttrs (
+    map (file: {
+      name = file;
+      value = headerText file;
+    }) (attrNames headers)
+  );
 in
 {
   # The validated table, the FILE * handle values, and the entries by name and by
@@ -590,12 +655,23 @@ in
     ;
 
   # { "<path>.h" = text; } for every generated header.
-  headerFiles = listToAttrs (
-    map (file: {
-      name = file;
-      value = headerText file;
-    }) (attrNames headers)
-  );
+  inherit headerFiles;
+
+  # The standard headers for the C compiler of cc/ (not given to the toolchain, which has
+  # clang's), and those together with the generated ones.
+  inherit stdHeaderFiles;
+  ccHeaderFiles = headerFiles // stdHeaderFiles;
+
+  # The variables that the host provides to C code linked by cc/link.nix
+  # ([ { name; size; align; } ], see cc/host.nix): errno, which stubsC defines for the
+  # toolchain.
+  hostData = [
+    {
+      name = "errno";
+      size = 4;
+      align = 4;
+    }
+  ];
 
   # Assembly stubs for every non-variadic entry.
   stubsAsm = concatStringsSep "\n" (map asmStub (filter (e: !(isVariadic e)) checked));

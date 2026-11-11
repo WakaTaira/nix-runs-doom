@@ -7150,6 +7150,31 @@ in
   )
   (t "cc parse: '...' without a named parameter throws" (throws "int bad(...);") true)
 
+  # __builtin_va_list
+  (t "cc run: __builtin_va_list in a typedef and in the parameters of declarations" (ret ''
+    typedef __builtin_va_list va_list;
+    int vprintf(const char *fmt, va_list ap);
+    int (*fp)(va_list);
+    int one(void) { int k(va_list *); typedef va_list w; return 1; }
+  '' "one" [ ]) 1)
+  (t "cc compile: a variable, member, value or definition of va_list throws" (map
+    (s: compileThrows ("typedef __builtin_va_list va_list; int vf(va_list ap); " + s))
+    [
+      "va_list x;"
+      "extern va_list x; int f(void) { return 1; }"
+      "va_list *p;"
+      "int f(void) { va_list x; return 1; }"
+      "int f(void) { static va_list x; return 1; }"
+      "int f(void) { extern va_list x; return 1; }"
+      "struct s { va_list a; };"
+      "int f(void) { return sizeof(va_list); }"
+      "int f(void) { return (int)(va_list)0; }"
+      "int h(va_list a) { return 1; }"
+      "va_list h(void);"
+      "int f(void) { return vf(0); }"
+    ]
+  ) (genList (_: true) 12))
+
   # Unions
   (t "cc run: union sizes and alignments"
     (
