@@ -3910,6 +3910,43 @@ in
       8
     ]
   )
+  (t "cc compile: a block-scope declaration hiding a name with no linkage has external linkage"
+    [
+      (map compileThrows [
+        "static int h(void); int f(void) { int h; { int h(void); return h(); } } static int h(void) { return 1; }"
+        "static int v; int f(void) { int v; { extern int v; return v; } }"
+        "static int h(void) { return 1; } int f(void) { int h; { int h(void); return h(); } }"
+        "int f(int h) { { int h(void); return h(); } } static int h(void) { return 1; }"
+        "int f(void) { typedef int h; { int h(void); return h(); } } static int h(void) { return 1; }"
+        "int f(void) { enum { h }; { int h(void); return h(); } } static int h(void) { return 1; }"
+        "int f(void) { for (int h = 0;;) { int h(void); return h(); } } static int h(void) { return 1; }"
+        "static int v; int f(void) { static int v; { extern int v; return v; } }"
+      ])
+      (dret
+        "static int h(void); int f(void) { int h(void); return h(); } static int h(void) { return 1; }"
+        "f"
+        [ ]
+      )
+      (dret
+        "static int h(void); int f(void) { { int h; } { int h(void); return h(); } } static int h(void) { return 2; }"
+        "f"
+        [ ]
+      )
+      (dret "static int v = 3; int f(void) { extern int v; return v; }" "f" [ ])
+      (dret
+        "static int h(void); int f(void) { int h(void); { int h(void); return h(); } } static int h(void) { return 4; }"
+        "f"
+        [ ]
+      )
+    ]
+    [
+      (genList (_: true) 8)
+      1
+      2
+      3
+      4
+    ]
+  )
   (t "cc run: a declaration after a static one keeps internal linkage"
     [
       (dret "static int f(void); int f(void) { return 3; } int g(void) { return f(); }" "g" [ ])

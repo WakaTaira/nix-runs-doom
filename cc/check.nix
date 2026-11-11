@@ -161,8 +161,12 @@
 # linkage is "internal" or "external" (C99 6.2.2): internal when the first declaration of
 # the name is `static`. A `static` declaration of a function or variable after one with
 # external linkage is an error, also after a block-scope declaration of the name (a
-# function, or an extern variable) in an earlier function that no file-scope declaration
-# preceded.
+# function, or an extern variable) in an earlier function that gave it external linkage
+# of its own: where no declaration of the name with linkage was visible, but nothing or
+# one with no linkage, such as a local variable (C99 6.2.2p4-5). Such a block-scope
+# declaration after a file-scope `static` one of the name is an error too ("non-static
+# declaration of '<name>' follows static declaration"), raised after the errors of the
+# file-scope declarations.
 #
 # Data
 # ----
@@ -2597,7 +2601,8 @@ let
   # see linkageOf); defs: the typed function definitions; size: the bytes placed so far;
   # objects: the placed variables
   # ([ { name; addr; end; at; writes; } ], writes as the inits of the data); blockLinked:
-  # the names declared at block scope with external linkage (see withBlockDecls). The context
+  # the block-scope declarations that give their name external linkage of their own, by
+  # name (see withBlockDecls). The context
   #   ctx = { structs; enums; consts; globals; tags; enumDefs; typeOnly; addrs; strings; }
   # holds the struct and union layouts by tag (see "Objects"), the enum types by tag, the
   # enumerators by name ({ type; value; }), the file-scope variables by name
@@ -2698,41 +2703,154 @@ let
         )
     );
 
-  # The names declared at block scope in the function definition f (its syntax tree): the
-  # function declarations and the extern variables, as { funcs; vars; } (sets of true).
-  blockDeclsOf =
-    f:
+  # The block-scope declarations in the function definition f (its syntax tree) that give
+  # their name external linkage of their own: the function declarations and the extern
+  # variables where no declaration of the name with linkage is visible (C99 6.2.2p4-5).
+  # Such a declaration takes the linkage of the visible one; otherwise, where nothing or a
+  # declaration with no linkage (a parameter, a local or static local variable, a typedef
+  # or an enumerator of an enclosing block) is visible, its linkage is external. The
+  # bindings of the blocks are followed in source order, scope = { <name> = "none" |
+  # "linked"; }; a name bound in no block is visible with linkage when the file-scope
+  # declarations so far (file = { funcs; vars; }, by kind) declare it.
+  # -> [ <proto or vardecl node> ]
+  ownLinksOf =
+    file: f:
+    linkStmt file (listToAttrs (
+      map (p: {
+        inherit (p) name;
+        value = "none";
+      }) f.params
+    )) f.body;
+
+  # The declarations of ownLinksOf in the statement n, with the bindings scope.
+  linkStmt =
+    file: scope: n:
     let
-      ds = collect (x: kindOf x == "proto" || kindOf x == "vardecl" && x.storage == "extern") (
-        _: false
-      ) f.body;
-      names =
+      k = n.kind;
+      sub = linkStmt file scope;
+    in
+    if k == "block" then
+      linkItems file scope n.items
+    else if k == "if" then
+      sub n.thenStmt ++ (if n.elseStmt == null then [ ] else sub n.elseStmt)
+    else if k == "while" || k == "do" || k == "switch" then
+      sub n.body
+    else if k == "case" || k == "default" then
+      sub n.stmt
+    else if k == "for" && n.init != null && n.init.kind == "decl" then
+      linkItems file scope [
+        n.init
+        n.body
+      ]
+    else if k == "for" then
+      sub n.body
+    else
+      [ ];
+
+  # The declarations of ownLinksOf in the items of a block, each in the scope of the
+  # declarations before it.
+  linkItems =
+    file: scope: items:
+    (foldl'
+      (
+        acc: s:
+        if s.kind == "decl" then
+          linkDecl file acc s
+        else
+          acc
+          // {
+            found = acc.found ++ linkStmt file acc.scope s;
+          }
+      )
+      {
+        inherit scope;
+        found = [ ];
+      }
+      items
+    ).found;
+
+  # acc = { scope; found; } after the declaration statement n.
+  linkDecl =
+    file: acc: n:
+    foldl' (
+      a: d:
+      let
+        k = d.kind;
+        bind =
+          names: v:
+          a.scope
+          // listToAttrs (
+            map (name: {
+              inherit name;
+              value = v;
+            }) names
+          );
+      in
+      if k == "proto" || k == "vardecl" && d.storage == "extern" then
+        {
+          scope = bind [ d.name ] "linked";
+          found = a.found ++ (if ownsLink file a.scope d then [ d ] else [ ]);
+        }
+      else if k == "vardecl" || k == "typedef" then
+        a // { scope = bind [ d.name ] "none"; }
+      else if k == "enum" then
+        a // { scope = bind (map (c: c.name) d.consts) "none"; }
+      else
+        a
+    ) acc n.decls;
+
+  # Whether the block-scope declaration d (a function declaration or an extern variable)
+  # gives its name external linkage of its own in the bindings scope (see ownLinksOf).
+  ownsLink =
+    file: scope: d:
+    let
+      v = scope.${d.name} or null;
+    in
+    if v != null then
+      v == "none"
+    else
+      !hasAttr d.name (if d.kind == "proto" then file.funcs else file.vars);
+
+  # acc.blockLinked with the declarations of ownLinksOf in the function definition f
+  # (funcs: the functions declared so far, f included), the first of each name kept, as
+  # { funcs; vars; } (declaration nodes by name). A later file-scope `static` declaration
+  # of such a name is an error (staticAfterExtern), and so is an earlier one
+  # (checkBlockLinks).
+  withBlockDecls =
+    acc: funcs: f:
+    let
+      ds = ownLinksOf {
+        inherit funcs;
+        vars = acc.ctx.globals;
+      } f;
+      named =
         k:
         listToAttrs (
           map (d: {
             inherit (d) name;
-            value = true;
+            value = d;
           }) (filter (d: d.kind == k) ds)
         );
     in
     {
-      funcs = names "proto";
-      vars = names "vardecl";
+      funcs = named "proto" // acc.blockLinked.funcs;
+      vars = named "vardecl" // acc.blockLinked.vars;
     };
 
-  # acc.blockLinked with the names that the function definition f declares at block scope
-  # where no file-scope declaration of them precedes it (funcs: the functions declared so
-  # far, f included). Such a name has external linkage (C99 6.2.2), so a later file-scope
-  # `static` declaration of it is an error (staticAfterExtern).
-  withBlockDecls =
-    acc: funcs: f:
+  # Fails at the first block-scope declaration of r.blockLinked (see withBlockDecls) whose
+  # name an earlier file-scope `static` declaration gives internal linkage: the name would
+  # have both linkages (C99 6.2.2p7). r is the end of the fold over the items, which has
+  # failed already where a `static` declaration follows.
+  checkBlockLinks =
+    r:
     let
-      d = blockDeclsOf f;
+      linkageIn = decls: d: (decls.${d.name} or { linkage = null; }).linkage;
+      bad =
+        filter (d: linkageIn r.funcs d == "internal") (attrValues r.blockLinked.funcs)
+        ++ filter (d: linkageIn r.ctx.globals d == "internal") (attrValues r.blockLinked.vars);
+      d = earliest bad;
     in
-    {
-      funcs = acc.blockLinked.funcs // removeAttrs d.funcs (attrNames funcs);
-      vars = acc.blockLinked.vars // removeAttrs d.vars (attrNames acc.ctx.globals);
-    };
+    bad == [ ] || fail d "non-static declaration of '${d.name}' follows static declaration";
 
   # The linkage ("internal" or "external", C99 6.2.2) of a file-scope declaration with the
   # storage class storage, after the earlier declaration prev of the name (or null): that
@@ -2748,11 +2866,12 @@ let
     else
       "external";
   # Whether a declaration with the storage class storage is `static` after one with
-  # external linkage: the earlier file-scope declaration prev, or, without one, a
-  # block-scope declaration in an earlier function (blockLinked, see withBlockDecls).
+  # external linkage: the earlier file-scope declaration prev, or a block-scope
+  # declaration in an earlier function that gave the name external linkage of its own
+  # (blockLinked, see withBlockDecls).
   staticAfterExtern =
     prev: blockLinked: storage:
-    storage == "static" && (if prev != null then prev.linkage == "external" else blockLinked);
+    storage == "static" && (prev != null && prev.linkage == "external" || blockLinked);
 
   # ---- Structs and enums ----
 
@@ -3497,11 +3616,13 @@ let
       );
       strings = placeStrings dataBase placed.size (stringUses items placed.objects);
     in
-    r
-    // {
-      inherit (placed) size objects;
-      inherit strings;
-    };
+    builtins.seq (checkBlockLinks r) (
+      r
+      // {
+        inherit (placed) size objects;
+        inherit strings;
+      }
+    );
 
   # How the block-scope extern x refers to the file-scope variable of its name in the final
   # context ctx: "ok" (defined, with a compatible type), "undefined" or "type" (defined
