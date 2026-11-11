@@ -60,14 +60,14 @@
 #
 # File-scope items (position: the declared name):
 #   { kind = "typedef"; name; type; }
-#   { kind = "proto"; name; ret = <type>; params = [ <param> ]; variadic; }
-#   { kind = "func"; name; ret = <type>; params = [ <param> ]; body = <block>; }
+#   { kind = "proto"; name; ret = <type>; params = [ <param> ]; variadic; storage; }
+#   { kind = "func"; name; ret = <type>; params = [ <param> ]; storage; body = <block>; }
 #   { kind = "global"; name; type; storage; init = <initializer or null>; }
 #       file-scope variable; storage is null, "static" or "extern".
 #   One declaration may declare several names (`int f(int), g(void);`); each becomes
 #   its own item. A declarator whose type is a function declares a proto or a func (ret,
-#   params and variadic are those of the function type). `static` and `extern` on a
-#   function are accepted and not recorded. Defining a variadic function is unsupported.
+#   params and variadic are those of the function type), whose storage is null, "static"
+#   or "extern" as for variables. Defining a variadic function is unsupported.
 #
 # Tag definitions (position: the `struct`, `union` or `enum` keyword), at file scope as
 # items and at block scope in the decls of a "decl" statement. They come before the
@@ -118,8 +118,9 @@
 #       storage is null, "static" or "extern"; the initializer is an expression, or an
 #       "initlist" for a static one (for others it is unsupported). An extern one has
 #       no initializer.
-#   { kind = "proto"; name; ret; params; variadic; }      function declaration (without
-#                                                         `static`)
+#   { kind = "proto"; name; ret; params; variadic; storage; }
+#                                                         function declaration; storage
+#                                                         is null or "extern"
 #   { kind = "typedef"; name; type; }
 #
 # Expressions:
@@ -1090,12 +1091,13 @@ let
           i = skipAttrs "'packed' on a declaration" d.i;
         };
 
-      # The proto node of a function declaration d (see `declared`).
+      # The proto node of a function declaration d (see `declared`) with the specifiers sp.
       protoNode =
-        d:
+        sp: d:
         mk d.nameTok "proto" {
           inherit (d) name;
           inherit (d.type) params variadic ret;
+          inherit (sp) storage;
         };
 
       externalDeclarators =
@@ -1124,7 +1126,7 @@ let
                 init = if hasInit then init.node else null;
               }
             else
-              protoNode d;
+              protoNode sp d;
           tn' = if sp.typedef then tn // { ${d.name} = type; } else shadow tn d.name;
           isDef = first && !sp.typedef && d.isFn && isP d.i "{";
           rest = externalDeclarators tn' sp (next + 1) false;
@@ -1132,7 +1134,7 @@ let
         if sp.register then
           fail at "illegal storage class 'register' at file scope"
         else if isDef then
-          inlineOnFunction sp d.isFn at (funcDef tn' d)
+          inlineOnFunction sp d.isFn at (funcDef tn' sp d)
         else if hasInit && sp.typedef then
           fail (tok d.i) "typedef with an initializer"
         else if hasInit && d.isFn then
@@ -1196,7 +1198,7 @@ let
           };
 
       funcDef =
-        tn: d:
+        tn: sp: d:
         let
           inherit (d.type) params;
           unnamed = builtins.filter (p: p.name == null) params;
@@ -1213,6 +1215,7 @@ let
                 inherit (d) name;
                 inherit params;
                 inherit (d.type) ret;
+                inherit (sp) storage;
                 body = body.node;
               })
             ];
@@ -1265,7 +1268,7 @@ let
                 inherit type;
               }
             else if d.isFn then
-              protoNode d
+              protoNode sp d
             else
               mk at "vardecl" {
                 inherit (d) name;

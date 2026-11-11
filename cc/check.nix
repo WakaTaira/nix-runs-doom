@@ -115,7 +115,10 @@
 # unsupported.
 #
 # Typed function (position of its name):
-#   { name; ret; params = [ var ]; body = <block>; line; col; }
+#   { name; ret; params = [ var ]; body = <block>; linkage; line; col; }
+# linkage is "internal" or "external" (C99 6.2.2): internal when the first declaration of
+# the name is `static`. A `static` declaration of a function or variable after one with
+# external linkage is an error.
 #
 # Data
 # ----
@@ -1766,6 +1769,7 @@ let
           funcs = env.funcs // {
             ${name} = sig // {
               defined = prev != null && prev.defined;
+              linkage = linkageOf prev null;
             };
           };
           vars = removeAttrs env.vars [ name ];
@@ -2184,14 +2188,15 @@ let
   # ---- File scope ----
   # The items are checked in order with the accumulator
   #   acc = { funcs; defs; ctx; size; objects; }
-  # funcs: the function signatures by name ({ ret; params; variadic; defined; }); defs: the
-  # typed function definitions; size: the bytes placed so far; objects: the placed variables
+  # funcs: the function signatures by name ({ ret; params; variadic; defined; linkage; },
+  # see linkageOf); defs: the typed function definitions; size: the bytes placed so far;
+  # objects: the placed variables
   # ([ { name; addr; end; at; writes; } ], writes as the inits of the data). The context
   #   ctx = { structs; enums; consts; globals; tags; addrs; strings; }
   # holds the struct and union layouts by tag (see "Objects"), the enum types by tag, the
   # enumerators by name ({ type; value; }), the file-scope variables by name
-  # ({ type; defined; hasInit; at; }), the internal names of the block-scope tags in scope
-  # by tag (empty at file scope; see resolveType), the addresses of all defined
+  # ({ type; defined; hasInit; at; linkage; }), the internal names of the block-scope tags
+  # in scope by tag (empty at file scope; see resolveType), the addresses of all defined
   # variables and static locals by data symbol, taken from the end of the fold and
   # placeStatics (an extern declaration may precede the definition that places the
   # variable), and the addresses of the string literals by key (see stringKey), taken
@@ -2254,14 +2259,18 @@ let
       sig = sigOf env item;
       prev = acc.funcs.${item.name} or null;
       isDef = item.kind == "func";
+      linkage = linkageOf prev item.storage;
       funcs = acc.funcs // {
         ${item.name} = sig // {
           defined = isDef || (prev != null && prev.defined);
+          inherit linkage;
         };
       };
     in
     builtins.seq (checkKind acc item item.name "function") (
-      if prev != null && !sameSig prev sig then
+      if staticAfterExtern prev item.storage then
+        fail item "static declaration of '${item.name}' follows non-static declaration"
+      else if prev != null && !sameSig prev sig then
         fail item "conflicting types for '${item.name}'"
       else if isDef && prev != null && prev.defined then
         fail item "redefinition of '${item.name}'"
@@ -2270,10 +2279,30 @@ let
           acc
           // {
             inherit funcs;
-            defs = acc.defs ++ (if isDef then [ (funcDef (env // { inherit funcs; }) sig item) ] else [ ]);
+            defs =
+              acc.defs
+              ++ (
+                if isDef then [ (funcDef (env // { inherit funcs; }) sig item // { inherit linkage; }) ] else [ ]
+              );
           }
         )
     );
+
+  # The linkage ("internal" or "external", C99 6.2.2) of a file-scope declaration with the
+  # storage class storage, after the earlier declaration prev of the name (or null): that
+  # of prev when there is one, otherwise internal for `static`. A `static` declaration
+  # after one with external linkage is an error (staticAfterExtern); a declaration without
+  # `static` after a `static` variable is a second definition (see declareGlobal).
+  linkageOf =
+    prev: storage:
+    if prev != null then
+      prev.linkage
+    else if storage == "static" then
+      "internal"
+    else
+      "external";
+  staticAfterExtern =
+    prev: storage: prev != null && storage == "static" && prev.linkage == "external";
 
   # ---- Structs and enums ----
 
@@ -2531,7 +2560,7 @@ let
     };
 
   # A declaration without an initializer and with `extern` only declares; anything else
-  # defines (and places) the variable. `static` changes nothing (one translation unit).
+  # defines (and places) the variable. `static` gives it internal linkage (linkageOf).
   declareGlobal =
     dataBase: acc: g:
     let
@@ -2542,7 +2571,9 @@ let
       keep = prev != null && (prev.defined || isComplete acc.ctx prev.type);
     in
     builtins.seq (checkKind acc g name "variable") (
-      if isVoid t then
+      if staticAfterExtern prev g.storage then
+        fail g "static declaration of '${name}' follows non-static declaration"
+      else if isVoid t then
         fail g "variable '${name}' has type 'void'"
       else if hasLLong t then
         unsupported g "8-byte integer in a global variable"
@@ -2557,6 +2588,7 @@ let
             defined = prev != null && prev.defined;
             hasInit = prev != null && prev.hasInit;
             at = if prev != null then prev.at else posOf g;
+            linkage = linkageOf prev g.storage;
           }
         )
       else if prev != null && prev.defined then
@@ -2600,6 +2632,7 @@ let
           defined = true;
           hasInit = g.init != null;
           at = acc.ctx.globals.${name}.at or (posOf g);
+          linkage = linkageOf (acc.ctx.globals.${name} or null) g.storage;
         }
         // {
           size = offset + sizeOfT acc.ctx t;

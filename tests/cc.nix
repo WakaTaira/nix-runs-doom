@@ -3872,6 +3872,36 @@ in
     (compileThrows "extern int g; int f(void) { return g; }")
     true
   )
+  (t "cc compile: static declaration after a non-static one throws (function and variable)"
+    (map compileThrows [
+      "int f(void); static int f(void) { return 1; }"
+      "extern int f(void); static int f(void) { return 1; }"
+      "int v; static int v;"
+      "extern int v; static int v = 1;"
+    ])
+    [
+      true
+      true
+      true
+      true
+    ]
+  )
+  (t "cc run: a declaration after a static one keeps internal linkage"
+    [
+      (dret "static int f(void); int f(void) { return 3; } int g(void) { return f(); }" "g" [ ])
+      (dret
+        "static int f(void); extern int f(void); int f(void) { return 4; } int g(void) { return f(); }"
+        "g"
+        [ ]
+      )
+      (dret "static int v = 5; extern int v; int g(void) { return v; }" "g" [ ])
+    ]
+    [
+      3
+      4
+      5
+    ]
+  )
   (t "cc compile: side effect in a branch of ?: throws"
     (compileThrows "int f(int x) { return x ? x++ : 0; }")
     true
