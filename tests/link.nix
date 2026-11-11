@@ -959,6 +959,47 @@ in
     ])
     (linkPair)
   ]) (genList (_: true) 12))
+  (t "cc link 11: tags agree when both types have none or both the same, never one alone"
+    [
+      (ret (lk [
+        (u "a" "typedef struct { int a; } T; extern T v; int f(void) { return v.a; }")
+        (u "b" "typedef struct { int a; } T; T v = { 5 };")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "typedef enum { R, G } E; extern E col; int f(void) { return col; }")
+        (u "b" "typedef enum { R, G } E; E col = G;")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "int f(void) { struct s { int a; }; extern struct s v; return v.a; }")
+        (u "b" "struct s { int a; } v = { 7 };")
+      ]) "f" [ ])
+      (throws (lk [
+        (u "a" "typedef struct { int a; } T; extern T v; int f(void) { return v.a; }")
+        (u "b" "struct s { int a; } v;")
+      ]))
+      (throws (lk [
+        (u "a" "struct s { int a; }; extern struct s v; int f(void) { return v.a; }")
+        (u "b" "typedef struct { int a; } T; T v;")
+      ]))
+      (throws (lk [
+        (u "a" "typedef enum { R, G } E; extern E col; int f(void) { return col; }")
+        (u "b" "enum c { R, G } col;")
+      ]))
+      (throws (lk [
+        (u "a" "struct s { int a; }; struct s *g(void); int f(void) { return g()->a; }")
+        (u "b" "typedef struct { int a; } T; T v; T *g(void) { return &v; }")
+      ]))
+    ]
+    [
+      5
+      1
+      7
+      true
+      true
+      true
+      true
+    ]
+  )
   (t "cc link 11: an array without a length agrees with any length inside other types"
     [
       (ret (lk [
