@@ -52,14 +52,22 @@
 #     one, with the first import of the name (see below)
 #   <position>: unsupported: host function '<name>' with a 64-bit, floating-point or
 #     struct parameter or return value
-# Types of variables agree when they are equal, or arrays of the same element type of
-# which one has no length; functions when the return types, the parameter types and
-# variadic are equal. A struct or union compares by name (linkName), so its members are
-# not compared. Each import is compared with the definition, or, without one (host,
-# undefined), with the first import of the name; a host function also needs nargs
-# parameters and the same variadic, and a host variable the size and alignment of
-# host.data. A name that nothing defines and that units import both as a variable and as
-# a function conflicts at the first import of the kind the first import does not have.
+# Types of variables agree when they are compatible, or arrays of compatible element
+# types of which one has no length; functions when the return types, the parameter types
+# and variadic are. Types are compared by structure (C99 6.2.7, see sameType): two
+# structs, or two unions, are compatible when their tags are equal if both have one and,
+# when both are complete, they have the same size and alignment and the same members (in
+# order for a struct) with the same names, offsets, bit-field widths and compatible types;
+# two enums when their tags are and their enumerators have the same names and values, and
+# an enum and its compatible integer type. A type being compared is taken to agree with
+# itself on the way, so types that refer to themselves compare. The anonymous or
+# block-scope struct of one unit can thus agree with that of another. Qualifiers are not
+# compared (cc/parse.nix drops them). Each import is compared with the definition, or,
+# without one (host, undefined), with the first import of the name; a host function also
+# needs nargs parameters and the same variadic, and a host variable the size and
+# alignment of host.data. A name that nothing defines and that units import both as a
+# variable and as a function conflicts at the first import of the kind the first import
+# does not have.
 # Of the errors of the units themselves (cc/check.nix), only those that their layouts
 # raise come first; the others (those of their expressions, for one) are raised when the
 # units are generated, after the link errors.
@@ -101,46 +109,134 @@ let
 
   # ---- Types ----
 
-  # The name of a struct or union as compared between units: an anonymous one (see
-  # cc/parse.nix) without the token index that tells it apart within its unit, so the
-  # same definition in a shared header has the same name in every unit.
-  linkName =
-    name:
+  # Types are compared as cc/check.nix linkType gives them (ltype and lsig of the imports
+  # and exports), each with the definitions of its unit (defs = { structs; enums; }, see
+  # cc/check.nix scopeDefs), structurally (C99 6.2.7). A comparison threads the set of the
+  # pairs of struct and union types under comparison, which are taken to agree, so a type
+  # that refers to itself ends and every pair is visited once; it gives that set, or null
+  # when the types disagree.
+
+  # The C tag of the internal name of a struct, union or enum: null for an anonymous one,
+  # without the `@<id>` of a block-scope one (see cc/check.nix localTagName).
+  tagOf =
+    name: if match "\\(anonymous at .*" name != null then null else head (match "([^@]*).*" name);
+
+  # The tags of a and b agree: equal when both have one.
+  tagsAgree =
+    a: b:
     let
-      m = match "(\\(anonymous at .*) #[0-9]+\\)" name;
+      x = tagOf a.name;
+      y = tagOf b.name;
     in
-    if m == null then name else "${head m})";
+    x == null || y == null || x == y;
 
-  normType =
-    t:
-    if t.tag == "ptr" then
-      t // { to = normType t.to; }
-    else if t.tag == "array" then
-      t // { of = normType t.of; }
-    else if t.tag == "fn" then
-      t
-      // {
-        ret = normType t.ret;
-        params = map normType t.params;
-      }
-    else if t.tag == "struct" || t.tag == "union" then
-      t // { name = linkName t.name; }
+  # The type a (with the definitions da) and the type b (with db), given the pairs seen.
+  sameType =
+    da: db: seen: a: b:
+    if a.tag == "enum" || b.tag == "enum" then
+      (if sameEnum da db a b then seen else null)
+    else if a.tag != b.tag then
+      null
+    else if a.tag == "ptr" then
+      sameType da db seen a.to b.to
+    else if a.tag == "array" then
+      (if a.len == b.len then sameType da db seen a.of b.of else null)
+    else if a.tag == "fn" then
+      sameSig da db seen a b
+    else if a.tag == "struct" || a.tag == "union" then
+      sameRecord da db seen a b
+    else if a == b then
+      seen
     else
-      t;
+      null;
 
+  # The type lists as and bs, pairwise.
+  sameTypes =
+    da: db: seen: as: bs:
+    if length as != length bs then
+      null
+    else
+      foldl' (s: i: if s == null then null else sameType da db s (elemAt as i) (elemAt bs i)) seen (
+        genList (i: i) (length as)
+      );
+
+  # The signatures (or function types) a and b: { ret; params; variadic; }.
+  sameSig =
+    da: db: seen: a: b:
+    let
+      s = sameType da db seen a.ret b.ret;
+    in
+    if a.variadic != b.variadic || s == null then null else sameTypes da db s a.params b.params;
+
+  # Two enums agree when their tags do and their enumerators have the same names and
+  # values; an enum and an integer type when that is the compatible integer type of the
+  # enum (C99 6.7.2.2).
+  sameEnum =
+    da: db: a: b:
+    if a.tag == "enum" && b.tag == "enum" then
+      tagsAgree a b && da.enums.${a.name}.consts == db.enums.${b.name}.consts
+    else if a.tag == "enum" then
+      da.enums.${a.name}.type == b
+    else
+      db.enums.${b.name}.type == a;
+
+  # Two structs or two unions agree when their tags do and, if both are complete, they have
+  # the same size and alignment and their members agree: in order for a struct, by name
+  # for a union. An incomplete one agrees with any.
+  sameRecord =
+    da: db: seen: a: b:
+    let
+      key = "${a.name}\n${b.name}";
+      la = da.structs.${a.name} or null;
+      lb = db.structs.${b.name} or null;
+      pairs =
+        if a.tag == "union" then
+          map (f: {
+            inherit f;
+            g = lb.byName.${f.name} or null;
+          }) la.fields
+        else
+          genList (i: {
+            f = elemAt la.fields i;
+            g = elemAt lb.fields i;
+          }) (length la.fields);
+    in
+    if !tagsAgree a b then
+      null
+    else if hasAttr key seen || la == null || lb == null then
+      seen
+    else if la.size != lb.size || la.align != lb.align || length la.fields != length lb.fields then
+      null
+    else
+      foldl' (s: p: if s == null || p.g == null then null else sameMember da db s p.f p.g) (
+        seen // { ${key} = true; }
+      ) pairs;
+
+  # Two members agree in name, offset, bit-field width and declared type.
+  sameMember =
+    da: db: seen: f: g:
+    if f.name != g.name || f.offset != g.offset || (f.width or null) != (g.width or null) then
+      null
+    else
+      sameType da db seen f.ltype g.ltype;
+
+  # The variables (imports or exports) a and b agree: the same type, or arrays of the same
+  # element type of which one has no length.
   varTypesMatch =
     a: b:
     let
-      x = normType a;
-      y = normType b;
+      x = a.ltype;
+      y = b.ltype;
     in
-    x == y || x.tag == "array" && y.tag == "array" && x.of == y.of && (x.len == null || y.len == null);
+    (
+      if x.tag == "array" && y.tag == "array" && (x.len == null || y.len == null) then
+        sameType a.defs b.defs { } x.of y.of
+      else
+        sameType a.defs b.defs { } x y
+    ) != null;
 
-  sigsMatch =
-    a: b:
-    normType a.ret == normType b.ret
-    && map normType a.params == map normType b.params
-    && a.variadic == b.variadic;
+  # The functions (imports or exports) a and b agree.
+  sigsMatch = a: b: sameSig a.defs b.defs { } a.lsig b.lsig != null;
 
   # A type that a host function cannot take or return (see wrapHost).
   isWide =
@@ -292,7 +388,7 @@ let
   conflictOf =
     isFunc: target: is:
     let
-      matches = a: b: if isFunc then sigsMatch a b else varTypesMatch a.type b.type;
+      matches = a: b: if isFunc then sigsMatch a b else varTypesMatch a b;
       first = head is;
       bad =
         if target.kind == "unit" then

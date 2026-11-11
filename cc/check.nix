@@ -5,17 +5,22 @@
 # and data the placement of the file-scope variables (see "Data" below); check uses
 # defaultDataBase. layout is the part that reads no address value:
 #   { size; symbols; exports; imports; }
-# size and symbols as in data; exports = { vars = [ { name; type; size; align; addr; } ];
-# funcs = [ { name; ret; params; variadic; } ]; } the definitions with external linkage.
+# size and symbols as in data; exports = { vars = [ { name; type; size; align; addr; ltype;
+# defs; } ]; funcs = [ { name; ret; params; variadic; lsig; defs; } ]; } the definitions
+# with external linkage.
 #
 # Link mode (link = { externAddr; }, for cc/link.nix): externAddr maps the name of a
 # variable that the unit uses and does not define to its address (lazily; layout never
 # calls it). Such variables and the functions with external linkage that the unit calls
 # and does not define are not errors but imports:
-#   imports = { vars = [ { name; type; size; align; line; col; file?; } ];
-#               funcs = [ { name; ret; params; variadic; line; col; file?; } ]; }
+#   imports = { vars = [ { name; type; size; align; ltype; defs; line; col; file?; } ];
+#               funcs = [ { name; ret; params; variadic; lsig; defs; line; col; file?; } ]; }
 # one per name (sorted), at its first use; the type of a variable merges the declarations
 # of the unit (an array length when one gives it), with size and align from objectExtent.
+# For the linker's comparison of types between units, ltype is the type of a variable and
+# lsig = { ret; params; variadic; } the signature of a function with enum types kept
+# (linkType), and defs = { structs; enums; } the struct, union and enum definitions that
+# their tags name (scopeDefs, those of block-scope declarations included).
 # A block-scope extern that disagrees with another declaration of the name, calls of a
 # function through declarations that disagree, and a call to a function with internal
 # linkage that is declared but not defined stay errors (see linkUnit), raised when imports
@@ -505,9 +510,11 @@ let
 
   # ---- Objects: arrays, structs, sizes and alignments ----
   # ctx (the context, see checkItems) holds the struct and union layouts by tag:
-  #   structs.<name> = { kind; size; align; fields = [ { name; type; offset; } ]; byName; }
-  # kind is "struct" or "union", and byName maps a member name to its field. The field of
-  # a bit-field also has bitfield = true.
+  #   structs.<name> = { kind; size; align; fields = [ { name; type; offset; ltype; } ];
+  #                      byName; }
+  # kind is "struct" or "union", byName maps a member name to its field, and ltype is the
+  # declared type of the member as the linker compares it (linkType). The field of a
+  # bit-field also has bitfield = true and its width.
 
   isArray = t: t.tag == "array";
   # Structs and unions (records).
@@ -969,6 +976,14 @@ let
         e
     );
 
+  # The type definitions in the context ctx, as the linker compares types with them
+  # (cc/link.nix): { structs; enums; } the struct and union layouts and the enum
+  # definitions (ctx.enumDefs) by tag or internal name.
+  scopeDefs = ctx: {
+    inherit (ctx) structs;
+    enums = ctx.enumDefs;
+  };
+
   # The reference of the "ident" or "call" node x in env: a block-scope extern variable (a
   # name bound to the data symbol of its own name, see externVar), a file-scope variable or a
   # function; nothing for a local, a static local, an enumerator, or an error (which the
@@ -1012,6 +1027,7 @@ let
             use = "func";
             inherit name;
             sig = env.funcs.${name};
+            defs = scopeDefs env.ctx;
           }
           // at
         )
@@ -1906,13 +1922,16 @@ let
 
   # A block-scope `extern` variable: the file-scope variable of the same name, which must
   # be defined in the input with a compatible type (checked at the end, see checkWith).
-  # -> { env; extern = { name; type; extent; line; col; }; } with extent the size and
-  # alignment of type here (see objectExtent; the linker's view of a block-scope tag).
+  # -> { env; extern = { name; type; extent; ltype; defs; line; col; }; } with extent the
+  # size and alignment of type here (see objectExtent; the linker's view of a block-scope
+  # tag), ltype the type as the linker compares it and defs the type definitions in scope
+  # (see scopeDefs).
   externVar =
     env: d:
     let
       name = d.name;
       t = resolveType env d d.type;
+      lt = linkType env d d.type;
       prev = env.ctx.globals.${name} or null;
       type = if prev != null && isComplete env.ctx prev.type then prev.type else t;
     in
@@ -1926,14 +1945,21 @@ let
       else if prev != null && !compatible prev.type t then
         fail d "redeclaration of '${name}' with a different type"
       else
-        builtins.deepSeq t {
-          env = bindObject env name type name;
-          extern = posOf d // {
-            inherit name;
-            type = t;
-            extent = objectExtent env.ctx t;
-          };
-        }
+        builtins.deepSeq
+          [
+            t
+            lt
+          ]
+          {
+            env = bindObject env name type name;
+            extern = posOf d // {
+              inherit name;
+              type = t;
+              extent = objectExtent env.ctx t;
+              ltype = lt;
+              defs = scopeDefs env.ctx;
+            };
+          }
     );
 
   # A static local: a variable at a fixed address in the data, placed after the file-scope
@@ -2089,12 +2115,16 @@ let
             };
             next = v + 1;
             negative = st.negative || v < 0;
+            values = st.values // {
+              ${c.name} = v;
+            };
           }
         );
       r = foldl' step {
         inherit env;
         next = 0;
         negative = false;
+        values = { };
       } n.consts;
       env1 = bindTag r.env n internal;
     in
@@ -2103,6 +2133,9 @@ let
       ctx = env1.ctx // {
         enums = env1.ctx.enums // {
           ${internal} = enumType r.negative;
+        };
+        enumDefs = env1.ctx.enumDefs // {
+          ${internal} = enumDef r;
         };
       };
     };
@@ -2300,25 +2333,52 @@ let
   # The parsed type t resolved in env (see the header): array lengths evaluated, enum types
   # replaced by their compatible integer type, the tags of block-scope definitions by their
   # internal names, and function types resolved with their parameters adjusted.
-  resolveType =
-    env: at: t:
+  resolveType = resolveTypeWith false;
+
+  # The type of a declaration as the linker compares it (see linkUnit): resolved as by
+  # resolveType, but an enum type stays { tag = "enum"; name; } with its internal name (the
+  # key of its definition in ctx.enumDefs).
+  linkType = resolveTypeWith true;
+
+  # resolveType, keeping enum types when keepEnums.
+  resolveTypeWith =
+    keepEnums: env: at: t:
+    let
+      resolve = resolveTypeWith keepEnums env;
+    in
     if t.tag == "ptr" then
-      ptrTo (resolveType env at t.to)
+      ptrTo (resolve at t.to)
     else if t.tag == "array" then
-      resolveArray env at t
+      resolveArray keepEnums env at t
     else if t.tag == "enum" then
-      env.ctx.enums.${tagName env t} or (fail at "incomplete enum type 'enum ${shownName t.name}'")
+      resolveEnum keepEnums env at t
     else if isRecord t then
       resolveRecord env at t
     else if t.tag == "fn" then
       {
         tag = "fn";
-        ret = resolveType env at t.ret;
-        params = map (p: adjustParam (resolveType env p p.type)) t.params;
+        ret = resolve at t.ret;
+        params = map (p: adjustParam (resolve p p.type)) t.params;
         inherit (t) variadic;
       }
     else
       t;
+
+  # The enum type t: its compatible integer type, or itself by internal name when
+  # keepEnums (see linkType).
+  resolveEnum =
+    keepEnums: env: at: t:
+    let
+      name = tagName env t;
+      int = env.ctx.enums.${name} or (fail at "incomplete enum type 'enum ${shownName t.name}'");
+    in
+    if keepEnums then
+      builtins.seq int {
+        tag = "enum";
+        inherit name;
+      }
+    else
+      int;
 
   # The name a struct, union or enum tag stands for in env.
   tagName = env: t: env.ctx.tags.${t.name} or t.name;
@@ -2348,9 +2408,9 @@ let
       t;
 
   resolveArray =
-    env: at: t:
+    keepEnums: env: at: t:
     let
-      of = resolveType env at t.of;
+      of = resolveTypeWith keepEnums env at t.of;
       len = if t.len == null then null else (constExpr (hooksOf env) t.len).value;
     in
     if !isComplete env.ctx of then
@@ -2376,7 +2436,8 @@ let
   # ---- Functions ----
 
   # Signature of a proto or func: the resolved return and parameter types, with parameter
-  # arrays and functions adjusted to pointers (adjustParam), and whether it is variadic.
+  # arrays and functions adjusted to pointers (adjustParam), and whether it is variadic;
+  # lsig is the same with the types as the linker compares them (linkType).
   sigOf =
     env: item:
     let
@@ -2387,6 +2448,7 @@ let
           t = resolveType env p p.type;
         in
         if isRecord t then unsupported p "${t.tag} parameter passed by value" else adjustParam t;
+      variadic = item.variadic or false;
     in
     if isArray ret then
       fail item "function cannot return array type '${showType ret}'"
@@ -2396,9 +2458,13 @@ let
       unsupported item "${ret.tag} returned by value"
     else
       {
-        inherit ret;
+        inherit ret variadic;
         params = map param item.params;
-        variadic = item.variadic or false;
+        lsig = {
+          ret = linkType env item item.ret;
+          params = map (p: adjustParam (linkType env p p.type)) item.params;
+          inherit variadic;
+        };
       };
 
   sameSig = a: b: a.ret == b.ret && a.params == b.params && a.variadic == b.variadic;
@@ -2449,11 +2515,13 @@ let
   # objects: the placed variables
   # ([ { name; addr; end; at; writes; } ], writes as the inits of the data); blockLinked:
   # the names declared at block scope with external linkage (see withBlockDecls). The context
-  #   ctx = { structs; enums; consts; globals; tags; typeOnly; addrs; strings; }
+  #   ctx = { structs; enums; consts; globals; tags; enumDefs; typeOnly; addrs; strings; }
   # holds the struct and union layouts by tag (see "Objects"), the enum types by tag, the
   # enumerators by name ({ type; value; }), the file-scope variables by name
-  # ({ type; defined; hasInit; at; linkage; }), the internal names of the block-scope tags
-  # in scope by tag (empty at file scope; see resolveType), whether expressions are only
+  # ({ type; ltype; defined; hasInit; at; linkage; }, ltype the type as the linker
+  # compares it, see linkType), the internal names of the block-scope tags
+  # in scope by tag (empty at file scope; see resolveType), the definitions of the enums
+  # by tag (see enumDef; block-scope ones by internal name), whether expressions are only
   # typed (see typeOnlyEnv; false here), the addresses of all defined
   # variables and static locals by data symbol, taken from the end of the fold and
   # placeStatics (an extern declaration may precede the definition that places the
@@ -2715,8 +2783,18 @@ let
       field = {
         inherit (f) name;
         inherit type offset;
+        # The declared type as the linker compares it (see linkUnit).
+        ltype = linkType env f f.type;
       }
-      // (if isBit then { bitfield = true; } else { });
+      // (
+        if isBit then
+          {
+            bitfield = true;
+            inherit (bit) width;
+          }
+        else
+          { }
+      );
     in
     builtins.seq (if isBit then bit else null) {
       inherit field align;
@@ -2731,7 +2809,7 @@ let
   # consecutive bit-fields of the same declared type fill it exactly (acc.run counts the
   # bits filled so far). Such a bit-field lies where clang places it, and it is read and
   # written as an unsigned member of w bits (as t when w is 32); its declared type gives the
-  # alignment of the struct. -> { type; run; }
+  # alignment of the struct. -> { type; run; width; }
   bitField =
     env: acc: f: t:
     let
@@ -2785,6 +2863,7 @@ let
               else
                 ty "uchar";
             run = if used == bits then 0 else used;
+            width = w;
           }
       );
 
@@ -2809,6 +2888,14 @@ let
   # The compatible integer type of an enum, int when an enumerator is negative.
   enumType = negative: if negative then tInt else tUInt;
 
+  # The definition of an enum in ctx.enumDefs, from the end r of the fold over its
+  # enumerators: { type; consts; } with type its compatible integer type and consts the
+  # values of its enumerators by name.
+  enumDef = r: {
+    type = enumType r.negative;
+    consts = r.values;
+  };
+
   # Enumerators are int constants (enumValue). Each is in scope from the next one on.
   defineEnum =
     acc: n:
@@ -2829,11 +2916,15 @@ let
             };
             next = v + 1;
             negative = st.negative || v < 0;
+            values = st.values // {
+              ${c.name} = v;
+            };
           };
       r = foldl' step {
         inherit acc;
         next = 0;
         negative = false;
+        values = { };
       } n.consts;
     in
     if hasAttr n.name acc.ctx.enums then
@@ -2842,6 +2933,9 @@ let
       withCtx r.acc {
         enums = r.acc.ctx.enums // {
           ${n.name} = enumType r.negative;
+        };
+        enumDefs = r.acc.ctx.enumDefs // {
+          ${n.name} = enumDef r;
         };
       };
 
@@ -2867,6 +2961,7 @@ let
     let
       name = g.name;
       t = resolveType (fileEnv acc) g g.type;
+      lt = linkType (fileEnv acc) g g.type;
       prev = acc.ctx.globals.${name} or null;
       isDef = g.storage != "extern" || g.init != null;
       keep = prev != null && (prev.defined || isComplete acc.ctx prev.type);
@@ -2885,15 +2980,21 @@ let
       else if prev != null && !compatible prev.type t then
         fail g "redeclaration of '${name}' with a different type"
       else if !isDef then
-        builtins.deepSeq t (
-          withGlobal acc name {
-            type = if keep then prev.type else t;
-            defined = prev != null && prev.defined;
-            hasInit = prev != null && prev.hasInit;
-            at = if prev != null then prev.at else posOf g;
-            linkage = linkageOf prev g.storage;
-          }
-        )
+        builtins.deepSeq
+          [
+            t
+            lt
+          ]
+          (
+            withGlobal acc name {
+              type = if keep then prev.type else t;
+              ltype = if keep then prev.ltype else lt;
+              defined = prev != null && prev.defined;
+              hasInit = prev != null && prev.hasInit;
+              at = if prev != null then prev.at else posOf g;
+              linkage = linkageOf prev g.storage;
+            }
+          )
       else if prev != null && prev.defined then
         (
           if prev.hasInit && g.init != null then
@@ -2903,8 +3004,16 @@ let
         )
       else
         # An earlier declaration may give the length the definition leaves out.
-        defineGlobal dataBase acc g (if keep then prev.type else sizedType (fileEnv acc) g t)
+        let
+          st = if keep then prev.type else sizedType (fileEnv acc) g t;
+        in
+        defineGlobal dataBase acc g st (if keep then prev.ltype else sizedLinkType lt st)
     );
+
+  # The link type lt (see linkType) of an array without a length with the length of the
+  # sized type t (see sizedType).
+  sizedLinkType =
+    lt: t: if isArray t && isArray lt && lt.len == null then lt // { inherit (t) len; } else lt;
 
   # The type of a defined variable: an array without a length takes it from its
   # initializer list.
@@ -2922,9 +3031,9 @@ let
     else
       t;
 
-  # Place the variable g of type t after the ones placed so far.
+  # Place the variable g of type t (and link type lt) after the ones placed so far.
   defineGlobal =
-    dataBase: acc: g: t:
+    dataBase: acc: g: t: lt:
     let
       name = g.name;
       offset = alignUp acc.size (alignOfT acc.ctx t);
@@ -2932,6 +3041,7 @@ let
       acc' =
         withGlobal acc name {
           type = t;
+          ltype = lt;
           defined = true;
           hasInit = g.init != null;
           at = acc.ctx.globals.${name}.at or (posOf g);
@@ -2957,7 +3067,10 @@ let
     else if !isComplete acc.ctx t then
       fail g "variable '${name}' has incomplete type '${showType t}'"
     else
-      builtins.deepSeq t acc';
+      builtins.deepSeq [
+        t
+        lt
+      ] acc';
 
   # ---- Initializers ----
   # An initializer becomes the stores of its scalars: [ { addr; size; value; } ] with value
@@ -3280,6 +3393,7 @@ let
           consts = { };
           globals = { };
           tags = { };
+          enumDefs = { };
           typeOnly = false;
           inherit addrs link;
           strings = strings.addrs;
@@ -3375,8 +3489,9 @@ let
       )
       {
         decls = builtins.mapAttrs (_: g: {
-          inherit (g) type;
+          inherit (g) type ltype;
           extent = null;
+          defs = null;
         }) globals;
         bad = null;
       }
@@ -3413,6 +3528,21 @@ let
       # that of the first call.
       sigFor = n: if fileFunc n != null then fileFunc n else (earliest funcUses.${n}).sig;
       conflicts = filter (u: !sameSig (sigFor u.name) u.sig) (concatLists (attrValues funcUses));
+      # The type definitions of the unit at its end, with those in scope at a block-scope
+      # declaration (local, or null at file scope): a tag of the file may be completed
+      # after the block, and a block-scope tag has an internal name of its own.
+      defsWith =
+        local:
+        let
+          u = scopeDefs r.ctx;
+        in
+        if local == null then
+          u
+        else
+          {
+            structs = u.structs // local.structs;
+            enums = u.enums // local.enums;
+          };
       importVar =
         n:
         let
@@ -3421,15 +3551,22 @@ let
         in
         {
           name = n;
-          inherit (d) type;
+          inherit (d) type ltype;
           inherit (e) size align;
+          defs = defsWith d.defs;
         }
         // useAt (earliest varUses.${n});
       importFunc =
         n:
         {
           name = n;
-          inherit (sigFor n) ret params variadic;
+          inherit (sigFor n)
+            ret
+            params
+            variadic
+            lsig
+            ;
+          defs = defsWith (if fileFunc n != null then null else (earliest funcUses.${n}).defs);
         }
         // useAt (earliest funcUses.${n});
     in
@@ -3462,9 +3599,10 @@ let
         [
           {
             inherit (o) name addr;
-            inherit (g) type;
+            inherit (g) type ltype;
             size = o.end - o.addr;
             align = alignOfT r.ctx g.type;
+            defs = scopeDefs r.ctx;
           }
         ]
     ) r.objects;
@@ -3477,7 +3615,13 @@ let
         [
           {
             name = n;
-            inherit (f) ret params variadic;
+            inherit (f)
+              ret
+              params
+              variadic
+              lsig
+              ;
+            defs = scopeDefs r.ctx;
           }
         ]
       else

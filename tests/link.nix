@@ -490,6 +490,21 @@ let
       read = readOf boxFiles;
     };
 
+  # Two anonymous structs of one macro expansion share a position; a.c and b.c use
+  # different ones under the same name.
+  pairFiles = {
+    "h.h" = "#define T2 typedef struct { int a; } s1_t; typedef struct { char c; } s2_t;\nT2\n";
+    "a.c" = "#include \"h.h\"\nextern s1_t g;\nint f(void) { return g.a; }\n";
+    "b.c" = "#include \"h.h\"\ns2_t g;\n";
+  };
+  linkPair = Cc.linkFiles {
+    files = [
+      "a.c"
+      "b.c"
+    ];
+    read = readOf pairFiles;
+  };
+
   ptFiles = {
     "pt.h" = "typedef struct pt { int x; int y; } pt_t;\nextern pt_t origin;\nint norm1(pt_t *p);\n";
     "a.c" = "#include \"pt.h\"\npt_t origin = { 2, 3 };\nint norm1(pt_t *p) { return p->x + p->y; }\n";
@@ -823,10 +838,10 @@ in
         "a.c"
         "b.c"
       ]) "getv" [ ])
-      (throws (linkBox [
+      (ret (linkBox [
         "c.c"
         "b.c"
-      ]))
+      ]) "getv" [ ])
     ]
     [
       true
@@ -837,9 +852,102 @@ in
       true
       2
       7
-      true
+      7
     ]
   )
+  (t "cc link 11: struct, union and enum types agree by contents between units"
+    [
+      (ret (lk [
+        (u "a" "struct node { int v; struct node *next; }; extern struct node *head; int sum(void) { int s = 0; for (struct node *p = head; p; p = p->next) s += p->v; return s; }")
+        (u "b" "struct node { int v; struct node *next; }; struct node n2 = { 2, 0 }; struct node n1 = { 1, &n2 }; struct node *head = &n1;")
+      ]) "sum" [ ])
+      (ret (lk [
+        (u "a" "struct b; struct a { struct b *pb; int w; }; struct b { struct a *pa; int v; }; extern struct a x; int f(void) { return x.pb->v + x.pb->pa->w; }")
+        (u "b" "struct a; struct b { struct a *pa; int v; }; struct a { struct b *pb; int w; }; extern struct b y; struct a x = { &y, 30 }; struct b y = { &x, 4 };")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "struct s; extern struct s *p; int f(void) { return p != 0; }")
+        (u "b" "struct s { int a; } v; struct s *p = &v;")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "int f(void) { struct s { int a; }; extern struct s v; return v.a; }")
+        (u "b" "struct s { int a; } v = { 9 };")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "int f(void) { struct { int a; } *g(void); return g()->a; }")
+        (u "b" "typedef struct { int a; } T; T v = { 6 }; T *g(void) { return &v; }")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "enum c { R, G = 5 }; extern enum c col; int f(void) { return col; }")
+        (u "b" "enum c { G = 5, R = 0 }; enum c col = G;")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "extern unsigned col; int f(void) { return col; }")
+        (u "b" "enum c { R, G } col = G;")
+      ]) "f" [ ])
+      (ret (lk [
+        (u "a" "union u { int a; char b; }; extern union u w; int f(void) { return w.a; }")
+        (u "b" "union u { char b; int a; } w = { 7 };")
+      ]) "f" [ ])
+    ]
+    [
+      3
+      34
+      1
+      9
+      6
+      5
+      1
+      7
+    ]
+  )
+  (t "cc link 11: struct, union and enum types of other contents conflict between units" (map throws [
+    (lk [
+      (u "a" "struct s { int a; }; extern struct s v; int f(void) { return v.a; }")
+      (u "b" "struct s { char a; } v;")
+    ])
+    (lk [
+      (u "a" "struct s { int a; }; extern struct s v; int f(void) { return v.a; }")
+      (u "b" "struct t { int a; } v;")
+    ])
+    (lk [
+      (u "a" "struct s { int a; }; extern struct s v; int f(void) { return v.a; }")
+      (u "b" "struct s { int b; } v;")
+    ])
+    (lk [
+      (u "a" "struct s { int a; int b; }; extern struct s v; int f(void) { return v.a; }")
+      (u "b" "struct s { int b; int a; } v;")
+    ])
+    (lk [
+      (u "a" "struct s { unsigned a : 8; unsigned b : 8; unsigned c : 16; }; extern struct s v; int f(void) { return v.a; }")
+      (u "b" "struct s { unsigned a : 16; unsigned b : 8; unsigned c : 8; } v;")
+    ])
+    (lk [
+      (u "a" "struct s { int a; } __attribute__((packed)); extern struct s v; int f(void) { return v.a; }")
+      (u "b" "struct s { int a; } v;")
+    ])
+    (lk [
+      (u "a" "struct node { int v; struct node *next; }; extern struct node *head; int f(void) { return head->v; }")
+      (u "b" "struct node { int v; struct node2 *next; }; struct node *head;")
+    ])
+    (lk [
+      (u "a" "enum c { R, G }; extern enum c col; int f(void) { return col; }")
+      (u "b" "enum c { R, G = 2 } col;")
+    ])
+    (lk [
+      (u "a" "enum c { R, G }; extern enum c col; int f(void) { return col; }")
+      (u "b" "enum c { R, B } col;")
+    ])
+    (lk [
+      (u "a" "enum c { R, G }; extern enum c col; int f(void) { return col; }")
+      (u "b" "enum d { R, G } col;")
+    ])
+    (lk [
+      (u "a" "int f(void) { struct s { int a; }; extern struct s v; return v.a; }")
+      (u "b" "struct s { char a; } v;")
+    ])
+    (linkPair)
+  ]) (genList (_: true) 12))
   (t "cc link 12: linkage within a file (static first is internal, static later throws)"
     [
       (runCalls
