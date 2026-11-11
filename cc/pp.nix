@@ -223,6 +223,8 @@ let
         in
         if isIdent t "__VA_ARGS__" then
           unsupported t "variadic macro"
+        else if t.kind == "other" && match "['\"].*" t.text != null then
+          fail t "missing terminating ${substring 0 1 t.text} character"
         else if isHash k then
           if k + 1 < nb && isParam (tok (k + 1)) then
             [

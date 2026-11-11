@@ -125,6 +125,16 @@ in
       "w # define V 3 V"
     ]
   )
+  (t "pp lines: trigraphs are not replaced (as in the GNU modes of gcc and clang)"
+    [
+      (pp "a ??( b ??) c")
+      (pp "??=define X 1\nX")
+    ]
+    [
+      "a ? ? ( b ? ? ) c"
+      "? ? = define X 1 X"
+    ]
+  )
   (t "pp lines: positions after spliced lines and multi-line comments"
     (map posOf (ppFiles {
       "main.c" = "a \\\n  b /* x\n */ c\n  d";
@@ -386,6 +396,9 @@ in
       (ppThrows "#define V(a, a) a")
       (ppThrows "#define V(a")
       (pp "#define V (a) a\nV")
+      (ppThrows "#define Q 'a")
+      (ppThrows "#define Q(x) \"a")
+      (ppThrows "#define Q '")
     ]
     [
       true
@@ -396,6 +409,9 @@ in
       true
       true
       "( a ) a"
+      true
+      true
+      true
     ]
   )
   (t "pp function: a directive inside the arguments, and a call across a directive, are unsupported"
@@ -721,6 +737,31 @@ in
     [
       "f h.h:2:7"
       "g main.c:2:5"
+    ]
+  )
+
+  (t "pp positions: an error in an included file stops compileFile (message checked by hand)"
+    (map
+      (
+        body:
+        throws (
+          Cc.compileFile {
+            main = "main.c";
+            read = readOf {
+              "main.c" = "int x;\n#include \"h.h\"\n";
+              "h.h" = "\nint g(void) { return ${body}; }\n";
+            };
+          }
+        )
+      )
+      [
+        "x"
+        "y"
+      ]
+    )
+    [
+      false
+      true
     ]
   )
 
