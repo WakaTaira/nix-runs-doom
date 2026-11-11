@@ -865,6 +865,14 @@ in
       )
       (throws (lk [ (u "a" "int f(void); static int f(void) { return 1; }") ]))
       (throws (lk [ (u "a" "int v; static int v;") ]))
+      (throws (lk [
+        (u "a" "int g(void) { int f(void); return f(); } static int f(void) { return 1; }")
+        (u "b" "int f(void) { return 2; }")
+      ]))
+      (throws (lk [
+        (u "a" "int f(void) { extern int v; return v; } static int v = 3;")
+        (u "b" "int v = 4;")
+      ]))
     ]
     [
       [
@@ -876,6 +884,8 @@ in
         1
         2
       ]
+      true
+      true
       true
       true
     ]

@@ -3886,6 +3886,30 @@ in
       true
     ]
   )
+  (t "cc compile: static declaration after a block-scope one throws, after a static one not"
+    [
+      (map compileThrows [
+        "int g(void) { int f(void); return f(); } static int f(void) { return 1; }"
+        "int f(void) { extern int v; return v; } static int v = 3;"
+        "int g(void) { { int f(void); } return 0; } static int f(void);"
+      ])
+      (dret
+        "static int f(void); int g(void) { int f(void); return f(); } static int f(void) { return 6; }"
+        "g"
+        [ ]
+      )
+      (dret "int g(void) { int f(void); return f(); } int f(void) { return 8; }" "g" [ ])
+    ]
+    [
+      [
+        true
+        true
+        true
+      ]
+      6
+      8
+    ]
+  )
   (t "cc run: a declaration after a static one keeps internal linkage"
     [
       (dret "static int f(void); int f(void) { return 3; } int g(void) { return f(); }" "g" [ ])

@@ -149,7 +149,9 @@
 #   { name; ret; params = [ var ]; body = <block>; linkage; line; col; }
 # linkage is "internal" or "external" (C99 6.2.2): internal when the first declaration of
 # the name is `static`. A `static` declaration of a function or variable after one with
-# external linkage is an error.
+# external linkage is an error, also after a block-scope declaration of the name (a
+# function, or an extern variable) in an earlier function that no file-scope declaration
+# preceded.
 #
 # Data
 # ----
@@ -2438,11 +2440,12 @@ let
 
   # ---- File scope ----
   # The items are checked in order with the accumulator
-  #   acc = { funcs; defs; ctx; size; objects; }
+  #   acc = { funcs; defs; ctx; size; objects; blockLinked; }
   # funcs: the function signatures by name ({ ret; params; variadic; defined; linkage; },
   # see linkageOf); defs: the typed function definitions; size: the bytes placed so far;
   # objects: the placed variables
-  # ([ { name; addr; end; at; writes; } ], writes as the inits of the data). The context
+  # ([ { name; addr; end; at; writes; } ], writes as the inits of the data); blockLinked:
+  # the names declared at block scope with external linkage (see withBlockDecls). The context
   #   ctx = { structs; enums; consts; globals; tags; typeOnly; addrs; strings; }
   # holds the struct and union layouts by tag (see "Objects"), the enum types by tag, the
   # enumerators by name ({ type; value; }), the file-scope variables by name
@@ -2520,7 +2523,7 @@ let
       };
     in
     builtins.seq (checkKind acc item item.name "function") (
-      if staticAfterExtern prev item.storage then
+      if staticAfterExtern prev (hasAttr item.name acc.blockLinked.funcs) item.storage then
         fail item "static declaration of '${item.name}' follows non-static declaration"
       else if prev != null && !sameSig prev sig then
         fail item "conflicting types for '${item.name}'"
@@ -2536,9 +2539,46 @@ let
               ++ (
                 if isDef then [ (funcDef (env // { inherit funcs; }) sig item // { inherit linkage; }) ] else [ ]
               );
+            blockLinked = if isDef then withBlockDecls acc funcs item else acc.blockLinked;
           }
         )
     );
+
+  # The names declared at block scope in the function definition f (its syntax tree): the
+  # function declarations and the extern variables, as { funcs; vars; } (sets of true).
+  blockDeclsOf =
+    f:
+    let
+      ds = collect (x: kindOf x == "proto" || kindOf x == "vardecl" && x.storage == "extern") (
+        _: false
+      ) f.body;
+      names =
+        k:
+        listToAttrs (
+          map (d: {
+            inherit (d) name;
+            value = true;
+          }) (filter (d: d.kind == k) ds)
+        );
+    in
+    {
+      funcs = names "proto";
+      vars = names "vardecl";
+    };
+
+  # acc.blockLinked with the names that the function definition f declares at block scope
+  # where no file-scope declaration of them precedes it (funcs: the functions declared so
+  # far, f included). Such a name has external linkage (C99 6.2.2), so a later file-scope
+  # `static` declaration of it is an error (staticAfterExtern).
+  withBlockDecls =
+    acc: funcs: f:
+    let
+      d = blockDeclsOf f;
+    in
+    {
+      funcs = acc.blockLinked.funcs // removeAttrs d.funcs (attrNames funcs);
+      vars = acc.blockLinked.vars // removeAttrs d.vars (attrNames acc.ctx.globals);
+    };
 
   # The linkage ("internal" or "external", C99 6.2.2) of a file-scope declaration with the
   # storage class storage, after the earlier declaration prev of the name (or null): that
@@ -2553,8 +2593,12 @@ let
       "internal"
     else
       "external";
+  # Whether a declaration with the storage class storage is `static` after one with
+  # external linkage: the earlier file-scope declaration prev, or, without one, a
+  # block-scope declaration in an earlier function (blockLinked, see withBlockDecls).
   staticAfterExtern =
-    prev: storage: prev != null && storage == "static" && prev.linkage == "external";
+    prev: blockLinked: storage:
+    storage == "static" && (if prev != null then prev.linkage == "external" else blockLinked);
 
   # ---- Structs and enums ----
 
@@ -2825,7 +2869,7 @@ let
       keep = prev != null && (prev.defined || isComplete acc.ctx prev.type);
     in
     builtins.seq (checkKind acc g name "variable") (
-      if staticAfterExtern prev g.storage then
+      if staticAfterExtern prev (hasAttr name acc.blockLinked.vars) g.storage then
         fail g "static declaration of '${name}' follows non-static declaration"
       else if isVoid t then
         fail g "variable '${name}' has type 'void'"
@@ -3239,6 +3283,10 @@ let
         };
         size = 0;
         objects = [ ];
+        blockLinked = {
+          funcs = { };
+          vars = { };
+        };
       } items;
       placed = placeStatics dataBase r;
       addrs = listToAttrs (
