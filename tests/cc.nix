@@ -8616,22 +8616,60 @@ in
     "void f(void) { \"abc\" = 0; }"
   ]) (genList (_: true) 9))
 
-  (t "cc compile: the value of the address of a literal in sizeof throws unless it has storage"
+  (t "cc run: the address of a literal in sizeof is not read, with or without storage"
     [
-      (map compileThrows [
-        "int f(void) { return sizeof((int)\"abc\" + 1); }"
-        "int f(void) { return sizeof((int)\"abc\" ? 1 : 2); }"
-        "int f(void) { return sizeof(1 << (int)\"abc\"); }"
+      (map (src: dret src "f" [ 4 ]) [
+        "int f(int x) { return sizeof((int)\"abc\" + 1); }"
+        "int f(int x) { return sizeof((int)\"abc\" ? 1 : 2); }"
+        "int f(int x) { return sizeof(1 << (int)\"abc\"); }"
         "int f(int x) { switch (x) { case sizeof((int)\"abc\" + 1): return 1; } return 0; }"
-        "int f(void) { static int n = sizeof((int)\"abc\" * 2); return n; }"
+        "int f(int x) { static int n = sizeof((int)\"abc\" * 2); return n; }"
       ])
       (ret "const char *g(void) { return \"abc\"; } int f(void) { return sizeof((int)\"abc\" + 1); }" "f"
         [ ]
       )
     ]
     [
-      (genList (_: true) 5)
+      [
+        4
+        4
+        4
+        1
+        4
+      ]
       4
+    ]
+  )
+  (t "cc run: switch conditions and sizeof operands that fold the address of a variable"
+    (
+      let
+        src = ''
+          int g;
+          char a[sizeof(1 + (unsigned)&g)];
+          int s1(void) { switch ((unsigned)&g + 1) { case 1: return 1; default: return 2; } }
+          int s2(void) { switch ((unsigned)&g ? 1 : 0) { case 1: return 3; } return 4; }
+          int s3(void) {
+            static char b[sizeof((unsigned)&g * 2)];
+            switch ((unsigned)"ab" - (unsigned)"ab") { case 0: return sizeof a + sizeof b; }
+            return 0;
+          }
+          int s4(void) { return sizeof(1 << (unsigned)&g); }
+        '';
+      in
+      [
+        (dret src "s1" [ ])
+        (dret src "s2" [ ])
+        (dret src "s3" [ ])
+        (dret src "s4" [ ])
+        (compileThrows "int g; int f(void) { switch (1 << (unsigned)&g) { case 1: return 1; } return 0; }")
+      ]
+    )
+    [
+      2
+      3
+      8
+      4
+      true
     ]
   )
   (t "cc lex: a non-ASCII byte after a backslash throws"

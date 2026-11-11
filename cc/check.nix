@@ -68,7 +68,9 @@
 # more, and of a long long by a negative amount, by 64 or more, or left by 63, is
 # unsupported. The address of a file-scope variable (or of a static local or a string
 # literal) is a pointer "lit", and so is a constant pointer plus or minus a constant
-# (member offsets and constant indices).
+# (member offsets and constant indices). The operand of sizeof, and the condition of a
+# switch for the shape of its node, are also typed without the addresses (typeOnlyEnv),
+# so the placement of the data never waits on an address folded there.
 #   { kind = "lit"; value; }                     integer constant in the range of type, or
 #                                                a constant address (pointer type)
 #   { kind = "var"; var; }                       local variable or parameter;
@@ -898,7 +900,28 @@ let
   # static local), at its address known once every variable is placed.
   objectAt =
     ctx: e: t: sym:
-    node e "deref" t { expr = litAt e (ptrTo t) (addressOf ctx sym); };
+    node e "deref" t { expr = addressAt ctx e (ptrTo t) (addressOf ctx sym); };
+
+  # The constant address addr as a value of the pointer type t at the node e: a "lit", or,
+  # where expressions are only typed (ctx.typeOnly, see typeOnlyEnv), a "symbol" node that
+  # is no constant, so that nothing is folded with it and addr is never read.
+  addressAt =
+    ctx: e: t: addr:
+    if ctx.typeOnly then node e "symbol" t { } else litAt e t addr;
+
+  # env for finding the type of an expression without reading any address: the type does
+  # not depend on the values of the addresses (constant folding keeps the type of what it
+  # folds), while the placement of the data, which gives the addresses, may depend on the
+  # type (an array length with sizeof, the sections of a switch). Only the type (and the
+  # shape that sizeof checks) of the result is used, never its value.
+  typeOnlyEnv =
+    env:
+    env
+    // {
+      ctx = env.ctx // {
+        typeOnly = true;
+      };
+    };
 
   # The address of the data symbol sym: placed in this unit, or, in link mode (ctx.link,
   # see checkWith), a variable of another unit given by the linker.
@@ -1021,8 +1044,8 @@ let
     ++ concatMap usesIn (subStmts n);
 
   # The array of the string literal e (a "strlit" node), at the address of its contents
-  # (see placeStrings). A literal in the operand of sizeof has no storage, so the value
-  # of its address cannot be used (by constant folding) there.
+  # (see placeStrings). A literal in the operand of sizeof has no storage; the operand is
+  # typed without reading addresses (see typeOnlyEnv), so its address is never asked for.
   stringObject =
     ctx: e:
     let
@@ -1031,7 +1054,7 @@ let
         ctx.strings.${stringKey e.bytes}
         or (unsupported e "value of the address of a string literal in an operand of sizeof");
     in
-    node e "deref" t { expr = litAt e (ptrTo t) addr; };
+    node e "deref" t { expr = addressAt ctx e (ptrTo t) addr; };
 
   # A name in env.vars is a local variable, or a block-scope `extern` or `static` variable
   # ({ name; type; object; } with object its data symbol).
@@ -1261,11 +1284,11 @@ let
       fail e "cannot take the address of an rvalue of type '${showType x.type}'";
 
   # sizeof of the type or expression of the "sizeof" or "sizeoftype" node n (the
-  # expression is typed, not evaluated).
+  # expression is typed, without reading an address, and not evaluated).
   sizeofValue =
     env: n:
     let
-      x = ex env n.expr;
+      x = ex (typeOnlyEnv env) n.expr;
       t = if n.kind == "sizeoftype" then resolveType env n n.type else x.type;
     in
     if n.kind == "sizeof" && x ? bitfield then
@@ -2167,7 +2190,10 @@ let
     env: n:
     let
       c = rv env n.cond;
-      t = promote c.type;
+      # The sections, which the placement of the static locals walks, depend on the type of
+      # the condition, so it is found without reading an address.
+      ct = (rv (typeOnlyEnv env) n.cond).type;
+      t = promote ct;
       body = n.body;
       r = foldl' (switchItem t) {
         env = inSwitch (enterBlock env);
@@ -2177,8 +2203,8 @@ let
         default = null;
       } body.items;
     in
-    if !isInteger c.type then
-      fail n.cond "statement requires expression of integer type ('${showType c.type}' invalid)"
+    if !isInteger ct then
+      fail n.cond "statement requires expression of integer type ('${showType ct}' invalid)"
     else if body.kind != "block" then
       unsupported body "'switch' body that is not a compound statement"
     else
@@ -2414,11 +2440,12 @@ let
   # see linkageOf); defs: the typed function definitions; size: the bytes placed so far;
   # objects: the placed variables
   # ([ { name; addr; end; at; writes; } ], writes as the inits of the data). The context
-  #   ctx = { structs; enums; consts; globals; tags; addrs; strings; }
+  #   ctx = { structs; enums; consts; globals; tags; typeOnly; addrs; strings; }
   # holds the struct and union layouts by tag (see "Objects"), the enum types by tag, the
   # enumerators by name ({ type; value; }), the file-scope variables by name
   # ({ type; defined; hasInit; at; linkage; }), the internal names of the block-scope tags
-  # in scope by tag (empty at file scope; see resolveType), the addresses of all defined
+  # in scope by tag (empty at file scope; see resolveType), whether expressions are only
+  # typed (see typeOnlyEnv; false here), the addresses of all defined
   # variables and static locals by data symbol, taken from the end of the fold and
   # placeStatics (an extern declaration may precede the definition that places the
   # variable), and the addresses of the string literals by key (see stringKey), taken
@@ -3203,6 +3230,7 @@ let
           consts = { };
           globals = { };
           tags = { };
+          typeOnly = false;
           inherit addrs link;
           strings = strings.addrs;
         };

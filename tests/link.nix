@@ -457,6 +457,24 @@ let
     link.externAddr = n: throw "externAddr ${n}";
   } (P.parse layoutSrc);
 
+  # A unit whose switch conditions and sizeof operands fold the address of a variable it
+  # imports; the placement depends on their types only.
+  foldedSrc = ''
+    extern int x;
+    char a[sizeof(1 + (unsigned)&x)];
+    int s1(void) { switch ((unsigned)&x + 1) { case 1: return 1; default: return 2; } }
+    int s2(void) { switch ((unsigned)&x ? 1 : 0) { case 1: return 3; } return 4; }
+    int s3(void) { static char b[sizeof((unsigned)&x * 2)]; return sizeof a + sizeof b; }
+  '';
+  folded = lk [
+    (u "a" foldedSrc)
+    (u "b" "int x;")
+  ];
+  foldedCheck = Ch.checkWith {
+    dataBase = base;
+    link.externAddr = n: throw "externAddr ${n}";
+  } (P.parse foldedSrc);
+
   # The shared header of two files, with an anonymous struct; a.c has tokens before it,
   # so the token indices of the struct differ between the units.
   boxFiles = {
@@ -1542,6 +1560,28 @@ in
       true
       true
       4
+    ]
+  )
+  (t "cc link 31: switch conditions and sizeof operands that fold an imported address"
+    [
+      (runCalls folded [
+        [ "s1" ]
+        [ "s2" ]
+        [ "s3" ]
+      ])
+      (passes foldedCheck.layout)
+      foldedCheck.layout.size
+      (map (v: v.name) foldedCheck.layout.imports.vars)
+    ]
+    [
+      [
+        2
+        3
+        8
+      ]
+      true
+      8
+      [ "x" ]
     ]
   )
 ]
