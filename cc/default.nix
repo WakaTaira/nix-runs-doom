@@ -25,7 +25,7 @@ let
   Ch = import ./check.nix;
   E = import ./emit.nix;
 
-  emitUnit = dataBase: unit: E.emit (Ch.checkWith { inherit dataBase; } unit);
+  emitUnit = dataBase: unit: E.emit (Ch.checkWith { inherit dataBase; } unit).checked;
 
   compileWith =
     {

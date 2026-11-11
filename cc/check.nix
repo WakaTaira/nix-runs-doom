@@ -1,8 +1,26 @@
 # C type checker: syntax tree (cc/parse.nix) -> typed syntax tree (input of cc/emit.nix).
 #
-# Entry point: checkWith { dataBase; } : unit node -> { funcs; data; }, with funcs the
-# typed function definitions in source order and data the placement of the file-scope
-# variables (see "Data" below); check uses defaultDataBase. Errors are thrown as
+# Entry point: checkWith { dataBase; link ? null; } : unit node -> { layout; checked; },
+# with checked = { funcs; data; }, funcs the typed function definitions in source order
+# and data the placement of the file-scope variables (see "Data" below); check uses
+# defaultDataBase. layout is the part that reads no address value:
+#   { size; symbols; exports; imports; }
+# size and symbols as in data; exports = { vars = [ { name; type; size; align; addr; } ];
+# funcs = [ { name; ret; params; variadic; } ]; } the definitions with external linkage.
+#
+# Link mode (link = { externAddr; }, for cc/link.nix): externAddr maps the name of a
+# variable that the unit uses and does not define to its address (lazily; layout never
+# calls it). Such variables and the functions with external linkage that the unit calls
+# and does not define are not errors but imports:
+#   imports = { vars = [ { name; type; size; align; line; col; file?; } ];
+#               funcs = [ { name; ret; params; variadic; line; col; file?; } ]; }
+# one per name (sorted), at its first use; the type of a variable merges the declarations
+# of the unit (an array length when one gives it), with size and align from objectExtent.
+# A block-scope extern that disagrees with another declaration of the name, and a call to a
+# function with internal linkage that is declared but not defined, stay errors (see
+# linkUnit), raised when imports or checked is evaluated. checked also has
+# link = { funcs; }, the names of the imported functions. Without link, imports are empty.
+# Errors are thrown as
 # "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for a preprocessed file,
 # whose nodes have `file`), and as "cc: <line>:<col>: unsupported: <what>" for valid
 # C outside the supported subset. `types` holds the type helpers shared with the emitter,
@@ -129,9 +147,10 @@
 # preprocessed file, seq the index of the name token; not a C identifier), and after them the
 # arrays of the string literals that need storage (see stringUses), one for each distinct
 # contents, with alignment 1, in the order of the first such literal of each:
-#   { base; size; symbols = [ { name; addr; } ]; strings = [ { addr; size; } ];
+#   { base; size; symbols = [ { name; addr; linkage; } ]; strings = [ { addr; size; } ];
 #     inits = [ { addr; size; value; } ]; }
-# size is the end of the last variable or string minus base; strings are in address
+# linkage is that of a file-scope variable, or "none" for a static local. size is the end
+# of the last variable or string minus base; strings are in address
 # order. inits are the scalar stores of the initializers whose value is not 0 (size 1, 2
 # or 4 bytes, value in the stored unsigned form), in address order within each variable,
 # followed by the bytes of the strings that are not 0.
@@ -853,7 +872,120 @@ let
   # static local), at its address known once every variable is placed.
   objectAt =
     ctx: e: t: sym:
-    node e "deref" t { expr = litAt e (ptrTo t) ctx.addrs.${sym}; };
+    node e "deref" t { expr = litAt e (ptrTo t) (addressOf ctx sym); };
+
+  # The address of the data symbol sym: placed in this unit, or, in link mode (ctx.link,
+  # see checkWith), a variable of another unit given by the linker.
+  addressOf =
+    ctx: sym:
+    if ctx.link != null && !(hasAttr sym ctx.addrs) then ctx.link.externAddr sym else ctx.addrs.${sym};
+
+  # ---- References for the linker ----
+  # In link mode (ctx.link), every statement node and file-scope object carries `uses`:
+  # the references of its expressions to file-scope variables and functions, as
+  #   { use = "var"; name; line; col; ... }  or  { use = "func"; name; sig; line; col; ... }
+  # with the position of the identifier (posOf) and sig the signature in scope (env.funcs).
+  # They are found in the syntax tree with the names in scope where the expression is
+  # checked, resolved as identExpr and callExpr resolve them, so that finding them reads no
+  # address (constant folding of addresses decides the shape of the typed tree). Operands
+  # of sizeof are not evaluated and do not count.
+
+  usesOf =
+    env: e:
+    concatMap (useOf env) (
+      collect
+        (
+          x:
+          elem (kindOf x) [
+            "ident"
+            "call"
+          ]
+        )
+        (
+          x:
+          elem (kindOf x) [
+            "sizeof"
+            "sizeoftype"
+            "strlit"
+          ]
+        )
+        e
+    );
+
+  # The reference of the "ident" or "call" node x in env: a block-scope extern variable (a
+  # name bound to the data symbol of its own name, see externVar), a file-scope variable or a
+  # function; nothing for a local, a static local, an enumerator, or an error (which the
+  # checker reports).
+  useOf =
+    env: x:
+    let
+      name = x.name;
+      v = env.vars.${name} or null;
+      isObject = v != null || hasAttr name env.ctx.globals || hasAttr name env.ctx.consts;
+      at = posOf x;
+    in
+    if x.kind == "ident" then
+      (
+        if
+          (
+            if v != null then
+              (v.object or null) == name
+            else
+              !hasAttr name env.ctx.consts && hasAttr name env.ctx.globals
+          )
+        then
+          [
+            (
+              {
+                use = "var";
+                inherit name;
+              }
+              // at
+            )
+          ]
+        else
+          [ ]
+      )
+    else if isObject || !hasAttr name env.funcs then
+      [ ]
+    else
+      [
+        (
+          {
+            use = "func";
+            inherit name;
+            sig = env.funcs.${name};
+          }
+          // at
+        )
+      ];
+
+  # { uses } for a node whose references are uses, in link mode; { } otherwise.
+  withUses = env: uses: if env.ctx.link == null then { } else { inherit uses; };
+  # The same for the expressions exprs (null for none) checked in env.
+  linkUses = env: exprs: withUses env (concatMap (usesOf env) exprs);
+
+  # The uses of the typed statement n and the statements in it (see declsIn).
+  usesIn =
+    n:
+    let
+      k = kindOf n;
+    in
+    (n.uses or [ ])
+    ++ (
+      if k == "block" then
+        concatMap usesIn n.items
+      else if k == "if" then
+        usesIn n.thenStmt ++ usesIn n.elseStmt
+      else if k == "while" || k == "do" then
+        usesIn n.body
+      else if k == "for" then
+        usesIn n.init ++ usesIn n.body
+      else if k == "switch" then
+        concatMap usesIn (n.skipped ++ concatLists n.sections)
+      else
+        [ ]
+    );
 
   # The array of the string literal e (a "strlit" node), at the address of its contents
   # (see placeStrings). A literal in the operand of sizeof has no storage, so the value
@@ -1503,7 +1635,15 @@ let
           inherit kind;
         }
         // posOf n
-        // fields;
+        // fields
+        // linkUses env (
+          if k == "expr" then
+            [ n.expr ]
+          else if k == "if" || k == "while" || k == "do" then
+            [ n.cond ]
+          else
+            [ ]
+        );
         inherit env;
       };
       kind = k;
@@ -1603,6 +1743,7 @@ let
           // {
             inherit (r) env;
             statics = acc.statics ++ [ r.static ];
+            uses = acc.uses ++ usesOf r.env d.init;
           }
         else
           let
@@ -1627,12 +1768,14 @@ let
                   inherit init;
                 }
               ];
+              uses = acc.uses ++ usesOf r.env d.init;
             };
       r = foldl' step {
         inherit env;
         vars = [ ];
         statics = [ ];
         externs = [ ];
+        uses = [ ];
       } n.decls;
     in
     {
@@ -1646,7 +1789,8 @@ let
             inherit (r) vars;
           }
           // (if r.statics == [ ] then { } else { inherit (r) statics; })
-          // (if r.externs == [ ] then { } else { inherit (r) externs; });
+          // (if r.externs == [ ] then { } else { inherit (r) externs; })
+          // withUses env r.uses;
       inherit (r) env;
     };
 
@@ -1678,7 +1822,8 @@ let
 
   # A block-scope `extern` variable: the file-scope variable of the same name, which must
   # be defined in the input with a compatible type (checked at the end, see checkWith).
-  # -> { env; extern = { name; type; line; col; }; }
+  # -> { env; extern = { name; type; extent; line; col; }; } with extent the size and
+  # alignment of type here (see objectExtent; the linker's view of a block-scope tag).
   externVar =
     env: d:
     let
@@ -1700,6 +1845,7 @@ let
           extern = posOf d // {
             inherit name;
             type = t;
+            extent = objectExtent env.ctx t;
           };
         }
     );
@@ -1890,22 +2036,31 @@ let
             declStmt fenv n.init
         else
           {
-            node = posOf n.init // {
-              kind = "expr";
-              expr = valueOf fenv n.init;
-            };
+            node =
+              posOf n.init
+              // {
+                kind = "expr";
+                expr = valueOf fenv n.init;
+              }
+              // linkUses fenv [ n.init ];
             env = fenv;
           };
       ienv = init.env;
     in
     {
-      node = posOf n // {
-        kind = "for";
-        init = init.node;
-        cond = if n.cond == null then null else rv ienv n.cond;
-        step = if n.step == null then null else valueOf ienv n.step;
-        body = sub (inLoop ienv) n.body;
-      };
+      node =
+        posOf n
+        // {
+          kind = "for";
+          init = init.node;
+          cond = if n.cond == null then null else rv ienv n.cond;
+          step = if n.step == null then null else valueOf ienv n.step;
+          body = sub (inLoop ienv) n.body;
+        }
+        // linkUses ienv [
+          n.cond
+          n.step
+        ];
       inherit env;
     };
 
@@ -1920,10 +2075,13 @@ let
       fail n "non-void function should return a value"
     else
       {
-        node = posOf n // {
-          kind = "return";
-          expr = if n.expr == null then null else assignConv n.expr env.ret (rv env n.expr);
-        };
+        node =
+          posOf n
+          // {
+            kind = "return";
+            expr = if n.expr == null then null else assignConv n.expr env.ret (rv env n.expr);
+          }
+          // linkUses env [ n.expr ];
         inherit env;
       };
 
@@ -1968,16 +2126,19 @@ let
       unsupported body "'switch' body that is not a compound statement"
     else
       {
-        node = posOf n // {
-          kind = "switch";
-          cond = mkCast t c;
-          inherit (r)
-            skipped
-            sections
-            cases
-            default
-            ;
-        };
+        node =
+          posOf n
+          // {
+            kind = "switch";
+            cond = mkCast t c;
+            inherit (r)
+              skipped
+              sections
+              cases
+              default
+              ;
+          }
+          // linkUses env [ n.cond ];
         inherit env;
       };
 
@@ -2643,6 +2804,8 @@ let
               at = posOf g;
               # The initializer sees the variable itself.
               writes = if g.init == null then [ ] else initWrites (fileEnv acc') t addr g.init;
+              # Its references in link mode (see usesOf).
+              uses = usesOf (fileEnv acc') g.init;
             }
           ];
         };
@@ -2982,7 +3145,7 @@ let
     };
 
   checkItems =
-    dataBase: items:
+    dataBase: link: items:
     let
       r = foldl' (itemStep dataBase) {
         funcs = { };
@@ -2993,7 +3156,7 @@ let
           consts = { };
           globals = { };
           tags = { };
-          inherit addrs;
+          inherit addrs link;
           strings = strings.addrs;
         };
         size = 0;
@@ -3029,11 +3192,190 @@ let
     else
       "type";
 
+  # The size and alignment of an object of type t as the linker sees them: an array
+  # without a length has size 0 and the alignment of its element, and an incomplete
+  # struct or union size 0 and alignment 1.
+  objectExtent =
+    ctx: t:
+    if isArray t && t.len == null then
+      {
+        size = 0;
+        align = alignOfT ctx t.of;
+      }
+    else if !isComplete ctx t then
+      {
+        size = 0;
+        align = 1;
+      }
+    else
+      {
+        size = sizeOfT ctx t;
+        align = alignOfT ctx t;
+      };
+
+  # The first of the nodes xs in the source (see before).
+  earliest = xs: foldl' (a: b: if before b a then b else a) (head xs) xs;
+
+  # The position of the use u in an import: { line; col; } and file when it has one.
+  useAt = u: { inherit (u) line col; } // (if u ? file then { inherit (u) file; } else { });
+
+  # The declarations of each variable name of the unit: the file-scope one (globals) and
+  # the block-scope extern ones (externs, in source order), merged into the one that
+  # gives an array length when any does. -> { decls = { <name> = { type; extent; }; };
+  # bad; } with bad the first block-scope extern whose type does not agree with the
+  # declarations before it (or null); extent is null for a file-scope declaration.
+  mergeExterns =
+    globals: externs:
+    foldl'
+      (
+        st: x:
+        let
+          prev = st.decls.${x.name} or null;
+        in
+        if st.bad != null then
+          st
+        else if prev != null && !compatible prev.type x.type then
+          st // { bad = x; }
+        else
+          st
+          // {
+            decls = st.decls // {
+              ${x.name} = if prev == null || isArray prev.type && prev.type.len == null then x else prev;
+            };
+          }
+      )
+      {
+        decls = builtins.mapAttrs (_: g: {
+          inherit (g) type;
+          extent = null;
+        }) globals;
+        bad = null;
+      }
+      externs;
+
+  # The link interface of the checked unit r in link mode, from its uses (see usesOf), which
+  # reads no address. -> { checks; imports; } with checks true or the first error of the
+  # unit that link mode finds this way: a block-scope extern whose type disagrees with
+  # another declaration of the name, a call through a block-scope declaration that the
+  # file-scope one contradicts, and a call to a function with internal linkage that is
+  # declared but not defined. imports (see checkWith) are the variables used and not
+  # defined, and the functions called and not defined that have external linkage.
+  linkUnit =
+    r:
+    let
+      uses = concatMap (o: o.uses or [ ]) r.objects ++ concatMap (f: usesIn f.body) r.defs;
+      merged = mergeExterns r.ctx.globals (concatMap (f: declsIn "externs" f.body) r.defs);
+      usesOfKind = k: groupBy (u: u.name) (filter (u: u.use == k) uses);
+      varUses = usesOfKind "var";
+      funcUses = usesOfKind "func";
+      fileFunc = n: r.funcs.${n} or null;
+      undefinedFuncs =
+        linkage:
+        filter (
+          n:
+          let
+            f = fileFunc n;
+          in
+          !(f != null && f.defined) && (if f == null then "external" else f.linkage) == linkage
+        ) (attrNames funcUses);
+      internalCalls = concatMap (n: funcUses.${n}) (undefinedFuncs "internal");
+      conflicts = filter (u: fileFunc u.name != null && !sameSig (fileFunc u.name) u.sig) (
+        concatLists (attrValues funcUses)
+      );
+      importVar =
+        n:
+        let
+          d = merged.decls.${n};
+          e = if d.extent == null || isComplete r.ctx d.type then objectExtent r.ctx d.type else d.extent;
+        in
+        {
+          name = n;
+          inherit (d) type;
+          inherit (e) size align;
+        }
+        // useAt (earliest varUses.${n});
+      importFunc =
+        n:
+        let
+          u = earliest funcUses.${n};
+          sig = if fileFunc n != null then fileFunc n else u.sig;
+        in
+        {
+          name = n;
+          inherit (sig) ret params variadic;
+        }
+        // useAt u;
+    in
+    {
+      checks =
+        if merged.bad != null then
+          fail merged.bad "redeclaration of '${merged.bad.name}' with a different type"
+        else if conflicts != [ ] then
+          fail (earliest conflicts) "conflicting types for '${(earliest conflicts).name}'"
+        else if internalCalls != [ ] then
+          unsupported (earliest internalCalls) "call to function '${(earliest internalCalls).name}' that is declared but not defined"
+        else
+          true;
+      imports = {
+        vars = map importVar (filter (n: !(r.ctx.globals.${n}.defined or false)) (attrNames varUses));
+        funcs = map importFunc (undefinedFuncs "external");
+      };
+    };
+
+  # The definitions with external linkage of the checked unit r (see checkWith).
+  exportsOf = r: {
+    vars = concatMap (
+      o:
+      let
+        g = r.ctx.globals.${o.name} or null;
+      in
+      if g == null || g.linkage != "external" then
+        [ ]
+      else
+        [
+          {
+            inherit (o) name addr;
+            inherit (g) type;
+            size = o.end - o.addr;
+            align = alignOfT r.ctx g.type;
+          }
+        ]
+    ) r.objects;
+    funcs = concatMap (
+      n:
+      let
+        f = r.funcs.${n};
+      in
+      if f.defined && f.linkage == "external" then
+        [
+          {
+            name = n;
+            inherit (f) ret params variadic;
+          }
+        ]
+      else
+        [ ]
+    ) (attrNames r.funcs);
+  };
+
+  # The data symbols of the checked unit r, with the linkage of each: that of a file-scope
+  # variable, "none" for a static local.
+  symbolsOf =
+    r:
+    map (o: {
+      inherit (o) name addr;
+      linkage = r.ctx.globals.${o.name}.linkage or "none";
+    }) r.objects;
+
   checkWith =
-    { dataBase }:
+    {
+      dataBase,
+      link ? null,
+    }:
     unit:
     let
-      r = checkItems dataBase unit.items;
+      r = checkItems dataBase link unit.items;
+      lu = linkUnit r;
       calls = collect (x: kindOf x == "call") (_: false) r.defs;
       undefinedCalls = filter (c: !(hasAttr c.name r.funcs) || !r.funcs.${c.name}.defined) calls;
       # A call through a block-scope declaration that the file-scope one contradicts.
@@ -3049,41 +3391,75 @@ let
       blockExtern = head blockExterns;
       # The first variable that ends above 2^32.
       overflow = head (filter (o: o.end > B.mask32 + 1) r.objects);
+      overflowFail = fail overflow.at "the data does not fit below 2^32 from dataBase (variable '${overflow.name}')";
       # The string literals that end above 2^32 (after the variables, which end below).
       stringOverflows = filter (s: s.addr + s.size > B.mask32 + 1) r.strings.list;
+      stringOverflowFail = fail (head stringOverflows).at "the data does not fit below 2^32 from dataBase (string literal)";
       extern = r.ctx.globals.${head externs};
       objectInits = map (w: { inherit (w) addr size value; }) (concatMap (o: o.writes) r.objects);
       stringInits = concatMap (s: byteWrites s.addr s.bytes) r.strings.list;
+      size = if r.strings.list == [ ] then r.size else r.strings.end;
+      layout = {
+        inherit size;
+        symbols = symbolsOf r;
+        exports = exportsOf r;
+        imports =
+          if link == null then
+            {
+              vars = [ ];
+              funcs = [ ];
+            }
+          else
+            builtins.seq lu.checks lu.imports;
+      };
       result = {
         funcs = r.defs;
         data = {
           base = dataBase;
-          size = if r.strings.list == [ ] then r.size else r.strings.end;
-          symbols = map (o: { inherit (o) name addr; }) r.objects;
+          inherit size;
+          symbols = symbolsOf r;
           strings = map (s: { inherit (s) addr size; }) r.strings.list;
           inits = filter (w: w.value != 0) (objectInits ++ stringInits);
         };
-      };
+      }
+      // (if link == null then { } else { link.funcs = map (f: f.name) layout.imports.funcs; });
+      single =
+        if externs != [ ] then
+          unsupported extern.at "extern variable '${head externs}' without a definition"
+        else if blockExterns != [ ] && externStatus r.ctx blockExtern == "undefined" then
+          unsupported blockExtern "extern variable '${blockExtern.name}' without a definition"
+        else if blockExterns != [ ] then
+          fail blockExtern "redeclaration of '${blockExtern.name}' with a different type"
+        else if dataBase + r.size > B.mask32 + 1 then
+          overflowFail
+        else if conflicts != [ ] then
+          fail (head conflicts) "conflicting types for '${(head conflicts).name}'"
+        else if undefinedCalls != [ ] then
+          unsupported (head undefinedCalls) "call to function '${(head undefinedCalls).name}' that is declared but not defined"
+        else if stringOverflows != [ ] then
+          stringOverflowFail
+        else
+          builtins.deepSeq result result;
+      linked = builtins.seq lu.checks (
+        if dataBase + r.size > B.mask32 + 1 then
+          overflowFail
+        else if stringOverflows != [ ] then
+          stringOverflowFail
+        else
+          builtins.deepSeq result result
+      );
     in
-    if !(isInt dataBase && dataBase >= 0 && dataBase <= B.mask32 && bitAnd dataBase 7 == 0) then
-      # 8: the largest alignment (of a struct with a double).
-      throw "cc: dataBase must be a multiple of 8 in 0..2^32-1"
-    else if externs != [ ] then
-      unsupported extern.at "extern variable '${head externs}' without a definition"
-    else if blockExterns != [ ] && externStatus r.ctx blockExtern == "undefined" then
-      unsupported blockExtern "extern variable '${blockExtern.name}' without a definition"
-    else if blockExterns != [ ] then
-      fail blockExtern "redeclaration of '${blockExtern.name}' with a different type"
-    else if dataBase + r.size > B.mask32 + 1 then
-      fail overflow.at "the data does not fit below 2^32 from dataBase (variable '${overflow.name}')"
-    else if conflicts != [ ] then
-      fail (head conflicts) "conflicting types for '${(head conflicts).name}'"
-    else if undefinedCalls != [ ] then
-      unsupported (head undefinedCalls) "call to function '${(head undefinedCalls).name}' that is declared but not defined"
-    else if stringOverflows != [ ] then
-      fail (head stringOverflows).at "the data does not fit below 2^32 from dataBase (string literal)"
-    else
-      builtins.deepSeq result result;
+    {
+      inherit layout;
+      checked =
+        if !(isInt dataBase && dataBase >= 0 && dataBase <= B.mask32 && bitAnd dataBase 7 == 0) then
+          # 8: the largest alignment (of a struct with a double).
+          throw "cc: dataBase must be a multiple of 8 in 0..2^32-1"
+        else if link == null then
+          single
+        else
+          linked;
+    };
 
   check = checkWith { dataBase = defaultDataBase; };
 in
