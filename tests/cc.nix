@@ -7280,6 +7280,45 @@ in
     ]
   ) (genList (_: true) 3))
 
+  (t "cc compile: () and (void) agree through arrays and pointers of function pointers"
+    (map (src: dret src "f" [ 1 ]) [
+      "extern void (*tab[])(); void (*tab[2])(void); int f(int c) { return tab[0] == 0; }"
+      "void (*g)(); void (*h)(void); int f(int c) { void (**pp)() = c ? &g : &h; return pp != 0; }"
+      "void (*g)(); void (*h)(void); int f(int c) { void (**a)() = &g; void (**b)(void) = &g; return a - b == 0; }"
+    ])
+    [
+      1
+      1
+      1
+    ]
+  )
+  (t "cc check: showType tells () from (void)"
+    (
+      let
+        fn = unspecified: params: variadic: {
+          tag = "fn";
+          ret = {
+            tag = "void";
+          };
+          inherit unspecified params variadic;
+        };
+        int = {
+          tag = "int";
+        };
+      in
+      map Ch.types.showType [
+        (fn true [ ] false)
+        (fn false [ ] false)
+        (fn false [ int ] true)
+      ]
+    )
+    [
+      "void ()"
+      "void (void)"
+      "void (int, ...)"
+    ]
+  )
+
   # Function pointers: values, numbers and calls through them
   (t "cc run: a function pointer initialized with a function is called" (dret
     "int add1(int x) { return x + 1; } int (*fp)(int) = add1; int f(void) { return fp(41); }"

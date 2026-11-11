@@ -19,8 +19,9 @@
 #               funcs = [ { name; ret; params; variadic; lsig; defs; calls; line; col;
 #                           file?; } ]; }
 # one per name (sorted), at its first use, with calls the numbers of arguments of the
-# direct calls of a function (none for one only used as a value); the type of a variable merges the declarations
-# of the unit (an array length when one gives it), with size and align from objectExtent.
+# direct calls of a function (none for one only used as a value); the type of a variable
+# merges the declarations of the unit (an array length when one gives it), with size and
+# align from objectExtent.
 # For the linker's comparison of types between units, ltype is the type of a variable and
 # lsig = { ret; params; variadic; unspecified; } the signature of a function with enum
 # types kept (linkType), and defs = { structs; enums; } the struct, union and enum
@@ -149,7 +150,8 @@
 # `x op= y`, `++x` and `x--` are "assign" nodes whose value computes from "old".
 # Arrays, structs and unions are objects in memory: while an expression is checked they are
 # "deref" nodes of array, struct or union type (the address in expr), which never reach
-# the typed tree, and so are function designators (see "Function pointers"). An array used as a value decays to a pointer to its first element; a
+# the typed tree, and so are function designators (see "Function pointers"). An array used
+# as a value decays to a pointer to its first element; a
 # struct or union is only used through its members, its address and sizeof. A string
 # literal is such an array object of type char[N] (N counts the 0 at the end) at a
 # constant address; its contents are read from memory, never folded, so it is not part
@@ -549,13 +551,18 @@ let
       "${t.tag} ${shownName t.name}"
     else if t.tag == "fn" then
       "${showType t.ret} (${
-        builtins.concatStringsSep ", " (map showType t.params ++ (if t.variadic then [ "..." ] else [ ]))
+        builtins.concatStringsSep ", " (
+          map showType t.params
+          ++ (if t.variadic then [ "..." ] else [ ])
+          ++ (if t.unspecified || t.params != [ ] || t.variadic then [ ] else [ "void" ])
+        )
       })"
     else
       typeNames.${t.tag};
 
   types = {
     inherit
+      showType
       isScalar
       isPtr
       isInteger
@@ -611,6 +618,19 @@ let
         else
           false
       );
+  # Of two types that agree, the one that keeps the prototype where one of them has none.
+  preferSpecified =
+    a: b:
+    if a == b then
+      a
+    else if isPtr a then
+      a // { to = preferSpecified a.to b.to; }
+    else if a.tag == "array" then
+      a // { of = preferSpecified a.of b.of; }
+    else if a.tag == "fn" then
+      if a.unspecified then b else a
+    else
+      a;
   # Two function types (or signatures: { ret; params; variadic; unspecified; }) agree.
   fnTypesAgree =
     a: b:
@@ -1649,8 +1669,8 @@ let
       t =
         if isInteger ta && isInteger tb then
           usual ta tb
-        else if isPtr ta && ta == tb then
-          ta
+        else if isPtr ta && typesAgree ta tb then
+          preferSpecified ta tb
         else if isFnPtr ta && isFnPtr tb && typesAgree ta tb then
           (if ta.to.unspecified then tb else ta)
         else if isFnPtr ta && isNullFn b then
@@ -1768,7 +1788,7 @@ let
         arith (usual ta tb)
       else if isPtr ta && isInteger tb then
         ptrAdd ctx at "-" a b
-      else if isPtr ta && ta == tb && isComplete ctx ta.to then
+      else if isPtr ta && typesAgree ta tb && isComplete ctx ta.to then
         node at "ptrdiff" tInt {
           lhs = a;
           rhs = b;
@@ -3399,7 +3419,8 @@ let
   # same element type where one has no length.
   compatible =
     a: b:
-    typesAgree a b || (isArray a && isArray b && a.of == b.of && (a.len == null || b.len == null));
+    typesAgree a b
+    || (isArray a && isArray b && typesAgree a.of b.of && (a.len == null || b.len == null));
 
   withGlobal =
     acc: name: g:
