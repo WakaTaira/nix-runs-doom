@@ -7196,8 +7196,12 @@ in
       "int h(va_list a) { return 1; }"
       "va_list h(void);"
       "int f(void) { return vf(0); }"
+      "va_list (*fp)(void);"
+      "int f(void) { va_list (*fp)(void) = 0; return 1; }"
+      "struct s { va_list (*fp)(int); };"
+      "int f(void) { return sizeof(va_list (*)(void)); }"
     ]
-  ) (genList (_: true) 12))
+  ) (genList (_: true) 16))
 
   # Unions
   (t "cc run: union sizes and alignments"

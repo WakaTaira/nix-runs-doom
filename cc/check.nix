@@ -54,8 +54,9 @@
 # after the default argument promotions; one of floating-point, struct or union type is
 # unsupported). __builtin_va_list (the va_list of stdarg.h, see cc/parse.nix) may only be
 # named in a typedef and in the parameters of a function declaration: a variable,
-# member, return type, cast or sizeof of a type with it (hasVaList), the definition of a
-# function with such a parameter and a call to one are unsupported ('va_list').
+# member, return type, cast or sizeof of a type with it (hasVaList: through pointers,
+# arrays and the return types of function types, not their parameters), the definition
+# of a function with such a parameter and a call to one are unsupported ('va_list').
 #
 # Typed syntax tree
 # -----------------
@@ -516,9 +517,9 @@ let
   # A floating-point object: a float or double, or an array of them.
   hasFloat = t: isFloat t || isArray t && hasFloat t.of;
   isFnPtr = t: isPtr t && t.to.tag == "fn";
-  # __builtin_va_list (cc/parse.nix), or a pointer to or an array of it: only a typedef
-  # and the parameters of a function declaration may have such a type (the parameters of
-  # a function type are not looked into).
+  # __builtin_va_list (cc/parse.nix), or a pointer to, an array of or a function returning
+  # it: only a typedef and the parameters of a function declaration may have such a type
+  # (the parameters of a function type are not looked into).
   hasVaList =
     t:
     if t.tag == "valist" then
@@ -527,6 +528,8 @@ let
       hasVaList t.to
     else if isArray t then
       hasVaList t.of
+    else if t.tag == "fn" then
+      hasVaList t.ret
     else
       false;
   # Sizes (and alignments) of the floating-point types; they are never read or written.
