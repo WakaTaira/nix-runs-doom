@@ -76,7 +76,12 @@
 # literal) is a pointer "lit", and so is a constant pointer plus or minus a constant
 # (member offsets and constant indices). The operand of sizeof, and the condition of a
 # switch for the shape of its node, are also typed without the addresses (typeOnlyEnv),
-# so the placement of the data never waits on an address folded there.
+# so the placement of the data never waits on an address folded there. An address is
+# then a constant of unknown value, which folds to a known constant where the result does
+# not depend on it (`(unsigned)&g & 0` is 0, see isSymbol). Any other value computed from
+# an address stays unknown there, so a 0 that only the address or an identity gives
+# (`(unsigned)&g & 3` for an aligned g, `(unsigned)&g - (unsigned)&g`) is no null pointer
+# constant in those operands, and a shift by such a value is not checked there.
 #   { kind = "lit"; value; }                     integer constant in the range of type, or
 #                                                a constant address (pointer type)
 #   { kind = "var"; var; }                       local variable or parameter;
@@ -682,6 +687,8 @@ let
         type = t;
         value = wrapTo t x.value;
       }
+    else if isSymbol x && isScalar t then
+      x // { type = t; }
     else
       node x "cast" t { expr = x; };
 
@@ -700,6 +707,20 @@ let
   litAt =
     at: t: value:
     node at "lit" t { inherit value; };
+
+  # Where expressions are only typed (see typeOnlyEnv), a "symbol" node is a constant of
+  # unknown value (an address, or what folding one gives). Operators fold a symbol where
+  # they fold a "lit": to a known constant where the result does not depend on its value
+  # (`x & 0`, `x * 0`, `x % 1` and `x % -1` are 0, `0 && x` is 0, `1 || x` is 1, and
+  # `c ? a : b` is a when c is not 0, b when c is 0, and k when a and b are both k),
+  # otherwise to a symbol of the result type.
+  isSymbol = x: x.kind == "symbol";
+  # A constant, of known or unknown value.
+  isConst = x: x.kind == "lit" || isSymbol x;
+  isIntConst = x: isConst x && isInteger x.type;
+  symbolAt = at: t: node at "symbol" t { };
+  # Whether a and b are integer constants of which one at least is a symbol.
+  symbolPair = a: b: (isSymbol a || isSymbol b) && isIntConst a && isIntConst b;
 
   # x << k for a value x of the integer type t, or null when it is not folded (long long
   # by 63 or more, whose product is not a Nix integer).
@@ -761,7 +782,26 @@ let
     let
       v = foldBinary n.type n.op n.lhs.value n.rhs.value;
     in
-    if isIntLit n.lhs && isIntLit n.rhs && v != null then litAt n n.type v else n;
+    if isIntLit n.lhs && isIntLit n.rhs && v != null then
+      litAt n n.type v
+    else if symbolPair n.lhs n.rhs then
+      foldSymbolBinop n
+    else
+      n;
+
+  # The "binop" node n on integer constants of which one at least is a symbol: 0 where
+  # the value does not depend on the symbol, otherwise a symbol (see isSymbol).
+  foldSymbolBinop =
+    n:
+    let
+      zero = x: isIntLit x && x.value == 0;
+    in
+    if (n.op == "&" || n.op == "*") && (zero n.lhs || zero n.rhs) then
+      litAt n n.type 0
+    else if n.op == "%" && isIntLit n.rhs && (n.rhs.value == 1 || n.rhs.value == -1) then
+      litAt n n.type 0
+    else
+      symbolAt n n.type;
 
   cmpOps = {
     "<" = a: b: a < b;
@@ -778,6 +818,8 @@ let
     n:
     if isIntLit n.lhs && isIntLit n.rhs then
       litAt n tInt (boolValue (cmpOps.${n.op} n.lhs.value n.rhs.value))
+    else if symbolPair n.lhs n.rhs then
+      symbolAt n tInt
     else
       n;
 
@@ -785,7 +827,14 @@ let
   foldLogic =
     n:
     if n.kind == "not" then
-      (if isIntLit n.expr then litAt n tInt (boolValue (n.expr.value == 0)) else n)
+      (
+        if isIntLit n.expr then
+          litAt n tInt (boolValue (n.expr.value == 0))
+        else if isSymbol n.expr && isInteger n.expr.type then
+          symbolAt n tInt
+        else
+          n
+      )
     else if isIntLit n.lhs && isIntLit n.rhs then
       litAt n tInt (
         boolValue (
@@ -795,8 +844,20 @@ let
             n.lhs.value != 0 || n.rhs.value != 0
         )
       )
+    else if symbolPair n.lhs n.rhs then
+      foldSymbolLogic n
     else
       n;
+
+  # The "logand" or "logor" node n on integer constants of which one at least is a
+  # symbol: decided by a known operand (0 for &&, not 0 for ||), otherwise a symbol.
+  foldSymbolLogic =
+    n:
+    let
+      isAnd = n.kind == "logand";
+      decides = x: isIntLit x && (if isAnd then x.value == 0 else x.value != 0);
+    in
+    if decides n.lhs || decides n.rhs then litAt n tInt (if isAnd then 0 else 1) else symbolAt n tInt;
 
   # Conversion as by assignment (also for arguments and return values). A function
   # pointer converts only from its own type and from a null pointer constant.
@@ -918,17 +979,19 @@ let
     node e "deref" t { expr = addressAt ctx e (ptrTo t) (addressOf ctx sym); };
 
   # The constant address addr as a value of the pointer type t at the node e: a "lit", or,
-  # where expressions are only typed (ctx.typeOnly, see typeOnlyEnv), a "symbol" node that
-  # is no constant, so that nothing is folded with it and addr is never read.
+  # where expressions are only typed (ctx.typeOnly, see typeOnlyEnv), a "symbol" node, a
+  # constant of unknown value (see isSymbol), so that addr is never read.
   addressAt =
     ctx: e: t: addr:
-    if ctx.typeOnly then node e "symbol" t { } else litAt e t addr;
+    if ctx.typeOnly then symbolAt e t else litAt e t addr;
 
-  # env for finding the type of an expression without reading any address: the type does
-  # not depend on the values of the addresses (constant folding keeps the type of what it
-  # folds), while the placement of the data, which gives the addresses, may depend on the
-  # type (an array length with sizeof, the sections of a switch). Only the type (and the
-  # shape that sizeof checks) of the result is used, never its value.
+  # env for finding the type of an expression without reading any address: the placement
+  # of the data, which gives the addresses, may depend on the type (an array length with
+  # sizeof, the sections of a switch). Constant folding keeps the type of what it folds,
+  # and a symbol folds like the address it stands for wherever the result does not
+  # depend on the address (see isSymbol), so a null pointer constant, which decides a type,
+  # is found as with the addresses. Only the type (and the shape that sizeof checks) of the
+  # result is used, never its value.
   typeOnlyEnv =
     env:
     env
@@ -1189,6 +1252,8 @@ let
       fail at "invalid argument type '${showType x.type}' to unary '${op}'"
     else if v.kind == "lit" then
       folded (if op == "-" then (n: -n) else (n: -n - 1))
+    else if isSymbol v then
+      v
     else
       node at (if op == "-" then "neg" else "bnot") t { expr = v; };
 
@@ -1226,6 +1291,8 @@ let
       fail at "arithmetic on a pointer to an incomplete type '${showType t}'"
     else if p.kind == "lit" && index.kind == "lit" then
       litAt at p.type ((if op == "+" then B.add else B.sub) p.value (index.value * size))
+    else if (isSymbol p || isSymbol index) && isConst p && isConst index then
+      symbolAt at p.type
     else
       node at "ptradd" p.type {
         inherit op index size;
@@ -1239,6 +1306,8 @@ let
       mkCast pt p
     else if p.kind == "lit" then
       litAt at pt (B.add p.value offset)
+    else if isSymbol p then
+      symbolAt at pt
     else
       node at "ptradd" pt {
         op = "+";
@@ -1368,12 +1437,26 @@ let
       unsupported e "side effect in a branch of '?:'"
     else if isIntLit c && isIntLit x && isIntLit y then
       (if c.value != 0 then x else y) // posOf e
+    else if isIntConst c && isIntConst x && isIntConst y then
+      foldSymbolCond e t c x y
     else
       node e "cond" t {
         cond = c;
         thenExpr = x;
         elseExpr = y;
       };
+
+  # `c ? x : y` (the node e, of type t) on integer constants of which one at least is a
+  # symbol (see isSymbol): the chosen branch when c is known, the value of both branches
+  # when they are equal, otherwise a symbol.
+  foldSymbolCond =
+    e: t: c: x: y:
+    if isIntLit c then
+      (if c.value != 0 then x else y) // posOf e
+    else if isIntLit x && isIntLit y && x.value == y.value then
+      x // posOf e
+    else
+      symbolAt e t;
 
   # Typing of the binary operator op (not && or ||) on the typed operands a and b; ctx
   # gives the sizes for pointer arithmetic (null where only integers occur).

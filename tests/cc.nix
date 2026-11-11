@@ -8700,6 +8700,53 @@ in
       true
     ]
   )
+  (t "cc run: in sizeof, an address folded to 0 whatever its value is a null pointer constant"
+    (
+      let
+        src = ''
+          struct s { int a; int b; } st;
+          int g;
+          int *p;
+          void (*fp)(void);
+          char a1[sizeof(1 ? &g : ((unsigned)&g & 0))];
+          int n1(void) { return sizeof(1 ? &g : ((unsigned)&g & 0)); }
+          int n2(void) { return sizeof(1 ? &g : (0 & (unsigned)&g)); }
+          int n3(void) { return sizeof(1 ? &g : ((unsigned)&g * 0)); }
+          int n4(void) { return sizeof(1 ? &g : ((unsigned)&g % 1)); }
+          int n5(void) { return sizeof(1 ? &g : (0 && (unsigned)&g)) + sizeof(1 ? &g : !(1 || (unsigned)&g)); }
+          int n6(void) { return sizeof(&g == ((unsigned)(&g + 1) & 0)) + sizeof(p != ((unsigned)&st.b * 0)); }
+          int n7(void) { return sizeof(1 ? &g : ((unsigned)&g ? 0 : 0)) + sizeof(1 ? &g : (-(unsigned)&g & 0)); }
+          int n8(void) { return sizeof(1 ? fp : (void *)((unsigned)&g & 0)); }
+          int n9(void) { static char b[sizeof(1 ? &g : ((unsigned)&g * 0))]; return sizeof a1 + sizeof b; }
+          int *full(void) { return 1 ? &g : ((unsigned)&g & 0); }
+        '';
+      in
+      map (f: dret src f [ ]) [
+        "n1"
+        "n2"
+        "n3"
+        "n4"
+        "n5"
+        "n6"
+        "n7"
+        "n8"
+        "n9"
+      ]
+      ++ [ (dret src "full" [ ] == (Cc.load src).__data.symbols.g) ]
+    )
+    [
+      4
+      4
+      4
+      4
+      8
+      8
+      8
+      4
+      8
+      true
+    ]
+  )
   (t "cc lex: a non-ASCII byte after a backslash throws"
     (map lexThrows [
       "x = \"\\${builtins.fromJSON ''"é"''}\";"

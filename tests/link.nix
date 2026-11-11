@@ -475,6 +475,17 @@ let
     link.externAddr = n: throw "externAddr ${n}";
   } (P.parse foldedSrc);
 
+  # sizeof operands where an imported address folds to a null pointer constant.
+  nullFoldSrc = ''
+    extern int x;
+    char a[sizeof(1 ? &x : ((unsigned)&x & 0))];
+    int f(void) { static char b[sizeof(1 ? &x : ((unsigned)&x * 0))]; return sizeof a + sizeof b; }
+  '';
+  nullFoldCheck = Ch.checkWith {
+    dataBase = base;
+    link.externAddr = n: throw "externAddr ${n}";
+  } (P.parse nullFoldSrc);
+
   # The shared header of two files, with an anonymous struct; a.c has tokens before it,
   # so the token indices of the struct differ between the units.
   boxFiles = {
@@ -1774,6 +1785,21 @@ in
       true
       8
       [ "x" ]
+    ]
+  )
+  (t "cc link 31: in sizeof, an imported address folded to 0 is a null pointer constant"
+    [
+      (ret (lk [
+        (u "a" nullFoldSrc)
+        (u "b" "int x;")
+      ]) "f" [ ])
+      (passes nullFoldCheck.layout)
+      nullFoldCheck.layout.size
+    ]
+    [
+      8
+      true
+      8
     ]
   )
 ]
