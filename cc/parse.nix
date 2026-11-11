@@ -31,10 +31,11 @@
 #                                    array; len is null for `[]`. `int m[2][3]` is an
 #                                    array of 2 arrays of 3 int. Parameters keep their
 #                                    array type (no adjustment to a pointer).
-#   { tag = "fn"; ret = <type>; params = [ <param> ]; variadic; }
+#   { tag = "fn"; ret = <type>; params = [ <param> ]; variadic; unspecified; }
 #                                    function; variadic tells that the parameter list
 #                                    ends in `...`. A parameter list `()` or `(void)`
-#                                    gives params = [ ]. Parameters keep their function
+#                                    gives params = [ ]; unspecified tells that it is
+#                                    `()` (no prototype). Parameters keep their function
 #                                    type, as they keep array types.
 #   { tag = "struct"; name; }        struct, by tag; an anonymous struct gets the name
 #                                    "(anonymous at <line>:<col>)" (of its keyword), or
@@ -66,14 +67,18 @@
 #
 # File-scope items (position: the declared name):
 #   { kind = "typedef"; name; type; }
-#   { kind = "proto"; name; ret = <type>; params = [ <param> ]; variadic; storage; }
+#   { kind = "proto"; name; ret = <type>; params = [ <param> ]; variadic; unspecified;
+#     storage; }
 #   { kind = "func"; name; ret = <type>; params = [ <param> ]; storage; body = <block>; }
 #   { kind = "global"; name; type; storage; init = <initializer or null>; }
 #       file-scope variable; storage is null, "static" or "extern".
 #   One declaration may declare several names (`int f(int), g(void);`); each becomes
 #   its own item. A declarator whose type is a function declares a proto or a func (ret,
-#   params and variadic are those of the function type), whose storage is null, "static"
-#   or "extern" as for variables. Defining a variadic function is unsupported.
+#   params, variadic and unspecified are those of the function type), whose storage is
+#   null, "static" or "extern" as for variables. Defining a variadic function is
+#   unsupported. The `()` of a definition specifies no parameters (a func has no
+#   unspecified); every other function declarator with `()` (of a proto, a function
+#   pointer type, a parameter or a type name) is unspecified.
 #
 # Tag definitions (position: the `struct`, `union` or `enum` keyword), at file scope as
 # items and at block scope in the decls of a "decl" statement. They come before the
@@ -124,7 +129,7 @@
 #       storage is null, "static" or "extern"; the initializer is an expression, or an
 #       "initlist" for a static one (for others it is unsupported). An extern one has
 #       no initializer.
-#   { kind = "proto"; name; ret; params; variadic; storage; }
+#   { kind = "proto"; name; ret; params; variadic; unspecified; storage; }
 #                                                         function declaration; storage
 #                                                         is null or "extern"
 #   { kind = "typedef"; name; type; }
@@ -339,7 +344,7 @@ let
           {
             tag = "fn";
             ret = t;
-            inherit (o) params variadic;
+            inherit (o) params variadic unspecified;
           };
     };
 
@@ -884,8 +889,9 @@ let
       # "abstract" (type names, no name). -> { name; nameTok; ops; i; } where ops are the
       # derivations in the order they apply to the specifier type (see declType), each
       # { op = "ptr"; tok; }, { op = "array"; len; tok; } (len an expression, or null for
-      # `[]`) or { op = "fn"; params; variadic; tok; }. A declarator in parentheses nests:
-      # the pointers before it and the suffixes after it apply first, then its own.
+      # `[]`) or { op = "fn"; params; variadic; unspecified; tok; }. A declarator in
+      # parentheses nests: the pointers before it and the suffixes after it apply first,
+      # then its own.
       declarator =
         tn: mode: i0:
         let
@@ -957,7 +963,7 @@ let
             else
               {
                 op = "fn";
-                inherit (fn) params variadic;
+                inherit (fn) params variadic unspecified;
                 tok = tok i;
               };
         in
@@ -972,25 +978,28 @@ let
             inherit i;
           };
 
-      # Parameter list after `(` -> { params; variadic; i; } with i after `)`.
+      # Parameter list after `(` -> { params; variadic; unspecified; i; } with i after `)`;
+      # unspecified tells that the list is `()`.
       paramList =
         tn: i:
         if isP i ")" then
           {
             params = [ ];
             variadic = false;
+            unspecified = true;
             i = i + 1;
           }
         else if isKw i "void" && isP (i + 1) ")" then
           {
             params = [ ];
             variadic = false;
+            unspecified = false;
             i = i + 2;
           }
         else if isP i "..." then
           fail (tok i) "ISO C requires a named parameter before '...'"
         else
-          paramsFrom tn i;
+          paramsFrom tn i // { unspecified = false; };
       paramsFrom =
         tn: i:
         let
@@ -1103,7 +1112,12 @@ let
         sp: d:
         mk d.nameTok "proto" {
           inherit (d) name;
-          inherit (d.type) params variadic ret;
+          inherit (d.type)
+            params
+            variadic
+            unspecified
+            ret
+            ;
           inherit (sp) storage;
         };
 

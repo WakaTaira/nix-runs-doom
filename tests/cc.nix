@@ -7193,6 +7193,88 @@ in
       ]
   ) (genList (_: true) 17))
 
+  # Declarations without a prototype: `()`
+  (t "cc parse: `()` marks a function declarator without a prototype, but not in a definition"
+    (
+      let
+        is = items "void a(); void b(void); void c() { } void (*p)(); int (*q)(int);";
+        fnOf = i: (elemAt is i).type.to;
+      in
+      [
+        (elemAt is 0).unspecified
+        (elemAt is 1).unspecified
+        ((elemAt is 2) ? unspecified)
+        (fnOf 3).unspecified
+        (fnOf 4).unspecified
+      ]
+    )
+    [
+      true
+      false
+      false
+      true
+      false
+    ]
+  )
+  (t "cc run: a declaration without a prototype agrees with a definition and keeps a prototype"
+    [
+      (ret "int r; void h(); void h(int *p) { *p = 7; } int f(void) { h(&r); return r; }" "f" [ ])
+      (ret "int k(int); int k(); int f(void) { return k(2); } int k(int x) { return x + 1; }" "f" [ ])
+      (ret "void tick(); int n; void tick() { n = n + 1; } int f(void) { tick(); tick(); return n; }" "f"
+        [ ]
+      )
+      (ret "void tick(); int n; int f(void) { tick(); return n; } void tick(void) { n = 4; }" "f" [ ])
+      (ret "void g(int x) { } int f(void) { void g(); g(1); return 2; }" "f" [ ])
+    ]
+    [
+      7
+      3
+      2
+      4
+      2
+    ]
+  )
+  (t
+    "cc compile: declarations without a prototype that conflict, and calls with arguments through them"
+    (map compileThrows [
+      "int f(void); int f(int);"
+      "int f(); void f(int x) { }"
+      "int f(); int f(int a, ...);"
+      "void g(); int f(void) { g(1); return 0; }"
+      "int f(void) { void g(); g(1); return 0; } void g(int x) { }"
+      "void g(); int f(void) { g(); return 0; } void g(int x) { }"
+    ])
+    (genList (_: true) 6)
+  )
+  (t "cc run: function pointers without a prototype agree with any non-variadic one"
+    [
+      (ret "int (*fp)(); int g(int (*q)(int)) { fp = q; return fp == q; }" "g" [ 5 ])
+      (ret "int g(int (*p)(int)) { int (*q)() = (int (*)())p; return q == p; }" "g" [ 5 ])
+      (ret "int (*r)(int); int g(int c, int (*a)(), int (*b)(int)) { r = c ? a : b; return r == a; }" "g"
+        [
+          1
+          6
+          7
+        ]
+      )
+      (ret "extern int (*fp)(); int (*fp)(int); int g(void) { return fp == 0; }" "g" [ ])
+    ]
+    [
+      1
+      1
+      1
+      1
+    ]
+  )
+  (t "cc compile: function pointers without a prototype still need the return type and no '...'" (map
+    compileThrows
+    [
+      "extern int (*fp)(); void (*fp)(int);"
+      "int g(void (*p)(int)) { int (*q)() = p; return 0; }"
+      "int g(int (*p)(int, ...)) { int (*q)() = p; return 0; }"
+    ]
+  ) (genList (_: true) 3))
+
   # Variadic prototypes
   (t "cc run: a variadic prototype is accepted" (ret
     "int printf(const char *fmt, ...); int one(void) { return 1; }"

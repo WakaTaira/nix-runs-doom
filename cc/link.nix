@@ -53,18 +53,21 @@
 #   <position>: unsupported: host function '<name>' with a 64-bit, floating-point or
 #     struct parameter or return value
 # Types of variables agree when they are compatible; functions when the return types, the
-# parameter types and variadic are. Types are compared by structure (C99 6.2.7, see
-# sameType): two arrays are compatible when their element types are and, if both have a
-# length, the lengths are equal (also inside pointers, members and parameters); two
-# structs, or two unions, are compatible when both have no tag or both have the same tag
-# and, when both are complete, they have the same size and alignment and the same members
-# (in order for a struct) with the same names, offsets, bit-field widths and compatible
-# types; two enums when their tags agree the same way and their enumerators have the same
-# names and values, and an enum and its compatible integer type. A type being compared is
-# taken to agree with itself on the way, so types that refer to themselves compare. The
-# anonymous struct of one unit can thus agree with an anonymous one of another, and a
-# block-scope struct with one of the same tag, but a struct with a tag never agrees with
-# one without (nor does an enum). Qualifiers are not compared (cc/parse.nix drops them).
+# parameter types and variadic are, or when the return types are and one of the two is
+# declared without a prototype (`()`, see cc/parse.nix) and the other is not variadic,
+# also for the function types inside other types. Types are compared by structure (C99
+# 6.2.7, see sameType): two arrays are compatible when their element types are and, if
+# both have a length, the lengths are equal (also inside pointers, members and
+# parameters); two structs, or two unions, are compatible when both have no tag or both
+# have the same tag and, when both are complete, they have the same size and alignment and
+# the same members (in order for a struct) with the same names, offsets, bit-field widths
+# and compatible types; two enums when their tags agree the same way and their enumerators
+# have the same names and values, and an enum and its compatible integer type. A type
+# being compared is taken to agree with itself on the way, so types that refer to
+# themselves compare. The anonymous struct of one unit can thus agree with an anonymous
+# one of another, and a block-scope struct with one of the same tag, but a struct with a
+# tag never agrees with one without (nor does an enum). Qualifiers are not compared
+# (cc/parse.nix drops them).
 # Each import is compared with the definition, or, without one (host, undefined), with
 # the first import of the name; a host function also needs nargs parameters and the same
 # variadic, and a host variable the size and alignment of host.data. A name that nothing
@@ -157,13 +160,23 @@ let
         genList (i: i) (length as)
       );
 
-  # The signatures (or function types) a and b: { ret; params; variadic; }.
+  # The signatures (or function types) a and b: { ret; params; variadic; unspecified; }.
+  # One without a prototype (unspecified) agrees with any that is not variadic.
   sameSig =
     da: db: seen: a: b:
     let
       s = sameType da db seen a.ret b.ret;
     in
-    if a.variadic != b.variadic || s == null then null else sameTypes da db s a.params b.params;
+    if s == null then
+      null
+    else if a.unspecified then
+      (if b.variadic then null else s)
+    else if b.unspecified then
+      (if a.variadic then null else s)
+    else if a.variadic != b.variadic then
+      null
+    else
+      sameTypes da db s a.params b.params;
 
   # Two enums agree when their tags do and their enumerators have the same names and
   # values; an enum and an integer type when that is the compatible integer type of the

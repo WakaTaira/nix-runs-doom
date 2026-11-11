@@ -18,14 +18,15 @@
 # one per name (sorted), at its first use; the type of a variable merges the declarations
 # of the unit (an array length when one gives it), with size and align from objectExtent.
 # For the linker's comparison of types between units, ltype is the type of a variable and
-# lsig = { ret; params; variadic; } the signature of a function with enum types kept
-# (linkType), and defs = { structs; enums; } the struct, union and enum definitions that
-# their tags name (scopeDefs, those of block-scope declarations included).
-# A block-scope extern that disagrees with another declaration of the name, calls of a
-# function through declarations that disagree, and a call to a function with internal
-# linkage that is declared but not defined stay errors (see linkUnit), raised when imports
-# or checked is evaluated. checked also has link = { funcs; }, the names of the imported
-# functions. Without link, imports are empty.
+# lsig = { ret; params; variadic; unspecified; } the signature of a function with enum
+# types kept (linkType), and defs = { structs; enums; } the struct, union and enum
+# definitions that their tags name (scopeDefs, those of block-scope declarations
+# included). A block-scope extern that disagrees with another declaration of the name,
+# calls of a function through declarations that disagree (a call without arguments through
+# a declaration without a prototype disagrees with a prototype that has parameters), and a
+# call to a function with internal linkage that is declared but not defined stay errors
+# (see linkUnit), raised when imports or checked is evaluated. checked also has
+# link = { funcs; }, the names of the imported functions. Without link, imports are empty.
 #
 # Errors are thrown as "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for
 # a preprocessed file or a named unit of a link, whose nodes have `file`), and as
@@ -37,31 +38,41 @@
 # when not given), an enum type is its compatible integer type (unsigned int when no
 # enumerator is negative, otherwise int, as in clang), and a function type has the
 # resolved types of its parameters (adjusted like those of a function: arrays and
-# functions to pointers) in params. A struct or union type stays a reference by tag to the
-# layouts of the struct and union definitions; the tag of a block-scope definition is
-# replaced by `<tag>@<line>:<col>` (of its keyword), which hides an outer one up to the end
-# of the block. Sizes, alignments and ranges follow clang's ilp32 ABI (char 1; short 2;
-# int, long, float and pointers 4; long long and double 8; a struct aligns to its most
-# aligned member and is padded to a multiple of that; a union has all its members at
-# offset 0; a packed struct or union aligns its members and itself to 1). Plain char is
-# unsigned, as in clang's RISC-V ABI (the scaffold's), but stays a type of its own.
+# functions to pointers) in params, and unspecified for one without a prototype (`()` in a
+# declaration that is not a definition, see cc/parse.nix). A struct or union type stays a
+# reference by tag to the layouts of the struct and union definitions; the tag of a
+# block-scope definition is replaced by `<tag>@<line>:<col>` (of its keyword), which hides
+# an outer one up to the end of the block. Sizes, alignments and ranges follow clang's
+# ilp32 ABI (char 1; short 2; int, long, float and pointers 4; long long and double 8; a
+# struct aligns to its most aligned member and is padded to a multiple of that; a union
+# has all its members at offset 0; a packed struct or union aligns its members and itself
+# to 1). Plain char is unsigned, as in clang's RISC-V ABI (the scaffold's), but stays a
+# type of its own.
 #
 # Bit-fields are supported in the form whose layout equals one of plain unsigned members
 # (see bitField): they are such members (unsigned char, unsigned short, or the declared
-# type for a width of 32), except that `&` and `sizeof` reject them. A function pointer is a
-# 4-byte pointer that can be copied, passed, returned, compared with == and != and tested;
-# taking a function's address, calling through a pointer and converting between a function
-# pointer and another type (but a null pointer constant) are unsupported. float and double
-# are known types with their size and alignment, but every floating-point value (and
-# variable, and the definition of or a call to a function with such a parameter or return
-# value) is unsupported, as are calls to a variadic function outside link mode (in link
-# mode a call gives at least the fixed arguments, and each variable argument is passed
-# after the default argument promotions; one of floating-point, struct or union type is
+# type for a width of 32), except that `&` and `sizeof` reject them. A function pointer is
+# a 4-byte pointer that can be copied, passed, returned, compared with == and != and
+# tested; taking a function's address, calling through a pointer and converting between a
+# function pointer and another type (but a null pointer constant) are unsupported. A
+# function type without a prototype agrees with any function type that is not variadic and
+# returns a type that agrees with its own (typesAgree): in the declarations of a variable,
+# and of a function, whose signature is then the composite one (a declaration without a
+# prototype keeps the parameters of an earlier one with a prototype), and where function
+# pointers are assigned, cast, compared and joined by ?:. A direct call with arguments to
+# a function whose signature in scope has no prototype is unsupported ("call with
+# arguments to the function '<name>' declared without a prototype"); one without arguments
+# is checked against the signature at the end of the unit. float and double are known
+# types with their size and alignment, but every floating-point value (and variable, and
+# the definition of or a call to a function with such a parameter or return value) is
+# unsupported, as are calls to a variadic function outside link mode (in link mode a call
+# gives at least the fixed arguments, and each variable argument is passed after the
+# default argument promotions; one of floating-point, struct or union type is
 # unsupported). __builtin_va_list (the va_list of stdarg.h, see cc/parse.nix) may only be
-# named in a typedef and in the parameters of a function declaration: a variable,
-# member, return type, cast or sizeof of a type with it (hasVaList: through pointers,
-# arrays and the return types of function types, not their parameters), the definition
-# of a function with such a parameter and a call to one are unsupported ('va_list').
+# named in a typedef and in the parameters of a function declaration: a variable, member,
+# return type, cast or sizeof of a type with it (hasVaList: through pointers, arrays and
+# the return types of function types, not their parameters), the definition of a function
+# with such a parameter and a call to one are unsupported ('va_list').
 #
 # Typed syntax tree
 # -----------------
@@ -193,6 +204,7 @@
 let
   B = import ../lib/bits.nix;
   inherit (builtins)
+    all
     any
     attrNames
     attrValues
@@ -533,6 +545,39 @@ let
   # A floating-point object: a float or double, or an array of them.
   hasFloat = t: isFloat t || isArray t && hasFloat t.of;
   isFnPtr = t: isPtr t && t.to.tag == "fn";
+  # Two resolved types of one unit agree: they are equal, but that a function type without
+  # a prototype (unspecified) agrees with any function type that is not variadic and whose
+  # return type agrees with its own, also through pointers, arrays (of the same length)
+  # and the return and parameter types of function types.
+  typesAgree =
+    a: b:
+    a == b
+    ||
+      a.tag == b.tag
+      && (
+        if isPtr a then
+          typesAgree a.to b.to
+        else if a.tag == "array" then
+          a.len == b.len && typesAgree a.of b.of
+        else if a.tag == "fn" then
+          fnTypesAgree a b
+        else
+          false
+      );
+  # Two function types (or signatures: { ret; params; variadic; unspecified; }) agree.
+  fnTypesAgree =
+    a: b:
+    typesAgree a.ret b.ret
+    && (
+      if a.unspecified then
+        !b.variadic
+      else if b.unspecified then
+        !a.variadic
+      else
+        a.variadic == b.variadic
+        && length a.params == length b.params
+        && all (i: typesAgree (elemAt a.params i) (elemAt b.params i)) (genList (i: i) (length a.params))
+    );
   # __builtin_va_list (cc/parse.nix), or a pointer to, an array of or a function returning
   # it: only a typedef and the parameters of a function declaration may have such a type
   # (the parameters of a function type are not looked into).
@@ -864,13 +909,14 @@ let
     if decides n.lhs || decides n.rhs then litAt n tInt (if isAnd then 0 else 1) else symbolAt n tInt;
 
   # Conversion as by assignment (also for arguments and return values). A function
-  # pointer converts only from its own type and from a null pointer constant.
+  # pointer converts only from a type that agrees with its own (typesAgree) and from a null
+  # pointer constant.
   assignConv =
     at: t: x:
     if isFnPtr t || isFnPtr x.type then
       (
-        if t == x.type then
-          x
+        if typesAgree t x.type then
+          mkCast t x
         else if isFnPtr t && isNullFn x then
           mkCast t x
         else
@@ -1014,8 +1060,10 @@ let
   # ---- References for the linker ----
   # In link mode (ctx.link), every statement node and file-scope object carries `uses`:
   # the references of its expressions to file-scope variables and functions, as
-  #   { use = "var"; name; line; col; ... }  or  { use = "func"; name; sig; line; col; ... }
-  # with the position of the identifier (posOf) and sig the signature in scope (env.funcs).
+  #   { use = "var"; name; line; col; ... }  or
+  #   { use = "func"; name; sig; nargs; line; col; ... }
+  # with the position of the identifier (posOf), sig the signature in scope (env.funcs) and
+  # nargs the number of arguments of the call.
   # They are found in the syntax tree with the names in scope where the expression is
   # checked, resolved as identExpr and callExpr resolve them, so that finding them reads no
   # address (constant folding of addresses decides the shape of the typed tree). Operands
@@ -1094,6 +1142,7 @@ let
             use = "func";
             inherit name;
             sig = env.funcs.${name};
+            nargs = length x.args;
             defs = scopeDefs env.ctx;
           }
           // at
@@ -1208,6 +1257,8 @@ let
       unsupported e "'va_list'"
     else if sigHasFloat f then
       unsupported e "call to the function '${e.name}' with a floating-point parameter or return value"
+    else if f.unspecified && m > 0 then
+      unsupported e "call with arguments to the function '${e.name}' declared without a prototype"
     else if (if f.variadic then m < n else n != m) then
       fail e "function '${e.name}' takes ${toString n} argument(s) but ${toString m} were given"
     else
@@ -1235,7 +1286,7 @@ let
       unsupported e "'va_list'"
     else if isFloat t then
       unsupported e "conversion to '${showType t}'"
-    else if (isFnPtr t || isFnPtr x.type) && t != x.type && !(isFnPtr t && isNullFn x) then
+    else if (isFnPtr t || isFnPtr x.type) && !typesAgree t x.type && !(isFnPtr t && isNullFn x) then
       unsupported e "cast from '${showType x.type}' to '${showType t}'"
     else
       mkCast t x;
@@ -1420,6 +1471,8 @@ let
           usual ta tb
         else if isPtr ta && ta == tb then
           ta
+        else if isFnPtr ta && isFnPtr tb && typesAgree ta tb then
+          (if ta.to.unspecified then tb else ta)
         else if isFnPtr ta && isNullFn b then
           ta
         else if isNullFn a && isFnPtr tb then
@@ -1562,7 +1615,7 @@ let
       invalid;
 
   # `==` and `!=` (anything else is unsupported) where an operand is a function pointer:
-  # with the same type, or with a null pointer constant.
+  # with a type that agrees (typesAgree), or with a null pointer constant.
   fnPtrCmp =
     at: op: a: b:
     let
@@ -1580,6 +1633,8 @@ let
       unsupported at "relational comparison of function pointers"
     else if ta == tb then
       cmp a b
+    else if typesAgree ta tb then
+      cmp a (mkCast ta b)
     else if isFnPtr ta && isNullFn b then
       cmp a (mkCast ta b)
     else if isNullFn a && isFnPtr tb then
@@ -2114,7 +2169,7 @@ let
         env
         // {
           funcs = env.funcs // {
-            ${name} = sig // {
+            ${name} = mergeSig prev sig // {
               defined = prev != null && prev.defined;
               linkage = linkageOf prev null;
             };
@@ -2446,7 +2501,7 @@ let
         tag = "fn";
         ret = resolve at t.ret;
         params = map (p: adjustParam (resolve p p.type)) t.params;
-        inherit (t) variadic;
+        inherit (t) variadic unspecified;
       }
     else
       t;
@@ -2536,6 +2591,7 @@ let
         in
         if isRecord t then unsupported p "${t.tag} parameter passed by value" else adjustParam t;
       variadic = item.variadic or false;
+      unspecified = item.unspecified or false;
     in
     if isArray ret then
       fail item "function cannot return array type '${showType ret}'"
@@ -2545,16 +2601,30 @@ let
       unsupported item "${ret.tag} returned by value"
     else
       {
-        inherit ret variadic;
+        inherit ret variadic unspecified;
         params = map param item.params;
         lsig = {
           ret = linkType env item item.ret;
           params = map (p: adjustParam (linkType env p p.type)) item.params;
-          inherit variadic;
+          inherit variadic unspecified;
         };
       };
 
-  sameSig = a: b: a.ret == b.ret && a.params == b.params && a.variadic == b.variadic;
+  # Two signatures (or function types) of one name agree (see typesAgree).
+  sameSig = fnTypesAgree;
+
+  # The signature of a function after its declaration with the signature sig, where prev
+  # (or null) is the one before: the composite type (C99 6.2.7p3) as far as a declaration
+  # without a prototype keeps the parameters of an earlier one with a prototype.
+  mergeSig =
+    prev: sig:
+    if prev != null && sig.unspecified then
+      removeAttrs prev [
+        "defined"
+        "linkage"
+      ]
+    else
+      sig;
 
   funcDef =
     env: sig: f:
@@ -2675,7 +2745,7 @@ let
       isDef = item.kind == "func";
       linkage = linkageOf prev item.storage;
       funcs = acc.funcs // {
-        ${item.name} = sig // {
+        ${item.name} = mergeSig prev sig // {
           defined = isDef || (prev != null && prev.defined);
           inherit linkage;
         };
@@ -3143,10 +3213,11 @@ let
 
   # ---- File-scope variables ----
 
-  # Two declarations of a variable agree: the same type, or arrays of the same element
-  # type where one has no length.
+  # Two declarations of a variable agree: types that agree (typesAgree), or arrays of the
+  # same element type where one has no length.
   compatible =
-    a: b: a == b || (isArray a && isArray b && a.of == b.of && (a.len == null || b.len == null));
+    a: b:
+    typesAgree a b || (isArray a && isArray b && a.of == b.of && (a.len == null || b.len == null));
 
   withGlobal =
     acc: name: g:
@@ -3701,6 +3772,13 @@ let
       }
       externs;
 
+  # Whether the call u (a "func" use) agrees with the signature s that the calls of its
+  # name must have: their signatures agree (sameSig), and a call without arguments through
+  # a declaration without a prototype is not one to a function with parameters (a call
+  # with arguments through one is unsupported, see callExpr).
+  callAgrees =
+    s: u: sameSig s u.sig && !(u.sig.unspecified && u.nargs == 0 && !s.unspecified && s.params != [ ]);
+
   # The link interface of the checked unit r in link mode, from its uses (see usesOf), which
   # reads no address. -> { checks; imports; } with checks true or the first error of the
   # unit that link mode finds this way: a block-scope extern whose type disagrees with
@@ -3731,7 +3809,7 @@ let
       # The signature that the calls of n must have: the file-scope one, or without one
       # that of the first call.
       sigFor = n: if fileFunc n != null then fileFunc n else (earliest funcUses.${n}).sig;
-      conflicts = filter (u: !sameSig (sigFor u.name) u.sig) (concatLists (attrValues funcUses));
+      conflicts = filter (u: !callAgrees (sigFor u.name) u) (concatLists (attrValues funcUses));
       # The type definitions of the unit at its end, with those in scope at a block-scope
       # declaration (local, or null at file scope): a tag of the file may be completed
       # after the block, and a block-scope tag has an internal name of its own.
@@ -3853,11 +3931,23 @@ let
       lu = linkUnit r;
       calls = collect (x: kindOf x == "call") (_: false) r.defs;
       undefinedCalls = filter (c: !(hasAttr c.name r.funcs) || !r.funcs.${c.name}.defined) calls;
-      # A call through a block-scope declaration that the file-scope one contradicts.
+      # A call through a block-scope declaration, or through one without a prototype, that
+      # the file-scope one contradicts.
       conflicts = filter (
         c:
+        let
+          f = r.funcs.${c.name};
+        in
         hasAttr c.name r.funcs
-        && (r.funcs.${c.name}.ret != c.type || r.funcs.${c.name}.params != map (a: a.type) c.args)
+        && (
+          !typesAgree f.ret c.type
+          ||
+            !f.unspecified
+            && (
+              length f.params != length c.args
+              || !all (i: typesAgree (elemAt f.params i) (elemAt c.args i).type) (genList (i: i) (length c.args))
+            )
+        )
       ) calls;
       externs = filter (n: !r.ctx.globals.${n}.defined) (attrNames r.ctx.globals);
       blockExterns = filter (x: externStatus r.ctx x != "ok") (

@@ -1861,4 +1861,51 @@ in
       8
     ]
   )
+  (t "cc link: a declaration without a prototype agrees with a non-variadic definition"
+    [
+      (ret (lk [
+        (u "a" "int h(); extern int (*hp)(); int get(int c) { if (c) return h(); return hp == 0; }")
+        (u "b" "int h(int a, int b) { return a + b; } int (*hp)(int, int);")
+      ]) "get" [ 0 ])
+      (ret
+        (lk [
+          (u "a" "int h(); extern int (*hp)(); int get(int c) { if (c) return h(); return hp == 0; }")
+          (u "b" "int h(int a, int b) { return a + b; } int (*hp)(int, int);")
+        ])
+        "h"
+        [
+          2
+          3
+        ]
+      )
+      (ret (lk [
+        (u "a" "void tick(); int ticks(void) { extern int n; tick(); tick(); return n; }")
+        (u "b" "int n; void tick() { n = n + 1; }")
+      ]) "ticks" [ ])
+      (passes (lk [ (u "a" "void DG_Init(); void start(void) { DG_Init(); }") ]))
+      (throws (lk [
+        (u "a" "int tick(); int f(void) { return tick(); }")
+        (u "b" "void tick() { }")
+      ]))
+      (throws (lk [
+        (u "a" "extern int (*hp)(); int f(void) { return hp == 0; }")
+        (u "b" "int (*hp)(int, ...);")
+      ]))
+      (throws (lk [
+        (u "a" "extern int (*hp)(); int f(void) { return hp == 0; }")
+        (u "b" "void (*hp)(int);")
+      ]))
+      (throws (lk [ (u "a" "void g(); int f(void) { g(1); return 0; } void g(int x) { }") ]))
+    ]
+    [
+      1
+      5
+      2
+      true
+      true
+      true
+      true
+      true
+    ]
+  )
 ]
