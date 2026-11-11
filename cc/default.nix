@@ -12,18 +12,20 @@
 #                                                  preprocess, then compileWith / loadWith
 #   readFrom [ <path> ]      : name -> string or null
 #                                                  a `read` over directories (see below)
-#   linkSources { units = [ { name; src; } ]; dataBase ? <default>; host ? <empty>;
+#   linkSources { units = [ { name; src; } ]; dataBase ? <default>; host ? host.default;
 #                 allowUndefined ? false; }
 #                            -> attrs              compile the preprocessed C sources and
 #                                                  link them (cc/link.nix): the functions
 #                                                  with external linkage, __data, __units
 #                                                  and __init (apply it to the memory first)
 #   linkFiles   { files; read; includePaths ? [ ]; defines ? { }; dataBase ? <default>;
-#                 host ? <empty>; allowUndefined ? false; }
+#                 host ? host.default; allowUndefined ? false; }
 #                            -> attrs              the same for the files (each preprocessed
 #                                                  as main; the unit is named by the file)
-# host (cc/host.nix) provides the functions and variables that the units use and do not
-# define; the default has none.
+#   host                     cc/host.nix: host.mk { wad ? null; } (the libc and the
+#                                                  doomgeneric platform layer), host.default
+#                                                  (= host.mk { }) and host.empty
+# host provides the functions and variables that the units use and do not define.
 # dataBase (default 0x00400000) is the address of the first file-scope variable. A
 # compiled function takes the memory trie (lib/mem.nix) and its arguments, and returns the
 # new memory, or { mem; ret; } when it returns a value. `__data.init` (see cc/emit.nix)
@@ -142,6 +144,7 @@ in
     linkSources
     linkFiles
     ;
+  host = Host;
 
   examples.spike = {
     src = spikeSrc;

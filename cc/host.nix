@@ -17,11 +17,114 @@
 # data are variables that the host provides: the linker places those that the units use
 # after the units' data, each aligned as given.
 #
-# default is the empty host (no function, no data).
-{
-  default = {
+# mk { wad ? null; } is the host of the libc (lib/libc.nix) and the doomgeneric platform
+# layer (scaffold/platform.nix), and default is mk { }. Its functions are the entries of
+# lib/hostcall.nix whose arguments and result are int, ptr or void, but the compiler
+# runtime (the names that start with `__`): printf, fprintf, snprintf and sscanf are
+# variadic and run vprintf, vfprintf, vsnprintf and vsscanf with va as the va_list, which
+# take the va_list as their last argument (a list; they can be called from C once va_list
+# values are supported). exit throws "libc: exit: <status>", so the output not yet shown
+# is lost. DG_DrawFrame records a frame from the variables DG_ScreenBuffer and colors in
+# symbols, and throws when called in a link without them. Its data is hostData of
+# lib/hostcall.nix (errno). The initial state is the world of lib/libc.nix mkWorld (the
+# heap from dataEnd rounded up to a multiple of 4096, errno at symbols.errno or not
+# written, and wad, { hex; size; } or null) with that of the platform layer and
+# count = 0 (the instruction count that DG_DrawFrame records).
+#
+# empty is the host without functions or data.
+let
+  H = import ../lib/hostcall.nix;
+  Libc = import ../lib/libc.nix;
+  inherit (builtins)
+    all
+    div
+    filter
+    hasAttr
+    length
+    listToAttrs
+    map
+    removeAttrs
+    substring
+    ;
+
+  empty = {
     funcs = _: { };
     data = [ ];
     init = _: { };
   };
+
+  # The entries of the host-call table that compiled C can call: no 64-bit or
+  # floating-point argument or result ("i64"), and no compiler runtime.
+  entries = filter (
+    e: all (t: t != "i64") (e.args ++ [ e.ret ]) && substring 0 2 e.name != "__"
+  ) H.table;
+
+  # The platform layer over the addresses in symbols (read only when a frame is read).
+  platformOf =
+    symbols:
+    import ../scaffold/platform.nix {
+      screenBufferAddr = symbols.DG_ScreenBuffer;
+      colorsAddr = symbols.colors;
+    };
+
+  # DG_DrawFrame of the platform layer p, which throws unless symbols has the variables
+  # that it reads.
+  drawFrame =
+    symbols: p: world: args:
+    if hasAttr "DG_ScreenBuffer" symbols && hasAttr "colors" symbols then
+      p.impls.DG_DrawFrame world args
+    else
+      throw "cc: host: DG_DrawFrame needs the variables DG_ScreenBuffer and colors";
+
+  # The call of the entry e (see the header).
+  callOf =
+    symbols: e:
+    let
+      p = platformOf symbols;
+    in
+    if e.variadic or false then
+      world: args: va:
+      Libc."v${e.name}" world (args ++ [ va ])
+    else if e.name == "DG_DrawFrame" then
+      drawFrame symbols p
+    else if hasAttr e.name p.impls then
+      p.impls.${e.name}
+    else
+      Libc.${e.name};
+
+  mk =
+    {
+      wad ? null,
+    }:
+    {
+      funcs =
+        { symbols, dataEnd }:
+        listToAttrs (
+          map (e: {
+            inherit (e) name;
+            value = {
+              nargs = length e.args;
+              variadic = e.variadic or false;
+              call = callOf symbols e;
+            };
+          }) entries
+        );
+      data = H.hostData;
+      init =
+        { symbols, dataEnd }:
+        removeAttrs (Libc.mkWorld {
+          mem = null;
+          heapBase = div (dataEnd + 4095) 4096 * 4096;
+          errnoAddr = symbols.errno or 0;
+          inherit wad;
+        }) [ "mem" ]
+        // (platformOf { }).world
+        // {
+          count = 0;
+        };
+    };
+in
+{
+  inherit empty mk;
+  default = mk { };
 }
