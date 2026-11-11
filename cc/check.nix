@@ -3,7 +3,8 @@
 # Entry point: checkWith { dataBase; } : unit node -> { funcs; data; }, with funcs the
 # typed function definitions in source order and data the placement of the file-scope
 # variables (see "Data" below); check uses defaultDataBase. Errors are thrown as
-# "cc: <line>:<col>: <message>", and as "cc: <line>:<col>: unsupported: <what>" for valid
+# "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for a preprocessed file,
+# whose nodes have `file`), and as "cc: <line>:<col>: unsupported: <what>" for valid
 # C outside the supported subset. `types` holds the type helpers shared with the emitter,
 # `collect` the tree walker, and `constExpr` / `noConstHooks` the integer constant
 # expression evaluator (see there).
@@ -170,7 +171,10 @@ let
     substring
     ;
 
-  fail = n: msg: throw "cc: ${toString n.line}:${toString n.col}: ${msg}";
+  # The position of a node: { line; col; }, with file for a preprocessed file.
+  posOf = n: if n ? file then { inherit (n) line col file; } else { inherit (n) line col; };
+  posText = n: "${if n ? file then "${n.file}:" else ""}${toString n.line}:${toString n.col}";
+  fail = n: msg: throw "cc: ${posText n}: ${msg}";
   unsupported = n: what: fail n "unsupported: ${what}";
 
   # Every attribute set x in a value (lists and attribute sets are searched) with pred x,
@@ -523,8 +527,8 @@ let
     at: kind: type: fields:
     {
       inherit kind type;
-      inherit (at) line col;
     }
+    // posOf at
     // fields;
 
   # Type of an integer literal: the first of the C candidate types that holds its value.
@@ -1105,7 +1109,7 @@ let
     if hasSideEffects e.thenExpr || hasSideEffects e.elseExpr then
       unsupported e "side effect in a branch of '?:'"
     else if isIntLit c && isIntLit x && isIntLit y then
-      (if c.value != 0 then x else y) // { inherit (e) line col; }
+      (if c.value != 0 then x else y) // posOf e
     else
       node e "cond" t {
         cond = c;
@@ -1352,7 +1356,7 @@ let
       let
         t = usual a.type b.type;
       in
-      mkCast t (if c.value != 0 then a else b) // { inherit (e) line col; };
+      mkCast t (if c.value != 0 then a else b) // posOf e;
 
   lvalue =
     env: e:
@@ -1469,8 +1473,8 @@ let
       at = fields: {
         node = {
           inherit kind;
-          inherit (n) line col;
         }
+        // posOf n
         // fields;
         inherit env;
       };
@@ -1525,10 +1529,10 @@ let
       r = stmt env n;
     in
     if r.node == null then
-      {
+      posOf n
+      // {
         kind = "block";
         items = [ ];
-        inherit (n) line col;
       }
     else
       r.node;
@@ -1608,10 +1612,10 @@ let
         if r.vars == [ ] && r.statics == [ ] && r.externs == [ ] then
           null
         else
-          {
+          posOf n
+          // {
             kind = "decl";
             inherit (r) vars;
-            inherit (n) line col;
           }
           // (if r.statics == [ ] then { } else { inherit (r) statics; })
           // (if r.externs == [ ] then { } else { inherit (r) externs; });
@@ -1665,10 +1669,9 @@ let
       else
         builtins.deepSeq t {
           env = bindObject env name type name;
-          extern = {
+          extern = posOf d // {
             inherit name;
             type = t;
-            inherit (d) line col;
           };
         }
     );
@@ -1702,11 +1705,10 @@ let
       else
         builtins.deepSeq t {
           env = env';
-          static = {
+          static = posOf d // {
             inherit sym;
             size = sizeOfT env.ctx t;
             align = alignOfT env.ctx t;
-            inherit (d) line col;
             writesAt = addr: if d.init == null then [ ] else initWrites env' t addr d.init;
           };
         }
@@ -1855,23 +1857,21 @@ let
             declStmt fenv n.init
         else
           {
-            node = {
+            node = posOf n.init // {
               kind = "expr";
               expr = valueOf fenv n.init;
-              inherit (n.init) line col;
             };
             env = fenv;
           };
       ienv = init.env;
     in
     {
-      node = {
+      node = posOf n // {
         kind = "for";
         init = init.node;
         cond = if n.cond == null then null else rv ienv n.cond;
         step = if n.step == null then null else valueOf ienv n.step;
         body = sub (inLoop ienv) n.body;
-        inherit (n) line col;
       };
       inherit env;
     };
@@ -1887,10 +1887,9 @@ let
       fail n "non-void function should return a value"
     else
       {
-        node = {
+        node = posOf n // {
           kind = "return";
           expr = if n.expr == null then null else assignConv n.expr env.ret (rv env n.expr);
-          inherit (n) line col;
         };
         inherit env;
       };
@@ -1936,7 +1935,7 @@ let
       unsupported body "'switch' body that is not a compound statement"
     else
       {
-        node = {
+        node = posOf n // {
           kind = "switch";
           cond = mkCast t c;
           inherit (r)
@@ -1945,7 +1944,6 @@ let
             cases
             default
             ;
-          inherit (n) line col;
         };
         inherit env;
       };
@@ -2143,18 +2141,14 @@ let
     if sigHasFloat sig then
       unsupported f "definition of a function with a floating-point parameter or return value"
     else
-      {
-        inherit (f)
-          name
-          line
-          col
-          ;
+      posOf f
+      // {
+        inherit (f) name;
         inherit (sig) ret;
         params = ps.vars;
-        body = {
+        body = posOf f.body // {
           kind = "block";
           inherit items;
-          inherit (f.body) line col;
         };
       };
 
@@ -2533,7 +2527,7 @@ let
             type = if keep then prev.type else t;
             defined = prev != null && prev.defined;
             hasInit = prev != null && prev.hasInit;
-            at = if prev != null then prev.at else { inherit (g) line col; };
+            at = if prev != null then prev.at else posOf g;
           }
         )
       else if prev != null && prev.defined then
@@ -2576,7 +2570,7 @@ let
           type = t;
           defined = true;
           hasInit = g.init != null;
-          at = acc.ctx.globals.${name}.at or { inherit (g) line col; };
+          at = acc.ctx.globals.${name}.at or (posOf g);
         }
         // {
           size = offset + sizeOfT acc.ctx t;
@@ -2584,7 +2578,7 @@ let
             {
               inherit name addr;
               end = addr + sizeOfT acc.ctx t;
-              at = { inherit (g) line col; };
+              at = posOf g;
               # The initializer sees the variable itself.
               writes = if g.init == null then [ ] else initWrites (fileEnv acc') t addr g.init;
             }
@@ -2838,7 +2832,7 @@ let
             name = o.sym;
             inherit addr;
             end = addr + o.size;
-            at = { inherit (o) line col; };
+            at = posOf o;
             writes = o.writesAt addr;
           }
         ];

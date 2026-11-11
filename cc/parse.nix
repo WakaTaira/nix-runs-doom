@@ -2,9 +2,11 @@
 # operators by precedence climbing). Typedef names are tracked per scope, so a
 # declaration and an expression or a cast are told apart as in C.
 #
-# Entry point: parse : string -> unit node. Errors are thrown as
+# Entry points: parse : string -> unit node, and parseTokenList : tokens -> unit node (for
+# the tokens of a preprocessed file, cc/lex.nix fromPp). Errors are thrown as
 # "cc: <line>:<col>: <message>", and as "cc: <line>:<col>: unsupported: <what>" for valid
-# C outside the supported subset.
+# C outside the supported subset; for a preprocessed file the position is
+# "<file>:<line>:<col>", and every node also has `file`.
 #
 # Syntax tree
 # -----------
@@ -29,7 +31,9 @@
 #                                    gives params = [ ]. Parameters keep their function
 #                                    type, as they keep array types.
 #   { tag = "struct"; name; }        struct, by tag; an anonymous struct gets the name
-#                                    "(anonymous at <line>:<col>)" (of its keyword)
+#                                    "(anonymous at <line>:<col>)" (of its keyword), or
+#                                    "(anonymous at <file>:<line>:<col> #<index>)" in
+#                                    a preprocessed file (index: of the keyword token)
 #   { tag = "union"; name; }         union, by tag (named like struct)
 #   { tag = "enum"; name; }          enum, by tag (named like struct)
 # `unsigned` and `unsigned int` are "uint"; `signed`, `signed int` and `int` are "int";
@@ -170,7 +174,9 @@ let
     map
     ;
 
-  fail = t: msg: throw "cc: ${toString t.line}:${toString t.col}: ${msg}";
+  # A token or node of a preprocessed file also has the file name (see cc/pp.nix).
+  posText = t: "${if t ? file then "${t.file}:" else ""}${toString t.line}:${toString t.col}";
+  fail = t: msg: throw "cc: ${posText t}: ${msg}";
   unsupported = t: what: fail t "unsupported: ${what}";
   describe = t: if t.kind == "eof" then "end of input" else "'${t.text}'";
 
@@ -180,6 +186,7 @@ let
       inherit kind;
       inherit (t) line col;
     }
+    // (if t ? file then { inherit (t) file; } else { })
     // fields;
 
   setOf =
@@ -652,7 +659,15 @@ let
           lead = attributes (i + 1);
           tagTok = tok lead.i;
           hasTag = tagTok.kind == "ident";
-          name = if hasTag then tagTok.text else "(anonymous at ${toString kw.line}:${toString kw.col})";
+          # In a preprocessed file, tokens of one macro expansion share a position, so the
+          # index of the keyword makes the name unique.
+          name =
+            if hasTag then
+              tagTok.text
+            else if kw ? file then
+              "(anonymous at ${posText kw} #${toString i})"
+            else
+              "(anonymous at ${toString kw.line}:${toString kw.col})";
           j = if hasTag then lead.i + 1 else lead.i;
           type = {
             tag = kw.text;
@@ -1841,13 +1856,16 @@ let
 
   # Every check above sits on the path that decides the next token index, so errors
   # surface while the items are iterated; deepSeq makes that independent of laziness.
-  parse =
-    src:
+  parse = src: parseTokenList (L.lex src);
+
+  # The unit node of a token list (as produced by cc/lex.nix lex or fromPp).
+  parseTokenList =
+    toks:
     let
-      unit = parseTokens (L.lex src);
+      unit = parseTokens toks;
     in
     builtins.deepSeq unit unit;
 in
 {
-  inherit parse;
+  inherit parse parseTokenList;
 }

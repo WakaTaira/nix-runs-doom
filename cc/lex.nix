@@ -38,6 +38,12 @@
 # with the literal), floating-point literals, and characters that start no C token.
 # Errors are thrown as "cc: <line>:<col>: <message>" ("unsupported: ..." for valid C
 # outside the subset).
+#
+# For the preprocessor (cc/pp.nix): ppLex cuts a file into preprocessing tokens (lines
+# spliced, comments removed, nothing checked), ppOne tells whether a text is one such
+# token (for `##`), and fromPp turns the preprocessed tokens into the tokens above (the
+# same checks and messages, at "<file>:<line>:<col>"; digraphs are unsupported), joining
+# adjacent string literals after expansion. Those tokens also have `file`.
 let
   A = import ../lib/ascii.nix;
   inherit (builtins)
@@ -59,12 +65,11 @@ let
     substring
     ;
 
-  fail =
-    line: col: msg:
-    throw "cc: ${toString line}:${toString col}: ${msg}";
-  unsupported =
-    line: col: what:
-    fail line col "unsupported: ${what}";
+  # pos is { line; col; } or, for a token of the preprocessor, { file; line; col; }.
+  posText =
+    pos: "${if pos ? file then "${pos.file}:" else ""}${toString pos.line}:${toString pos.col}";
+  fail = pos: msg: throw "cc: ${posText pos}: ${msg}";
+  unsupported = pos: what: fail pos "unsupported: ${what}";
 
   # Space, tab, newline, carriage return, form feed and vertical tab.
   ws = " \t\n\r" + fromJSON ''"\f\u000b"'';
@@ -217,7 +222,7 @@ let
 
   # A preprocessing number as an integer-literal token.
   intToken =
-    line: col: text:
+    pos: text:
     let
       hex = match "0[xX]([0-9A-Fa-f]+)([0-9A-Za-z_]*)" text;
       oct = match "0([0-7]+)([0-9A-Za-z_]*)" text;
@@ -252,22 +257,18 @@ let
         || (hex != null && match "0[xX][0-9A-Fa-f]*[pP].*" text != null);
     in
     if isFloat then
-      unsupported line col "floating-point literal '${text}'"
+      unsupported pos "floating-point literal '${text}'"
     else if hex == null && match "0[0-7]*[89].*" text != null then
-      fail line col "invalid digit in octal literal '${text}'"
+      fail pos "invalid digit in octal literal '${text}'"
     else if parts == null || suffix == null then
-      fail line col "invalid integer literal '${text}'"
+      fail pos "invalid integer literal '${text}'"
     else if tooLarge then
-      unsupported line col "integer literal too large '${text}'"
+      unsupported pos "integer literal too large '${text}'"
     else
-      {
+      pos
+      // {
         kind = "int";
-        inherit
-          text
-          line
-          col
-          value
-          ;
+        inherit text value;
         inherit (suffix) unsigned long;
       };
 
@@ -299,46 +300,46 @@ let
   # character. The capture groups give the escape and the text after the backslash.
   escapeRe = "(\\\\([0-7][0-7]?[0-7]?|x[0-9A-Fa-f]*|.))";
 
-  # Byte value of the escape e (the text after the backslash) in a `what` at line:col.
+  # Byte value of the escape e (the text after the backslash) in a `what` at pos.
   escapeValue =
-    line: col: what: e:
+    pos: what: e:
     let
       c = substring 0 1 e;
       digits = substring 1 (stringLength e - 1) e;
       oct = octValue e;
     in
     if hasAttr c octDigits then
-      (if oct > 255 then fail line col "octal escape sequence out of range" else oct)
+      (if oct > 255 then fail pos "octal escape sequence out of range" else oct)
     else if c == "x" then
       if digits == "" then
-        fail line col "\\x used with no following hex digits"
+        fail pos "\\x used with no following hex digits"
       else if stringLength (stripZeros digits) > 2 then
-        fail line col "hex escape sequence out of range"
+        fail pos "hex escape sequence out of range"
       else
         hexValue digits
     else if hasAttr e escapes then
       escapes.${e}
     else if !hasAttr e asciiCodes then
-      unsupported line col "non-ASCII byte in a ${what}"
+      unsupported pos "non-ASCII byte in a ${what}"
     else
-      fail line col "unknown escape sequence '\\${e}'";
+      fail pos "unknown escape sequence '\\${e}'";
 
-  # Byte values of the text s without escapes, in a `what` at line:col.
+  # Byte values of the text s without escapes, in a `what` at pos.
   plainBytes =
-    line: col: what: s:
-    genList (i: asciiCodes.${substring i 1 s} or (unsupported line col "non-ASCII byte in a ${what}")) (
+    pos: what: s:
+    genList (i: asciiCodes.${substring i 1 s} or (unsupported pos "non-ASCII byte in a ${what}")) (
       stringLength s
     );
 
-  # Byte values of the contents (between the quotes) of a `what` at line:col, forced so
-  # that its errors are raised with the token.
+  # Byte values of the contents (between the quotes) of a `what` at pos, forced so that
+  # its errors are raised with the token.
   decode =
-    line: col: what: body:
+    pos: what: body:
     let
       bytes = concatLists (
-        map (
-          p: if isList p then [ (escapeValue line col what (elemAt p 1)) ] else plainBytes line col what p
-        ) (split escapeRe body)
+        map (p: if isList p then [ (escapeValue pos what (elemAt p 1)) ] else plainBytes pos what p) (
+          split escapeRe body
+        )
       );
     in
     builtins.deepSeq bytes bytes;
@@ -348,85 +349,79 @@ let
 
   # A complete character literal ('...') as a token.
   charToken =
-    line: col: text:
+    pos: text:
     let
       body = contents text;
-      bytes = decode line col "character literal" body;
+      bytes = decode pos "character literal" body;
     in
     if body == "" then
-      fail line col "empty character literal"
+      fail pos "empty character literal"
     else if length bytes != 1 then
-      unsupported line col "character literal ${text}"
+      unsupported pos "character literal ${text}"
     else
-      {
+      pos
+      // {
         kind = "char";
-        inherit
-          text
-          line
-          col
-          ;
+        inherit text;
         value = head bytes;
       };
 
   # A complete string literal ("...") as a token.
   stringToken =
-    line: col: text:
+    pos: text:
     let
-      bytes = decode line col "string literal" (contents text);
+      bytes = decode pos "string literal" (contents text);
     in
-    builtins.seq bytes {
-      kind = "string";
-      inherit
-        text
-        line
-        col
-        bytes
-        ;
-    };
+    builtins.seq bytes (
+      pos
+      // {
+        kind = "string";
+        inherit text bytes;
+      }
+    );
 
-  # Classify the matched text at line:col: a token, or null for a comment.
+  # Classify the matched text at pos: a token, or null for a comment.
   classify =
-    line: col: text:
+    pos: text:
     let
       c = substring 0 1 text;
       c2 = substring 0 2 text;
     in
     if hasAttr c digits then
-      intToken line col text
+      intToken pos text
     else if match "[.][0-9].*" text != null then
-      unsupported line col "floating-point literal '${text}'"
+      unsupported pos "floating-point literal '${text}'"
     else if match "[LuU]'.*" text != null then
-      unsupported line col "prefixed character literal ${text}"
+      unsupported pos "prefixed character literal ${text}"
     else if match "(u8|[LuU])\".*" text != null then
-      unsupported line col "prefixed string literal"
+      unsupported pos "prefixed string literal"
     else if hasAttr c identStart then
-      {
+      pos
+      // {
         kind = if hasAttr text keywords then "keyword" else "ident";
-        inherit text line col;
+        inherit text;
       }
     else if text == "/*" then
-      fail line col "unterminated comment"
+      fail pos "unterminated comment"
     else if c2 == "/*" || c2 == "//" then
       null
     else if hasAttr text puncts then
-      {
+      pos
+      // {
         kind = "punct";
-        inherit text line col;
+        inherit text;
       }
     else if c == "#" then
-      unsupported line col "preprocessor directive"
+      unsupported pos "preprocessor directive"
     else if c == "\"" then
       if stringLength text > 1 then
-        stringToken line col text
+        stringToken pos text
       else
-        fail line col "missing terminating '\"' character"
+        fail pos "missing terminating '\"' character"
     else if c == "'" then
-      if stringLength text > 1 then
-        charToken line col text
-      else
-        fail line col "unterminated character literal"
+      if stringLength text > 1 then charToken pos text else fail pos "unterminated character literal"
     else
-      fail line col "unexpected character '${text}'";
+      fail pos "unexpected character '${text}'";
 
   # Position after the text s, starting at pos.
   advance =
@@ -469,7 +464,7 @@ let
           text = head (elemAt pieces (2 * i + 1));
         in
         {
-          tok = classify start.line start.col text;
+          tok = classify start text;
           end = advance start text;
         }
       ) n;
@@ -515,7 +510,257 @@ let
           first // { bytes = concatLists (genList (k: (elemAt toks (s + k)).bytes) (e - s)); };
     in
     genList joined m;
+  # ---- Preprocessing tokens (for cc/pp.nix) ----
+
+  # The regex of tokenRe for preprocessing tokens: a preprocessing number may contain
+  # `e+`, `e-`, `p+` and `p-`; `#`, `##` and the digraphs are one token each; a character
+  # or string literal without its closing quote runs to the end of its line.
+  ppRe =
+    "("
+    + "/\\*([^*]|\\*+[^*/])*\\*+/"
+    + "|//[^\n]*"
+    + "|/\\*"
+    + "|'([^'\\\n]|\\\\[^\n])*'?"
+    + "|[LuU]'([^'\\\n]|\\\\[^\n])*'"
+    + "|\"${stringBody}\"?"
+    + "|(u8|[LuU])\"${stringBody}\""
+    + "|[.]?[0-9]([0-9A-Za-z_.]|[eEpP][-+])*"
+    + "|[A-Za-z_][0-9A-Za-z_]*"
+    + "|%:%:|##|<:|:>|<%|%>|%:"
+    + "|>>=|<<=|\\.\\.\\.|->|\\+\\+|--|<<|>>|&&|\\|\\||[-*/%+&^|<>=!]="
+    + "|[^${ws}]"
+    + ")";
+
+  digraphs = setOf [
+    "<:"
+    ":>"
+    "<%"
+    "%>"
+    "%:"
+    "%:%:"
+  ];
+  ppPuncts =
+    puncts
+    // digraphs
+    // setOf [
+      "#"
+      "##"
+    ];
+
+  charRe = "[LuU]?'([^'\\\n]|\\\\[^\n])*'";
+  stringRe = "(u8|[LuU])?\"${stringBody}\"";
+
+  # The kind of the preprocessing token text (a match of ppRe): "number", "char",
+  # "string", "ident", "punct" or "other" (any other character, and a character or string
+  # literal without its closing quote); "comment" for a comment and "open" for the start
+  # of a comment without its end.
+  ppKind =
+    text:
+    let
+      c = substring 0 1 text;
+      c2 = substring 0 2 text;
+    in
+    if hasAttr c digits || match "[.][0-9].*" text != null then
+      "number"
+    else if match charRe text != null then
+      "char"
+    else if match stringRe text != null then
+      "string"
+    else if hasAttr c identStart then
+      "ident"
+    else if text == "/*" then
+      "open"
+    else if c2 == "/*" || c2 == "//" then
+      "comment"
+    else if hasAttr text ppPuncts then
+      "punct"
+    else
+      "other";
+
+  # Translation phase 2: each backslash-newline pair is removed, joining the lines.
+  # -> { text; pos; } with pos mapping a position in text to the position in src.
+  splice =
+    src:
+    let
+      text = builtins.replaceStrings [ "\\\n" ] [ "" ] src;
+      phys = filter builtins.isString (split "\n" src);
+      np = length phys;
+      segLen = p: stringLength (elemAt phys p) - 1;
+      cont = p: p + 1 < np && segLen p >= 0 && substring (segLen p) 1 (elemAt phys p) == "\\";
+      # The physical line (0-based) where each line of text starts.
+      starts = filter (p: p == 0 || !cont (p - 1)) (genList (p: p) np);
+      nl = length starts;
+      pos =
+        q:
+        let
+          p0 = elemAt starts (q.line - 1);
+          segs = (if q.line < nl then elemAt starts q.line else np) - p0;
+          r =
+            foldl'
+              (
+                acc: _:
+                if cont acc.p && acc.col > segLen acc.p then
+                  {
+                    p = acc.p + 1;
+                    col = acc.col - segLen acc.p;
+                  }
+                else
+                  acc
+              )
+              {
+                p = p0;
+                inherit (q) col;
+              }
+              (genList (k: k) segs);
+        in
+        {
+          line = r.p + 1;
+          inherit (r) col;
+        };
+    in
+    if text == src then
+      {
+        inherit text;
+        pos = q: q;
+      }
+    else
+      { inherit text pos; };
+
+  # Translation phases 1 to 3 of the file named file with contents src: lines spliced,
+  # comments removed, preprocessing tokens. -> { toks; end; } with end the position after
+  # the last character. A token is { kind; text; file; line; col; ws; bol; } (kind as in
+  # ppKind, without comments; ws tells that whitespace or a comment precedes it, bol that
+  # it is the first token of a line). No token is checked here except that a comment must
+  # end, so the text of a skipped group may be anything else.
+  ppLex =
+    file: src:
+    let
+      sp = splice src;
+      pieces = split ppRe sp.text;
+      n = (length pieces - 1) / 2;
+      first = {
+        end = {
+          line = 1;
+          col = 1;
+        };
+        nl = true;
+        ws = false;
+      };
+      # Element i: the i-th match, after the whitespace that precedes it. nl and ws carry
+      # a newline and whitespace across comments to the next token.
+      raw = genList (
+        i:
+        let
+          prev = if i == 0 then first else elemAt raw (i - 1);
+          gap = elemAt pieces (2 * i);
+          start = advance prev.end gap;
+          text = head (elemAt pieces (2 * i + 1));
+          kind = ppKind text;
+          nl = prev.nl || start.line != prev.end.line;
+          ws = prev.ws || gap != "";
+          at = sp.pos start // {
+            inherit file;
+          };
+        in
+        if kind == "open" then
+          fail at "unterminated comment"
+        else
+          {
+            end = advance start text;
+            nl = kind == "comment" && nl;
+            ws = kind == "comment";
+            tok =
+              if kind == "comment" then
+                null
+              else
+                at
+                // {
+                  inherit kind text ws;
+                  bol = nl;
+                };
+          }
+      ) n;
+      forced = foldl' (acc: r: builtins.seq r.tok (builtins.seq r.end acc)) null raw;
+      endPos = advance (if n == 0 then first.end else (elemAt raw (n - 1)).end) (elemAt pieces (2 * n));
+    in
+    builtins.seq forced {
+      toks = map (r: r.tok) (filter (r: r.tok != null) raw);
+      end = sp.pos endPos // {
+        inherit file;
+      };
+    };
+
+  # The kind (as in ppKind) of text if it is exactly one valid preprocessing token, or null
+  # (for the `##` operator).
+  ppOne =
+    text:
+    let
+      pieces = split ppRe text;
+      kind = ppKind (head (elemAt pieces 1));
+    in
+    if
+      length pieces != 3
+      || head pieces != ""
+      || elemAt pieces 2 != ""
+      || kind == "comment"
+      || kind == "open"
+      || (kind == "other" && stringLength text > 1)
+    then
+      null
+    else
+      kind;
+
+  # The token of the compiler for the preprocessing token t (translation phase 7, before
+  # string literals are joined): literals are checked and their values computed, and the
+  # tokens that the lexer rejects are rejected with its messages.
+  fromPpToken =
+    t:
+    let
+      pos = {
+        inherit (t) file line col;
+      };
+      c = substring 0 1 t.text;
+    in
+    if t.kind == "punct" && hasAttr t.text digraphs then
+      unsupported pos "digraph '${t.text}'"
+    else if t.text == "#" || t.text == "##" then
+      fail pos "stray '${t.text}' in program"
+    else if t.kind == "other" && c == "\"" then
+      fail pos "missing terminating '\"' character"
+    else if t.kind == "other" && c == "'" then
+      fail pos "unterminated character literal"
+    else
+      classify pos t.text;
+
+  # The tokens of the compiler for the preprocessed tokens toks, adjacent string literals
+  # joined, ending in an "eof" token at end ({ file; line; col; }). Converted in order, so
+  # the first error wins.
+  fromPp =
+    toks: end:
+    let
+      conv = map fromPpToken toks;
+      forced = foldl' (acc: t: builtins.seq t acc) null conv;
+    in
+    builtins.seq forced (
+      joinStrings conv
+      ++ [
+        (
+          end
+          // {
+            kind = "eof";
+            text = "";
+          }
+        )
+      ]
+    );
 in
 {
-  inherit lex;
+  inherit
+    lex
+    ppLex
+    ppOne
+    fromPpToken
+    fromPp
+    digraphs
+    ;
 }
