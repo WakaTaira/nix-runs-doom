@@ -16,9 +16,10 @@
 #               funcs = [ { name; ret; params; variadic; line; col; file?; } ]; }
 # one per name (sorted), at its first use; the type of a variable merges the declarations
 # of the unit (an array length when one gives it), with size and align from objectExtent.
-# A block-scope extern that disagrees with another declaration of the name, and a call to a
-# function with internal linkage that is declared but not defined, stay errors (see
-# linkUnit), raised when imports or checked is evaluated. checked also has
+# A block-scope extern that disagrees with another declaration of the name, calls of a
+# function through declarations that disagree, and a call to a function with internal
+# linkage that is declared but not defined stay errors (see linkUnit), raised when imports
+# or checked is evaluated. checked also has
 # link = { funcs; }, the names of the imported functions. Without link, imports are empty.
 # Errors are thrown as
 # "cc: <line>:<col>: <message>" ("cc: <file>:<line>:<col>: ..." for a preprocessed file,
@@ -3257,7 +3258,8 @@ let
   # reads no address. -> { checks; imports; } with checks true or the first error of the
   # unit that link mode finds this way: a block-scope extern whose type disagrees with
   # another declaration of the name, a call through a block-scope declaration that the
-  # file-scope one contradicts, and a call to a function with internal linkage that is
+  # file-scope one (or, without one, that of the first call) contradicts, and a call to a
+  # function with internal linkage that is
   # declared but not defined. imports (see checkWith) are the variables used and not
   # defined, and the functions called and not defined that have external linkage.
   linkUnit =
@@ -3279,9 +3281,10 @@ let
           !(f != null && f.defined) && (if f == null then "external" else f.linkage) == linkage
         ) (attrNames funcUses);
       internalCalls = concatMap (n: funcUses.${n}) (undefinedFuncs "internal");
-      conflicts = filter (u: fileFunc u.name != null && !sameSig (fileFunc u.name) u.sig) (
-        concatLists (attrValues funcUses)
-      );
+      # The signature that the calls of n must have: the file-scope one, or without one
+      # that of the first call.
+      sigFor = n: if fileFunc n != null then fileFunc n else (earliest funcUses.${n}).sig;
+      conflicts = filter (u: !sameSig (sigFor u.name) u.sig) (concatLists (attrValues funcUses));
       importVar =
         n:
         let
@@ -3296,15 +3299,11 @@ let
         // useAt (earliest varUses.${n});
       importFunc =
         n:
-        let
-          u = earliest funcUses.${n};
-          sig = if fileFunc n != null then fileFunc n else u.sig;
-        in
         {
           name = n;
-          inherit (sig) ret params variadic;
+          inherit (sigFor n) ret params variadic;
         }
-        // useAt u;
+        // useAt (earliest funcUses.${n});
     in
     {
       checks =

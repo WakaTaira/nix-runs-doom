@@ -946,6 +946,9 @@ in
           (u "a" "int fa(void) { extern int x; return x; } int fb(void) { extern char x; return x; }")
         ]))
         (throws (lkU [ (u "a" "void fa(void) { extern int x; } void fb(void) { extern char x; }") ]))
+        (throws (lkU [
+          (u "a" "int fa(void) { int h(int); return h(1); } int fb(void) { int h(char); return h(1); }")
+        ]))
         (passes (lkU [
           (u "a" "int fa(void) { extern int x; return x; } int fb(void) { extern int x; return x; }")
         ]))
@@ -965,6 +968,7 @@ in
       ]
     )
     [
+      true
       true
       true
       true
