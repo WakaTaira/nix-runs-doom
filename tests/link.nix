@@ -6,6 +6,7 @@
 let
   Cc = import ../cc;
   Ch = import ../cc/check.nix;
+  H = import ../lib/hostcall.nix;
   Lk = import ../cc/link.nix;
   P = import ../cc/parse.nix;
   M = import ../lib/mem.nix;
@@ -14,6 +15,7 @@ let
     attrNames
     concatStringsSep
     deepSeq
+    elemAt
     filter
     foldl'
     genList
@@ -35,11 +37,14 @@ let
   lkWith = args: units: Cc.linkSources (args // { inherit units; });
   throws = x: !(tryEval (deepSeq x x)).success;
   passes = x: (tryEval (deepSeq x x)).success;
+  compileThrows = src: !(tryEval (Cc.compile src)).success;
   contains = needle: s: builtins.replaceStrings [ needle ] [ "" ] s != s;
 
   # The return values of the calls ([ fn arg ... ]) of the linked program l, made in order
   # on one memory, starting from __init; null for a void function.
-  runCalls =
+  runCalls = l: calls: (afterCalls l calls).rets;
+  # The same calls -> { mem; rets; } with mem the memory after them.
+  afterCalls =
     l: calls:
     let
       step =
@@ -58,10 +63,12 @@ let
             rets = st.rets ++ [ null ];
           };
     in
-    (foldl' step {
+    foldl' step {
       mem = l.__init M.empty;
       rets = [ ];
-    } calls).rets;
+    } calls;
+  # The output (stdout and stderr) of the default host after the calls.
+  outOf = l: calls: (afterCalls l calls).mem.host.out;
   ret =
     l: fn: args:
     head (runCalls l [ ([ fn ] ++ args) ]);
@@ -219,7 +226,9 @@ let
           nargs = 1;
           variadic = true;
           call = w: args: va: {
-            world = w;
+            world = w // {
+              seen = va;
+            };
             ret = head args + length va;
           };
         };
@@ -267,6 +276,164 @@ let
     ret (withHost [
       (u "a" "${rt} echo(int); int f(void) { return echo(${arg}); }")
     ]) "f" [ ];
+
+  # ---- The default host ----
+
+  # The C files srcs (by name) linked with the default host, with the headers of
+  # lib/hostcall.nix (ccHeaderFiles) for #include <...>.
+  withStd = withStdWith { };
+  withStdWith =
+    args: srcs:
+    Cc.linkFiles (
+      args
+      // {
+        files = attrNames srcs;
+        read = n: srcs.${n} or H.ccHeaderFiles.${n} or null;
+        includePaths = [ "" ];
+      }
+    );
+  # The output of the function run of a single file src linked with the default host.
+  printed = src: outOf (withStd { "a.c" = src; }) [ [ "run" ] ];
+
+  libcUse = withStd {
+    "a.c" = ''
+      #include <string.h>
+      #include <stdlib.h>
+      #include <ctype.h>
+      #include <stdio.h>
+      #include <errno.h>
+      char buf[8];
+      int t_strlen(void) { return strlen("hello"); }
+      int t_strcmp(void) { return strcmp("abc", "abd"); }
+      int t_abs(void) { return abs(-5); }
+      int t_toupper(void) { return toupper('q'); }
+      int t_memcpy(void) { memcpy(buf, "xyz", 4); return buf[1]; }
+      int t_memset(void) { memset(buf, -1, 4); return buf[0] + buf[3] + (buf[4] == 0); }
+      void *m1(void) { return malloc(16); }
+      void say(void) { puts("hi"); putchar('!'); }
+      int nofile(void) { return (fopen("nope.txt", "r") == 0) * 10 + errno; }
+    '';
+    "b.c" = ''
+      #include <stdlib.h>
+      void *m2(void) { return malloc(16); }
+    '';
+  };
+
+  platformSrc = ''
+    void DG_SleepMs(unsigned ms);
+    unsigned DG_GetTicksMs(void);
+    void DG_DrawFrame(void);
+    unsigned char *DG_ScreenBuffer;
+    unsigned colors[256];
+    unsigned char screen[64000];
+    unsigned ticks(void) { DG_SleepMs(30); DG_SleepMs(12); return DG_GetTicksMs(); }
+    void draw(void) {
+      DG_ScreenBuffer = screen;
+      screen[0] = 7;
+      screen[63999] = 9;
+      colors[7] = 0x00112233;
+      DG_DrawFrame();
+    }
+  '';
+  platform = lk [ (u "a" platformSrc) ];
+  drawn = (afterCalls platform [ [ "draw" ] ]).mem.host;
+
+  # The host state across bulk writes (storeRun and storeStride).
+  bulk = lk [
+    (u "a" ''
+      void *malloc(unsigned n);
+      int putchar(int c);
+      char small[64];
+      char big[4096];
+      void *ma(void) { return malloc(4); }
+      void pa(void) { putchar('a'); }
+      void run(int n) { for (int i = 0; i < n; i++) small[i] = i; }
+      void stride(int n) { int j = 0; for (int i = 0; i < n; i++) { big[j] = 1; j += 320; } }
+      void pb(void) { putchar('b'); }
+    '')
+  ];
+  bulkRun = afterCalls bulk [
+    [ "ma" ]
+    [ "pa" ]
+    [
+      "run"
+      64
+    ]
+    [
+      "stride"
+      12
+    ]
+    [ "pb" ]
+    [ "ma" ]
+  ];
+
+  exiting = lk [
+    (u "a" ''
+      void exit(int status);
+      int f(int x) { if (x) exit(3); return 2; }
+    '')
+  ];
+
+  # ---- Variadic calls ----
+
+  # The output of printf over the formats and arguments of run in a single unit.
+  printfSrc = body: ''
+    #include <stdio.h>
+    ${body}
+  '';
+  formats = printed (printfSrc ''
+    char name[8] = "abc";
+    void run(void) {
+      long long big = 7;
+      unsigned u = 3000000000u;
+      char c = 200;
+      signed char sc = -3;
+      short s = -300;
+      unsigned short us = 65535;
+      big = big * 1000000000;
+      printf("plain\n");
+      printf("%lld %lld %llx %lld %llx\n", 5LL, -5LL, 0x123456789LL, big, -1LL);
+      printf("%d %u %x\n", -1, -1, -1);
+      printf("%u %d\n", u, u);
+      printf("%d %d %d %d\n", c, sc, s, us);
+      printf("%p %s|%s %c%%\n", (void *)0x1234, "lit", name, 'Z');
+      printf("[%5d][%-4d][%05d][%.3d][%3s][%.2s]\n", 42, 7, -42, 5, "ab", "xyz");
+    }
+  '');
+
+  order = printed (printfSrc ''
+    int i = 1;
+    int f(void) { return i * 10; }
+    void run(void) {
+      int k = 5;
+      printf("%d %d\n", i++, f());
+      printf("%d %d %d\n", k++, k++, k);
+      i = 9;
+      printf("%d\n", i);
+    }
+  '');
+
+  strio = withStd {
+    "a.c" = ''
+      #include <stdio.h>
+      char b[8];
+      int a;
+      unsigned x;
+      int sn(void) { return snprintf(b, 4, "%d", 12345); }
+      void err(void) { fprintf(stderr, "e%d;", 1); fprintf(stdout, "o%d;", 2); }
+      int sc(void) { return sscanf(" 17 ab", "%d %x", &a, &x); }
+      int ra(void) { return a; }
+      unsigned rx(void) { return x; }
+    '';
+  };
+
+  loops = withStd {
+    "a.c" = ''
+      #include <stdio.h>
+      void run(void) { for (int i = 0; i < 3; i++) printf("%d,", i); }
+      int ok(int x) { return x && printf("y") > 0; }
+    '';
+  };
 
   # A unit whose layout uses a variable it does not define, through folded constants and
   # an initializer.
@@ -977,6 +1144,309 @@ in
       true
       true
       true
+    ]
+  )
+  (t "cc link 18: libc functions of the default host"
+    [
+      (runCalls libcUse [
+        [ "t_strlen" ]
+        [ "t_strcmp" ]
+        [ "t_abs" ]
+        [ "t_toupper" ]
+        [ "t_memcpy" ]
+        [ "t_memset" ]
+        [ "nofile" ]
+      ])
+      (
+        let
+          r = runCalls libcUse [
+            [ "m1" ]
+            [ "m2" ]
+            [ "m1" ]
+          ];
+          a = elemAt r 0;
+          b = elemAt r 1;
+          c = elemAt r 2;
+        in
+        [
+          (a >= libcUse.__data.base + libcUse.__data.size)
+          (b > a)
+          (c > b)
+        ]
+      )
+      (outOf libcUse [
+        [ "say" ]
+        [ "say" ]
+      ])
+    ]
+    [
+      [
+        5
+        (-1)
+        5
+        81
+        121
+        511
+        12
+      ]
+      [
+        true
+        true
+        true
+      ]
+      "hi\n!hi\n!"
+    ]
+  )
+  (t "cc link 19: the platform layer: the clock and DG_DrawFrame over DG_ScreenBuffer and colors"
+    [
+      (ret platform "ticks" [ ])
+      drawn.frameCount
+      (map (elemAt (head drawn.frames).screen) [
+        0
+        1
+        63999
+      ])
+      (elemAt (head drawn.frames).palette 7)
+      (length (head drawn.frames).screen)
+      (throws
+        (afterCalls (lk [
+          (u "a" "void DG_DrawFrame(void); void draw(void) { DG_DrawFrame(); }")
+        ]) [ [ "draw" ] ]).mem
+      )
+      (passes (lk [ (u "a" "void DG_DrawFrame(void); void draw(void) { DG_DrawFrame(); }") ]).__data)
+    ]
+    [
+      42
+      1
+      [
+        7
+        0
+        9
+      ]
+      {
+        r = 17;
+        g = 34;
+        b = 51;
+      }
+      64000
+      true
+      true
+    ]
+  )
+  (t "cc link 20: the host state stays across bulk writes (storeRun and storeStride)"
+    [
+      (contains "M.storeRun" bulk.__units.a.nix)
+      (contains "M.storeStride" bulk.__units.a.nix)
+      bulkRun.mem.host.out
+      (elemAt bulkRun.rets 5 - head bulkRun.rets)
+      (M.loadByte bulkRun.mem (bulk.__data.symbols.small + 63))
+      (M.loadByte bulkRun.mem (bulk.__data.symbols.big + 11 * 320))
+    ]
+    [
+      true
+      true
+      "ab"
+      16
+      63
+      1
+    ]
+  )
+  (t "cc link 21: errno is placed when a unit uses it"
+    [
+      (hasAttr "errno" libcUse.__data.symbols)
+      ((libcUse.__init M.empty).host.errnoAddr == libcUse.__data.symbols.errno)
+      (hasAttr "errno" bulk.__data.symbols)
+      (bulk.__init M.empty).host.errnoAddr
+    ]
+    [
+      true
+      true
+      false
+      0
+    ]
+  )
+  (t "cc link 22: exit throws where it is reached and nowhere else"
+    [
+      (ret exiting "f" [ 0 ])
+      (passes (exiting.f (exiting.__init M.empty) 0))
+      (throws (exiting.f (exiting.__init M.empty) 1))
+    ]
+    [
+      2
+      true
+      true
+    ]
+  )
+  (t "cc link 23: C calls a variadic function of a host given by the caller"
+    (
+      let
+        l = withHost [
+          (u "a" ''
+            int vh(int, ...);
+            int none(void) { return vh(10); }
+            int some(void) { char c = 3; return vh(10, 1, -2, c); }
+          '')
+        ];
+        r = l.some (l.__init M.empty);
+      in
+      [
+        (ret l "none" [ ])
+        r.ret
+        r.mem.host.seen
+      ]
+    )
+    [
+      10
+      13
+      [
+        1
+        (-2)
+        3
+      ]
+    ]
+  )
+  (t "cc link 24: printf conversions of the variable arguments" formats (
+    concatStringsSep "\n" [
+      "plain"
+      "5 -5 123456789 7000000000 ffffffffffffffff"
+      "-1 4294967295 ffffffff"
+      "3000000000 -1294967296"
+      "200 -3 -300 65535"
+      "0x1234 lit|abc Z%"
+      "[   42][7   ][-0042][005][ ab][xy]"
+      ""
+    ]
+  ))
+  (t "cc link 25: the arguments are evaluated left to right with their side effects" order
+    "1 20\n5 6 7\n9\n"
+  )
+  (t "cc link 26: snprintf, fprintf to stderr and stdout, sscanf into globals"
+    [
+      (
+        let
+          st = afterCalls strio [ [ "sn" ] ];
+        in
+        [
+          (head st.rets)
+          (map (i: M.loadByte st.mem (strio.__data.symbols.b + i)) [
+            0
+            1
+            2
+            3
+          ])
+        ]
+      )
+      (outOf strio [ [ "err" ] ])
+      (runCalls strio [
+        [ "sc" ]
+        [ "ra" ]
+        [ "rx" ]
+      ])
+    ]
+    [
+      [
+        5
+        [
+          49
+          50
+          51
+          0
+        ]
+      ]
+      "e1;o2;"
+      [
+        2
+        17
+        171
+      ]
+    ]
+  )
+  (t "cc link 27: variadic calls in a loop and right of &&"
+    [
+      (outOf loops [ [ "run" ] ])
+      (runCalls loops [
+        [
+          "ok"
+          0
+        ]
+        [
+          "ok"
+          1
+        ]
+      ])
+      (outOf loops [
+        [
+          "ok"
+          0
+        ]
+        [
+          "ok"
+          1
+        ]
+      ])
+    ]
+    [
+      "0,1,2,"
+      [
+        0
+        1
+      ]
+      "y"
+    ]
+  )
+  (t "cc link 28: a format that needs more arguments than given throws"
+    [
+      (throws (printed (printfSrc ''void run(void) { printf("%d %d", 1); }'')))
+      (throws (
+        outOf (withStd {
+          "a.c" = ''
+            #include <stdio.h>
+            int a;
+            void run(void) { sscanf("1 2", "%d %d", &a); }
+          '';
+        }) [ [ "run" ] ]
+      ))
+      (printed (printfSrc ''void run(void) { printf("%d", 1, 2); }''))
+    ]
+    [
+      true
+      true
+      "1"
+    ]
+  )
+  (t "cc link 29: variadic calls that stop: too few fixed arguments, floating-point, va_list" (
+    map (s: throws (withStdWith { allowUndefined = true; } { "a.c" = printfSrc s; })) [
+      "void run(void) { printf(); }"
+      "int sn(char *b) { return snprintf(b, 4); }"
+      "extern double d; void run(void) { printf(\"%f\", d); }"
+      "struct s { int a; } g; void run(void) { printf(\"%d\", g); }"
+      "void run(void) { vprintf(\"x\", (va_list)0); }"
+      "void run(va_list ap) { vprintf(\"x\", ap); }"
+      "int mine(int a, ...) { return a; }"
+    ]
+    ++ [
+      (compileThrows ''int printf(const char *, ...); int f(void) { return printf("x"); }'')
+      (passes (
+        withStdWith { allowUndefined = true; } {
+          "a.c" = printfSrc "extern int d; void run(void) { printf(\"%d\", d); }";
+        }
+      ))
+    ]
+  ) (genList (_: true) 9))
+  (t "cc link 34: a host function declared with an 8-byte result or parameter"
+    [
+      (throws (lk [
+        (u "a" "long long strlen(const char *); long long f(void) { return strlen(\"a\"); }")
+      ]))
+      (throws (lk [ (u "a" "int abs(long long); int f(void) { return abs(1); }") ]))
+      (ret (lk [
+        (u "a" "unsigned strlen(const char *); int f(void) { return strlen(\"ab\"); }")
+      ]) "f" [ ])
+    ]
+    [
+      true
+      true
+      2
     ]
   )
   (t "cc link 31: the layout of a unit reads no address of the variables it imports"
