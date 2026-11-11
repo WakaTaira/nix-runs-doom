@@ -12,6 +12,18 @@
 #                                                  preprocess, then compileWith / loadWith
 #   readFrom [ <path> ]      : name -> string or null
 #                                                  a `read` over directories (see below)
+#   linkSources { units = [ { name; src; } ]; dataBase ? <default>; host ? <empty>;
+#                 allowUndefined ? false; }
+#                            -> attrs              compile the preprocessed C sources and
+#                                                  link them (cc/link.nix): the functions
+#                                                  with external linkage, __data, __units
+#                                                  and __init (apply it to the memory first)
+#   linkFiles   { files; read; includePaths ? [ ]; defines ? { }; dataBase ? <default>;
+#                 host ? <empty>; allowUndefined ? false; }
+#                            -> attrs              the same for the files (each preprocessed
+#                                                  as main; the unit is named by the file)
+# host (cc/host.nix) provides the functions and variables that the units use and do not
+# define; the default has none.
 # dataBase (default 0x00400000) is the address of the first file-scope variable. A
 # compiled function takes the memory trie (lib/mem.nix) and its arguments, and returns the
 # new memory, or { mem; ret; } when it returns a value. `__data.init` (see cc/emit.nix)
@@ -24,6 +36,8 @@ let
   P = import ./parse.nix;
   Ch = import ./check.nix;
   E = import ./emit.nix;
+  Lk = import ./link.nix;
+  Host = import ./host.nix;
 
   emitUnit = dataBase: unit: E.emit (Ch.checkWith { inherit dataBase; } unit).checked;
 
@@ -48,16 +62,57 @@ let
 
   preprocess = args: (Pp.preprocess args).toks;
 
+  # The syntax tree of the file main, preprocessed (args as for Pp.preprocess).
+  parseFile =
+    args:
+    let
+      r = Pp.preprocess args;
+    in
+    P.parseTokenList (L.fromPp r.toks r.end);
+
   compileFile =
     {
       dataBase ? Ch.defaultDataBase,
       ...
     }@args:
-    let
-      r = Pp.preprocess (removeAttrs args [ "dataBase" ]);
-    in
-    emitUnit dataBase (P.parseTokenList (L.fromPp r.toks r.end));
+    emitUnit dataBase (parseFile (removeAttrs args [ "dataBase" ]));
   loadFile = args: importCompiled (compileFile args);
+
+  linkSources =
+    {
+      units,
+      dataBase ? Ch.defaultDataBase,
+      host ? Host.default,
+      allowUndefined ? false,
+    }:
+    Lk.link {
+      units = map (u: {
+        inherit (u) name;
+        unit = P.parse u.src;
+      }) units;
+      inherit dataBase host allowUndefined;
+    };
+
+  linkFiles =
+    {
+      files,
+      read,
+      includePaths ? [ ],
+      defines ? { },
+      dataBase ? Ch.defaultDataBase,
+      host ? Host.default,
+      allowUndefined ? false,
+    }:
+    Lk.link {
+      units = map (f: {
+        name = f;
+        unit = parseFile {
+          main = f;
+          inherit read includePaths defines;
+        };
+      }) files;
+      inherit dataBase host allowUndefined;
+    };
 
   # A `read` for preprocess: the name is looked up in the directories dirs (Nix paths) as
   # one namespace, the first directory that has it winning. For external inputs such as
@@ -84,6 +139,8 @@ in
     compileFile
     loadFile
     readFrom
+    linkSources
+    linkFiles
     ;
 
   examples.spike = {

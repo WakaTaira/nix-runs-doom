@@ -3,7 +3,12 @@
 # Entry point: emit : { funcs; data; } -> string. The output is the source of a function
 #   { M, B, R }: { <C function name> = <Nix function>; ...; __data = <data>; }
 # with M = lib/mem.nix, B = lib/bits.nix and R = cc/runtime.nix. It imports nothing, so
-# it can be loaded from the store (cc/default.nix). __data describes the file-scope
+# it can be loaded from the store (cc/default.nix). In link mode (the result of
+# cc/check.nix checkWith with link, which has `link`) the output is
+#   { M, B, R, X }: { <C function name> = <Nix function>; ...; __data = <data>; }
+# with only the functions with external linkage in the set (the static ones stay in the
+# let), and each imported function f bound as `f_fn = X.f;`: X holds the functions of the
+# other units and of the host (cc/link.nix), called like the unit's own. __data describes the file-scope
 # variables, static locals and string literals (cc/check.nix, "Data"):
 #   { base; size; symbols = { <C name> = <address>; ... };
 #     strings = [ { addr; size; } ... ]; init = mem: <mem>; }
@@ -3473,12 +3478,23 @@ let
 
   emit =
     checked:
-    "{ M, B, R }:\nlet\n  inherit (builtins) bitAnd bitOr bitXor div;\n  inherit (R) wrapInt;\n"
+    let
+      link = checked.link or null;
+      exported =
+        if link == null then checked.funcs else filter (f: f.linkage == "external") checked.funcs;
+    in
+    "{ M, B, R${
+      if link == null then "" else ", X"
+    } }:\nlet\n  inherit (builtins) bitAnd bitOr bitXor div;\n  inherit (R) wrapInt;\n"
+    + (if link == null then "" else importBinds link.funcs)
     + concatStringsSep "" (map func checked.funcs)
     + "in\n{\n"
-    + concatStringsSep "" (map (f: "  ${quoteAttr f.name} = ${f.name}_fn;\n") checked.funcs)
+    + concatStringsSep "" (map (f: "  ${quoteAttr f.name} = ${f.name}_fn;\n") exported)
     + dataAttr checked.data
     + "}\n";
+
+  # Link mode: the bindings of the imported functions (names) to their functions in X.
+  importBinds = names: concatStringsSep "" (map (n: "  ${n}_fn = X.${quoteAttr n};\n") names);
 in
 {
   inherit emit;
