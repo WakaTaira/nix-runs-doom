@@ -19,7 +19,9 @@
 # calling the functions. The translation is
 # mechanical, except for the loop driver and the cached reads described below:
 #   - A C function becomes `mem: <params>:` returning the new memory, or { mem; ret; }
-#     when it returns a value.
+#     when it returns a value. A call to a variadic function (link mode) is
+#     `<f>_fn mem <fixed arguments> [ <variable arguments> ]`, the list empty when there are
+#     none, its elements in the representation of their (promoted) types.
 #   - Locals become let bindings, with a new name for each assignment. Assigning a plain
 #     name or a non-negative constant only renames.
 #   - A loop becomes `R.loop cond body vars`, or `R.loopDo body vars` (no condition to
@@ -876,13 +878,20 @@ let
         }
       );
 
+  # A call to a variadic function (link mode, which has e.va) passes the variable
+  # arguments as one list after the fixed ones, all evaluated left to right.
   call =
     s: e:
     let
-      r = exprs s e.args;
+      va = e.va or null;
+      n = length e.args;
+      r = exprs s (e.args ++ (if va == null then [ ] else va));
+      fixed = if va == null then r.cs else genList (elemAt r.cs) n;
+      vaItems = genList (i: wrap 0 (elemAt r.cs (n + i))) (length va);
+      vaList = atom (if vaItems == [ ] then "[ ]" else "[ ${concatStringsSep " " vaItems} ]");
       isVoid = T.isVoid e.type;
       f = fresh r.s (if isVoid then "mem" else "r");
-      code = app "${e.name}_fn" ([ (atom r.s.mem) ] ++ r.cs);
+      code = app "${e.name}_fn" ([ (atom r.s.mem) ] ++ fixed ++ (if va == null then [ ] else [ vaList ]));
     in
     {
       s = f.s // {

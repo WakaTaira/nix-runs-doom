@@ -49,11 +49,13 @@
 # pointer and another type (but a null pointer constant) are unsupported. float and double
 # are known types with their size and alignment, but every floating-point value (and
 # variable, and the definition of or a call to a function with such a parameter or return
-# value) is unsupported, as are calls to a variadic function. __builtin_va_list (the
-# va_list of stdarg.h, see cc/parse.nix) may only be named in a typedef and in the
-# parameters of a function declaration: a variable, member, return type, cast or sizeof
-# of a type with it (hasVaList), the definition of a function with such a parameter and a
-# call to one are unsupported ('va_list').
+# value) is unsupported, as are calls to a variadic function outside link mode (in link
+# mode a call gives at least the fixed arguments, and each variable argument is passed
+# after the default argument promotions; one of floating-point, struct or union type is
+# unsupported). __builtin_va_list (the va_list of stdarg.h, see cc/parse.nix) may only be
+# named in a typedef and in the parameters of a function declaration: a variable,
+# member, return type, cast or sizeof of a type with it (hasVaList), the definition of a
+# function with such a parameter and a call to one are unsupported ('va_list').
 #
 # Typed syntax tree
 # -----------------
@@ -75,6 +77,10 @@
 #   { kind = "old"; }                            the target's value before an assignment;
 #                                                appears only inside an assign's value
 #   { kind = "call"; name; args; }               args converted to the parameter types
+#   { kind = "call"; name; args; va; }           a call to a variadic function (link
+#                                                mode): va the variable arguments after
+#                                                the default argument promotions (char
+#                                                and short types to int)
 #   { kind = "cast"; expr; }                     conversion of expr to type (void: discard)
 #   { kind = "neg" | "bnot"; expr; }             unary - and ~ (expr has the result type)
 #   { kind = "not"; expr; }                      !; expr is any scalar; type int
@@ -1066,6 +1072,13 @@ let
           a = elemAt e.args i;
         in
         assignConv a (elemAt f.params i) (rv env a);
+      # A variable argument: its value after the default argument promotions.
+      vaArg =
+        i:
+        let
+          x = rv env (elemAt e.args (n + i));
+        in
+        mkCast (promote x.type) x;
       objType = env.vars.${e.name}.type or env.ctx.globals.${e.name}.type or null;
     in
     if hasAttr e.name env.vars || hasAttr e.name env.ctx.globals || hasAttr e.name env.ctx.consts then
@@ -1075,19 +1088,22 @@ let
         fail e "called object '${e.name}' is not a function"
     else if !hasAttr e.name env.funcs then
       fail e "call to undeclared function '${e.name}'"
-    else if f.variadic then
+    else if f.variadic && env.ctx.link == null then
       unsupported e "call to the variadic function '${e.name}'"
     else if sigHasVaList f then
       unsupported e "'va_list'"
     else if sigHasFloat f then
       unsupported e "call to the function '${e.name}' with a floating-point parameter or return value"
-    else if n != m then
+    else if (if f.variadic then m < n else n != m) then
       fail e "function '${e.name}' takes ${toString n} argument(s) but ${toString m} were given"
     else
-      node e "call" f.ret {
-        inherit (e) name;
-        args = genList arg n;
-      };
+      node e "call" f.ret (
+        {
+          inherit (e) name;
+          args = genList arg n;
+        }
+        // (if f.variadic then { va = genList vaArg (m - n); } else { })
+      );
 
   castExpr =
     env: e:
