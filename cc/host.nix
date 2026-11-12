@@ -26,7 +26,8 @@
 # printf, fprintf, snprintf and sscanf are variadic and run vprintf, vfprintf, vsnprintf
 # and vsscanf with va as the va_list, which take the va_list as their last argument (a
 # list; C code calls them with a va_list of a variadic definition, set by va_start). exit
-# throws "libc: exit: <status>", so the output not yet shown is lost. DG_DrawFrame records
+# throws exitText world status: "libc: exit: <status>", followed by a line break and the
+# output in world.out (the output not yet shown) when there is any. DG_DrawFrame records
 # a frame from the variables DG_ScreenBuffer and colors in symbols, and throws when called
 # in a link without them. Its data is hostData of lib/hostcall.nix (errno). The initial
 # state is the world of lib/libc.nix mkWorld (the heap from dataEnd rounded up to a
@@ -38,9 +39,11 @@
 let
   H = import ../lib/hostcall.nix;
   Libc = import ../lib/libc.nix;
+  B = import ../lib/bits.nix;
   inherit (builtins)
     all
     div
+    elemAt
     filter
     hasAttr
     length
@@ -80,13 +83,20 @@ let
     else
       throw "cc: host: DG_DrawFrame needs the variables DG_ScreenBuffer and colors";
 
+  # The message of exit: the signed status, then the output not yet shown, if any.
+  exitText =
+    world: status:
+    "libc: exit: ${toString status}" + (if world.out == "" then "" else "\n" + world.out);
+
   # The call of the entry e (see the header).
   callOf =
     symbols: e:
     let
       p = platformOf symbols;
     in
-    if e.variadic or false then
+    if e.name == "exit" then
+      world: a: throw (exitText world (B.toSigned (elemAt a 0)))
+    else if e.variadic or false then
       world: args: va:
       Libc."v${e.name}" world (args ++ [ va ])
     else if e.name == "DG_DrawFrame" then
@@ -129,6 +139,6 @@ let
     };
 in
 {
-  inherit empty mk;
+  inherit empty mk exitText;
   default = mk { };
 }
