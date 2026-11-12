@@ -7,8 +7,15 @@ let
   K = import ../doom/keys.nix;
   R = import ../doom/render.nix;
   Scaffold = import ../scaffold/render.nix;
+  Cc = import ../cc;
+  M = import ../lib/mem.nix;
+  P = import ../scaffold/platform.nix {
+    screenBufferAddr = 0;
+    colorsAddr = 0;
+  };
   inherit (builtins)
     bitAnd
+    concatStringsSep
     elemAt
     foldl'
     fromJSON
@@ -81,6 +88,125 @@ let
   };
   lineCount = s: (length (split "\n" s) - 1) / 2;
   firstCell = "${esc}[38;2;4;9;13m${esc}[48;2;12;25;37m▀";
+
+  # DG_GetKey of the platform layer over a memory whose words at 64 and 68 are all ones,
+  # so that the word write of pressed and the byte write of key can be told apart.
+  getKey = P.impls.DG_GetKey;
+  keyArgs = [
+    64
+    68
+  ];
+  keyMem = M.storeWord (M.storeWord M.empty 64 4294967295) 68 4294967295;
+  noKey = getKey {
+    mem = keyMem;
+    keys = [ ];
+  } keyArgs;
+  key1 = getKey {
+    mem = keyMem;
+    keys = [
+      (press 173)
+      (release 97)
+    ];
+  } keyArgs;
+  key2 = getKey key1.world keyArgs;
+  key3 = getKey key2.world keyArgs;
+  keyWritten = r: [
+    (M.loadWord r.world.mem 64)
+    (M.loadByte r.world.mem 68)
+    (M.loadByte r.world.mem 69)
+  ];
+
+  # A guest in the shape of doomgeneric: Create prints its arguments and draws the
+  # argument count; each tick prints one letter (a for tick 1, ...) and draws the key
+  # events it took, taking them as i_input.c does: until none is left or after the first
+  # release. Screen byte 0 is the count of events, then pressed and key of each.
+  guest = Cc.linkSources {
+    units = [
+      {
+        name = "guest";
+        src = ''
+          int DG_GetKey(int *pressed, unsigned char *key);
+          void DG_DrawFrame(void);
+          int puts(const char *s);
+          int putchar(int c);
+          unsigned char *DG_ScreenBuffer;
+          unsigned colors[256];
+          unsigned char screen[64000];
+          int ticks;
+          void doomgeneric_Create(int argc, char **argv) {
+            int i;
+            for (i = 0; i < argc; i++) puts(argv[i]);
+            DG_ScreenBuffer = screen;
+            screen[0] = argc;
+            DG_DrawFrame();
+          }
+          void doomgeneric_Tick(void) {
+            int pressed;
+            unsigned char key;
+            int n = 0;
+            ticks++;
+            putchar(96 + ticks);
+            putchar(10);
+            while (DG_GetKey(&pressed, &key)) {
+              screen[1 + 2 * n] = pressed;
+              screen[2 + 2 * n] = key;
+              n++;
+              if (!pressed) break;
+            }
+            screen[0] = n;
+            DG_DrawFrame();
+          }
+          void bye(void) { puts("bye"); }
+        '';
+      }
+    ];
+  };
+
+  # The driver over the guest with the key texts of ticks 1, 2, ... (null: no input);
+  # acc lists per call the tick, the output and the first 7 screen bytes of each frame.
+  runGuest =
+    args: texts:
+    import ../doom/run.nix {
+      linked = guest;
+      inherit args;
+      ticks = length texts;
+      readKeys = tick: elemAt texts (tick - 1);
+      onTick =
+        info: acc:
+        acc
+        ++ [
+          {
+            inherit (info) tick out;
+            frames = map (f: genList (elemAt f.screen) 7) info.frames;
+          }
+        ];
+      init = [ ];
+    };
+  guestArgs = [
+    "doom"
+    "-x"
+    "foo"
+  ];
+  keyRun = runGuest guestArgs [
+    "a"
+    "ab"
+    "ab"
+    null
+    "ab${esc}[A"
+  ];
+
+  # The pending key events after each of 1 .. n ticks, for texts that hold two keys for
+  # three ticks and then release both.
+  heldTexts = [
+    "ab"
+    "abab"
+    "ababab"
+    "ababab"
+    "ababab"
+    "ababab"
+  ];
+  pendingAfter = n: length (runGuest [ "doom" ] (genList (elemAt heldTexts) n)).mem.host.keys;
+  throws = x: !(builtins.tryEval (builtins.deepSeq x x)).success;
 in
 [
   (t "doom keys: ord of an ASCII character"
@@ -353,4 +479,202 @@ in
   (t "doom render: row ends with a reset and a newline" (substring (
     stringLength image80 - 5
   ) 5 image80) "${esc}[0m\n")
+  (t "doom DG_GetKey: no event returns 0 and leaves the memory"
+    [
+      noKey.ret
+      (noKey.world.mem == keyMem)
+    ]
+    [
+      0
+      true
+    ]
+  )
+  (t "doom DG_GetKey: two events in order, then 0"
+    [
+      key1.ret
+      (keyWritten key1)
+      key2.ret
+      (keyWritten key2)
+      key2.world.keys
+      key3.ret
+      (key3.world.mem == key2.world.mem)
+    ]
+    [
+      1
+      [
+        1
+        173
+        255
+      ]
+      1
+      [
+        0
+        97
+        255
+      ]
+      [ ]
+      0
+      true
+    ]
+  )
+  (t "doom run: argv reaches Create and tick 0 has its frame and output" (elemAt keyRun.acc 0) {
+    tick = 0;
+    out = "doom\n-x\nfoo\n";
+    frames = [
+      [
+        3
+        0
+        0
+        0
+        0
+        0
+        0
+      ]
+    ];
+  })
+  (t "doom run: each tick has its own frames, output and key events" (builtins.tail keyRun.acc) [
+    {
+      tick = 1;
+      out = "a\n";
+      frames = [
+        [
+          1
+          1
+          97
+          0
+          0
+          0
+          0
+        ]
+      ];
+    }
+    {
+      tick = 2;
+      out = "b\n";
+      frames = [
+        [
+          2
+          1
+          98
+          0
+          97
+          0
+          0
+        ]
+      ];
+    }
+    {
+      tick = 3;
+      out = "c\n";
+      frames = [
+        [
+          1
+          0
+          98
+          0
+          97
+          0
+          0
+        ]
+      ];
+    }
+    {
+      tick = 4;
+      out = "d\n";
+      frames = [
+        [
+          0
+          0
+          98
+          0
+          97
+          0
+          0
+        ]
+      ];
+    }
+    {
+      tick = 5;
+      out = "e\n";
+      frames = [
+        [
+          1
+          1
+          173
+          0
+          97
+          0
+          0
+        ]
+      ];
+    }
+  ])
+  (t "doom run: result fields and emptied host frames and output"
+    [
+      keyRun.frameCount
+      (genList (elemAt keyRun.last.screen) 3)
+      keyRun.mem.host.frames
+      keyRun.mem.host.out
+      keyRun.mem.host.keys
+    ]
+    [
+      6
+      [
+        1
+        1
+        173
+      ]
+      [ ]
+      ""
+      [ ]
+    ]
+  )
+  (t "doom run: no tick runs Create only"
+    (
+      let
+        r = runGuest guestArgs [ ];
+      in
+      [
+        r.frameCount
+        (length r.acc)
+        (genList (elemAt r.last.screen) 1)
+      ]
+    )
+    [
+      1
+      1
+      [ 3 ]
+    ]
+  )
+  (t "doom run: pending key events do not pile up over held and released keys"
+    (genList (i: pendingAfter (i + 1)) 6)
+    [
+      0
+      0
+      0
+      1
+      0
+      0
+    ]
+  )
+  (t "doom run: argument strings up to 4096 bytes"
+    [
+      (throws (runGuest [ (concatStringsSep "" (genList (_: "a") 4095)) ] [ ]).frameCount)
+      (throws (runGuest [ (concatStringsSep "" (genList (_: "a") 4096)) ] [ ]).frameCount)
+    ]
+    [
+      false
+      true
+    ]
+  )
+  (t "doom exitText: the output not yet shown follows the status"
+    [
+      (Cc.host.exitText (guest.bye keyRun.mem).host 3)
+      (Cc.host.exitText keyRun.mem.host 1)
+    ]
+    [
+      "libc: exit: 3\nbye\n"
+      "libc: exit: 1"
+    ]
+  )
 ]
