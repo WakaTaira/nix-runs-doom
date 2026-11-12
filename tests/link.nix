@@ -1697,6 +1697,138 @@ in
       ))
     ]
   ) (genList (_: true) 8))
+  (t "cc link: %f and %.Nf of snprintf round the exact binary value, ties to even"
+    [
+      (printed (printfSrc ''
+        void run(void) {
+          char b[64];
+          snprintf(b, sizeof b, "%f|%.2f|%.2f|%f", 2.5, 0.125, 2.675, -1.0);
+          printf("%s", b);
+        }
+      ''))
+      (printed (printfSrc ''
+        void run(void) {
+          printf("%.0f|%.0f|%.0f|%.1f|%.3f|%.6f|%f", 0.5, 1.5, 2.5, 0.05, 1.0005, 1e-7, 1.0 / 3);
+          printf("/%.2f|%.1f|%.4f", -0.001, 99.95, 123456.78125);
+        }
+      ''))
+      (printed (printfSrc ''
+        float third = 1.0f / 3;
+        void run(void) { float h = 0.1f; printf("%f %.6f", h, third); }
+      ''))
+    ]
+    [
+      "2.500000|0.12|2.67|-1.000000"
+      "0|2|2|0.1|1.000|0.000000|0.333333/-0.00|100.0|123456.7812"
+      "0.100000 0.333333"
+    ]
+  )
+  (t "cc link: %f with a width, flags, a precision above 6 or an integer argument throws"
+    (map (s: throws (printed (printfSrc "void run(void) { ${s} }"))) [
+      ''printf("%8f", 1.0);''
+      ''printf("%-f", 1.0);''
+      ''printf("%.7f", 1.0);''
+      ''printf("%f", 1);''
+    ])
+    [
+      true
+      true
+      true
+      true
+    ]
+  )
+  (t "cc link: wrapHost passes floating-point and va_list arguments as they are"
+    (
+      let
+        h = {
+          nargs = 3;
+          call = w: args: {
+            world = w // {
+              seen = args;
+            };
+            ret = 0.1;
+          };
+        };
+        mem = M.empty // {
+          host = { };
+        };
+        decl = ret: {
+          inherit ret;
+          params = [
+            { tag = "int"; }
+            { tag = "double"; }
+            { tag = "valist"; }
+          ];
+        };
+        f = Lk.wrapHost h (decl { tag = "float"; }) mem (-1) 0.5 [
+          1
+          2.5
+        ];
+        d = Lk.wrapHost h (decl { tag = "double"; }) mem 1 2.0 [ ];
+      in
+      [
+        f.ret
+        f.mem.host.seen
+        d.ret
+      ]
+    )
+    [
+      0.10000000149011612
+      [
+        4294967295
+        0.5
+        [
+          1
+          2.5
+        ]
+      ]
+      0.1
+    ]
+  )
+  (t "cc link: atof and fabs of the host take and return doubles"
+    (
+      let
+        l = withStd {
+          "a.c" = ''
+            #include <stdlib.h>
+            #include <math.h>
+            double a1(void) { return atof("1.5e2"); }
+            double a2(void) { return atof("  -12.5xyz"); }
+            double a3(void) { return atof("x1"); }
+            double a4(void) { return atof(".25e-1"); }
+            double f1(void) { return fabs(-0.25); }
+            float f2(float x) { return fabs(x - 1); }
+            int f3(void) { return fabs(-3) == 3; }
+          '';
+        };
+      in
+      [
+        (ret l "a1" [ ])
+        (ret l "a2" [ ])
+        (ret l "a3" [ ])
+        (ret l "a4" [ ])
+        (ret l "f1" [ ])
+        (ret l "f2" [ 0.5 ])
+        (ret l "f3" [ ])
+        (throws (
+          ret l "a1" [ ]
+          + ret (withStd {
+            "a.c" = "double atof(const char *); double f(void) { return atof(\"1e400\"); }";
+          }) "f" [ ]
+        ))
+      ]
+    )
+    [
+      150.0
+      (-12.5)
+      0.0
+      0.025
+      0.25
+      0.5
+      1
+      true
+    ]
+  )
   (t "cc link 34: a host function declared with an 8-byte result or parameter"
     [
       (throws (lk [

@@ -51,7 +51,8 @@
 # as `f_fn mem a1 ... aN` (and a list of the variable arguments when variadic): see
 # wrapHost. Its result follows the declaration in the units: the memory for void,
 # otherwise { mem; ret; } with ret converted to the declared return type as a cast to it
-# converts an unsigned 32-bit value (so a narrower type keeps the low bytes).
+# converts an unsigned 32-bit value (so a narrower type keeps the low bytes), or, for a
+# floating-point type, a Nix float.
 #
 # Errors are thrown as "cc: link: <message>", with positions "<unit>:<line>:<col>" (the
 # file of the node instead of the unit for a preprocessed unit) at the first use of the
@@ -68,8 +69,8 @@
 #   <position>: conflicting types for '<name>'
 #     at the first import, in unit order, that disagrees with the definition, or, without
 #     one, with the first import of the name (see below)
-#   <position>: unsupported: host function '<name>' with a 64-bit, floating-point or
-#     struct parameter or return value
+#   <position>: unsupported: host function '<name>' with a 64-bit, struct or union
+#     parameter or return value
 # Types of variables agree when they are compatible; functions when the return types, the
 # parameter types and variadic are, or when the return types are and one of the two is
 # declared without a prototype (`()`, see cc/parse.nix) and the other is not variadic,
@@ -265,8 +266,6 @@ let
     t:
     elem t.tag [
       "llong"
-      "float"
-      "double"
       "struct"
       "union"
     ];
@@ -341,15 +340,47 @@ let
   # ---- Host functions ----
 
   # The host function h in the convention of the generated code, for its declaration decl
-  # (an import): `mem: a1: ... aN:` (and `va:` when h is variadic), returning the memory,
-  # or { mem; ret; } unless decl returns void. The fixed arguments go to h.call as u32, va
-  # as it is; the world is mem.host with mem, and the new world goes back into the memory
-  # under `host`. Every field of the new host state is forced, and the small libc fields
-  # completely, so no thunk keeps old states alive (as lib/hostcall.nix dispatch does).
+  # (an import, or at least { ret; }): `mem: a1: ... aN:` (and `va:` when h is variadic),
+  # returning the memory,
+  # or { mem; ret; } unless decl returns void. The fixed arguments go to h.call as u32,
+  # but those that decl declares with a floating-point or va_list type, which go as they
+  # are (Nix floats and lists), and so does va. The result is converted to the declared
+  # return type: as a cast converts an unsigned 32-bit value, or to a Nix float (rounded to
+  # single precision for float). Which arguments pass as they are is decided once, from
+  # the types of decl, not at each call. The world is mem.host with mem, and the new world
+  # goes back into the memory under `host`. Every field of the new host state is forced,
+  # and the small libc fields completely, so no thunk keeps old states alive (as
+  # lib/hostcall.nix dispatch does).
   wrapHost =
     h: decl:
     let
       variadic = h.variadic or false;
+      params = decl.params or [ ];
+      np = length params;
+      # Whether the fixed argument i passes as it is.
+      asIs = genList (
+        i:
+        i < np
+        && (
+          let
+            p = elemAt params i;
+          in
+          T.isFloat p || p.tag == "valist"
+        )
+      ) h.nargs;
+      convArgs =
+        if any (x: x) asIs then
+          args: genList (i: if elemAt asIs i then elemAt args i else B.u32 (elemAt args i)) (length args)
+        else
+          map B.u32;
+      retOf =
+        r:
+        if decl.ret.tag == "float" then
+          R.toF32 r
+        else if decl.ret.tag == "double" then
+          r + 0.0
+        else
+          T.wrapTo decl.ret r;
       result =
         r:
         let
@@ -364,7 +395,7 @@ let
           else
             {
               inherit mem;
-              ret = T.wrapTo decl.ret r.ret;
+              ret = retOf r.ret;
             }
         );
       run =
@@ -373,7 +404,7 @@ let
           world = mem.host // {
             inherit mem;
           };
-          fixed = map B.u32 args;
+          fixed = convArgs args;
         in
         if variadic then va: result (h.call world fixed va) else result (h.call world fixed);
     in
@@ -712,7 +743,7 @@ let
       (map (i: "${posText i}: conflicting types for '${i.name}'") kindConflicts)
       (map (
         i:
-        "${posText i}: unsupported: host function '${i.name}' with a 64-bit, floating-point or struct parameter or return value"
+        "${posText i}: unsupported: host function '${i.name}' with a 64-bit, struct or union parameter or return value"
       ) wideHostImports)
     ];
 

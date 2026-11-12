@@ -662,6 +662,21 @@ in
   inherit stdHeaderFiles;
   ccHeaderFiles = headerFiles // stdHeaderFiles;
 
+  # The types of the entries whose double arguments and results the C compiler of cc/
+  # passes as they are (Nix floats), "f64", where the table has the soft-float "i64" of
+  # the toolchain; cc/host.nix applies them to the table (the toolchain, the stubs and
+  # dispatch keep the table as it is).
+  ccFloatTypes = {
+    atof = {
+      args = [ "ptr" ];
+      ret = "f64";
+    };
+    fabs = {
+      args = [ "f64" ];
+      ret = "f64";
+    };
+  };
+
   # The variables that the host provides to C code linked by cc/link.nix
   # ([ { name; size; align; } ], see cc/host.nix): errno, which stubsC defines for the
   # toolchain.
