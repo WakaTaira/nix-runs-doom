@@ -26,8 +26,11 @@ behaviour.
   through that result would need a test after every call in every function; a `throw`
   costs nothing until `exit` is called.
 - **Observable differences.**
-  - The output still held in the memory (`mem.host.out`, see below) is lost: a `throw`
-    carries no state out of the evaluation.
+  - A `throw` carries no state out of the evaluation, so the message itself carries the
+    output still held in the memory (`mem.host.out`, see below): the status, then a line
+    break and that output when there is any (`exitText` in `cc/host.nix`). The driver
+    `doom/run.nix` empties `out` after each call, so what is appended is the output not yet
+    shown, including the text of `I_Error`.
   - A caller that reads only the result of a function and drops the memory never sees the
     `exit`.
   - An error of a pure computation that C would run after the `exit`, but whose value is
@@ -245,6 +248,43 @@ These are limitations of the default host (`cc/host.nix` over `lib/libc.nix` and
 - `DG_GetKey` always returns 0: there is no key input yet.
 - `DG_DrawFrame` records `instrs = 0` in its frame records: compiled code counts no
   instructions (`count` of the host state stays 0).
+
+### Input and clock
+
+How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
+
+- **Input is a regular file that is read at every tick.** Nix cannot wait for input: in
+  the version used (2.34.9), `builtins.readFile` of a FIFO returns `""` the first time and
+  never returns the second time, and a `/proc` file reads as `""`. A regular file, on the
+  other hand, is read again at every `readFile`, even with the same path, so a program
+  outside the evaluation appends to a file (for example `cat > /tmp/doom.keys` in a raw
+  terminal) and the driver reads its whole text before each `doomgeneric_Tick`
+  (`doom/run.nix`). `doom/keys.nix` `poll` keeps how much of the text it has consumed and
+  decodes only the new part into the key numbers of `doomkeys.h`; the events go to the end
+  of the queue `keys` of the host state, from which `DG_GetKey` takes them one by one.
+- **Releases are made up.** A terminal never reports that a key was released, and holding
+  a key repeats its bytes. A key is therefore pressed for exactly one tick: the tick that
+  follows the arrival of its bytes. `poll` gives the presses of the keys decoded now, then
+  a release for each key that was pressed at the previous tick and is not decoded now.
+  A key that stays down gets a new press at every tick and no release. Presses come before
+  releases because `I_GetEvent` in `i_input.c` stops at the first key release it hands
+  over: a release placed first would be taken together with the press of a key that is
+  held, in one call, and cancel it, and movement would not work. Repeating a press only
+  keeps `gamekeydown` true, and in the menus it acts as auto-repeat.
+- **A lone ESC is confirmed one tick late.** `ESC` is also the start of the arrow
+  sequences (`ESC [ A`, `ESC O A`), so an `ESC` at the end of the text, or any cut-off
+  sequence, is not decoded at once. If nothing more has arrived at the next read, it is
+  read as complete (`ESC` is `KEY_ESCAPE`); otherwise it is decoded with the new bytes.
+- **Limits of the file.** A NUL byte (Ctrl-Space) in the key file makes `readFile` abort
+  the whole evaluation, because a Nix string cannot hold NUL; it cannot be prevented. If
+  the file becomes shorter than what was consumed, `poll` starts again from the front, so
+  the file can be emptied and written anew; but if it is emptied and then written past
+  its former length before the next read, the shortening goes unnoticed and the beginning
+  is skipped.
+- **The clock is virtual.** Only `DG_SleepMs` advances it, so Doom never waits for a tic
+  to pass. The game runs as fast as the evaluation does, not at 35 tics per second, and
+  keys arrive per tick of evaluation, not per tic of time. Following a real clock is not
+  done.
 
 ### Implementation-defined choices
 
