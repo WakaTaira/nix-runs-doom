@@ -414,6 +414,27 @@ let
     }
   '');
 
+  # Locals in memory as the buffers and targets of host calls, and a unit whose frames are
+  # placed as in a single file.
+  frameIo = withStd {
+    "a.c" = ''
+      #include <stdio.h>
+      int sn(char *out) {
+        char buf[16];
+        int n = snprintf(buf, sizeof buf, "<%d:%s>", 42, "ok");
+        int i;
+        for (i = 0; i <= n; i++) out[i] = buf[i];
+        return n;
+      }
+      int sc(void) { int a; unsigned x; sscanf(" 17 ab", "%d %x", &a, &x); return a * 1000 + x; }
+    '';
+  };
+  frameUnitSrc = ''
+    int f(int v) { static int s; int a[2]; int *p = &v; a[v & 1] = *p; return a[v & 1] + s; }
+    int g(void) { struct { int x; char c[3]; } q; q.x = 3; q.c[2] = 4; return q.x + q.c[2]; }
+  '';
+  frameUnit = lk [ (u "a" frameUnitSrc) ];
+
   strio = withStd {
     "a.c" = ''
       #include <stdio.h>
@@ -2126,6 +2147,60 @@ in
         10
         1
         2
+      ]
+    ]
+  )
+  (t "cc link: a local buffer of snprintf and & of locals for sscanf"
+    (
+      let
+        st = afterCalls frameIo [
+          [
+            "sn"
+            65536
+          ]
+          [ "sc" ]
+        ];
+      in
+      [
+        st.rets
+        (genList (i: M.loadByte st.mem (65536 + i)) 8)
+      ]
+    )
+    [
+      [
+        7
+        17171
+      ]
+      [
+        60
+        52
+        50
+        58
+        111
+        107
+        62
+        0
+      ]
+    ]
+  )
+  (t "cc link: frames are placed as in a single file"
+    [
+      (frameUnit.__data.units.a.symbols == (Cc.load frameUnitSrc).__data.symbols)
+      (length (attrNames frameUnit.__data.units.a.symbols))
+      (runCalls frameUnit [
+        [
+          "f"
+          5
+        ]
+        [ "g" ]
+      ])
+    ]
+    [
+      true
+      4
+      [
+        5
+        7
       ]
     ]
   )

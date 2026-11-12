@@ -1857,6 +1857,64 @@ let
     }
   '';
 
+  # ---- Slice 12: locals in memory ----
+  # Arrays, structs and unions, and the scalars whose address is taken, live in frames at
+  # fixed addresses in the data; an array of scalars indexed by constants only is split
+  # into one variable per element (cc/check.nix, "Locals in memory").
+  frameSrc = ''
+    struct P { int x, y; };
+    int g(struct P *p) { return p->x - p->y; }
+    void inc(int *p) { (*p)++; }
+    int squares(void) { int a[4]; int i; for (i = 0; i < 4; i++) a[i] = i * i; return a[0] + a[1] + a[2] + a[3]; }
+    int member(void) { struct P q; q.x = 7; q.y = 2; return g(&q); }
+    int param(int v) { inc(&v); inc(&v); return v; }
+    int alias(void) { int x = 1; int *p = &x; *p = 9; return x; }
+    int split(int k) { int d[3]; d[1] = k; d[2] = k + 1; return d[1] * 10 + d[2]; }
+    int rec(int n) { int d[3]; d[0] = n; d[2] = n * 2; if (n > 0) rec(n - 1); return d[0] * 10 + d[2]; }
+    int shared(int n) { int a[2]; a[n & 1] = n; if (n > 0) shared(n - 1); return a[n & 1]; }
+    unsigned sizes(void) {
+      char b[7]; int n[3][2]; struct P q; int d[5];
+      return sizeof b + sizeof n * 10 + sizeof n[1] * 100 + sizeof q * 1000 + sizeof d / sizeof d[0] * 10000;
+    }
+    int blocks(int k) {
+      int r;
+      {
+        int a[2];
+        a[k & 1] = 10; a[(k + 1) & 1] = 20;
+        {
+          int a[2];
+          a[k & 1] = 30; a[(k + 1) & 1] = 40;
+          r = a[0] + a[1];
+        }
+        r = r * 100 + a[0] * 10 + a[1];
+      }
+      return r;
+    }
+    int cached(int n) {
+      int x = 0; int *p = &x; int s = 0; int i;
+      for (i = 0; i < n; i++) { *p = *p + i; s = s + x; }
+      return s * 1000 + x;
+    }
+    int keep(int set, int i) { int a[2]; if (set) a[i & 1] = set; return a[i & 1]; }
+    int reg(int a) { register int x = a; int *p = &x; return *p + 1; }
+    long long wide(int k) { long long d[2]; d[1] = k; d[0] = d[1] * 3; return d[0] + d[1]; }
+    int sw(int k) {
+      switch (k) { case 0: ; int a[2]; int *p = &k; a[k & 1] = *p + 5; return a[0]; default: return -1; }
+    }
+    int lenOf(void) { enum { N = 3 }; int a[4]; a[N] = 1; a[N - 3] = 2; return a[0] * 10 + a[3]; }
+    union U { int i; unsigned char c[4]; };
+    int un(int v) { union U u; u.i = v; return u.c[0] + u.c[3]; }
+    enum { K = 2 };
+    int byEnum(void) { int a[3]; a[K] = 5; a[K - 1] = a[K] + 1; return a[1]; }
+  '';
+  # The data symbols of frameSrc and their order: static locals first, then the frames in
+  # function order, the parameters of a function before its locals.
+  frameOrderSrc = ''
+    int one(int v) { static int s1; char a[3]; int *p = &v; a[v & 1] = 1; return *p + a[0] + s1; }
+    struct Q { short h; char c; };
+    int two(void) { static char s2; struct Q q; int x = 4; int *p = &x; q.h = 1; q.c = 2; return q.h + q.c + *p + s2; }
+  '';
+
 in
 [
   # Lexer
@@ -3848,16 +3906,15 @@ in
     true
   )
   (t "cc compile: goto throws" (compileThrows "void f(void) { goto x; x: ; }") true)
-  (t "cc compile: &x throws" (compileThrows "void f(int x) { int *p = &x; }") true)
-  (t "cc compile: block-scope struct throws" (compileThrows "void f(void) { struct s { int a; } x; }")
-    true
+  (t "cc compile: a block-scope struct variable compiles"
+    (compileThrows "void f(void) { struct s { int a; } x; }")
+    false
   )
   (t "cc compile: case throws" (compileThrows "void f(int x) { if (x) case 1: ; }") true)
   (t "cc compile: member access through a non-struct pointer throws"
     (compileThrows "struct s; int f(int *p) { return p->a; }")
     true
   )
-  (t "cc compile: local array throws" (compileThrows "void f(void) { int a[3]; }") true)
   (t "cc compile: struct assignment throws"
     (compileThrows "struct s { int a; }; struct s x, y; void f(void) { x = y; }")
     true
@@ -7700,14 +7757,13 @@ in
       1300
     ]
   )
-  (t "cc compile: union values, parameters and local unions throw" (map compileThrows [
+  (t "cc compile: union values and parameters throw" (map compileThrows [
     "union u { int a; }; union u x, y; void f(void) { x = y; }"
     "union u { int a; }; void f(union u x) { }"
     "union u { int a; }; union u f(void);"
-    "union u { int a; }; void f(void) { union u x; }"
     "union u { int a; }; union u g = 1;"
     "struct s { int a; }; union s *p;"
-  ]) (genList (_: true) 6))
+  ]) (genList (_: true) 5))
 
   # Bit-fields
   (t "cc run: bit-field layouts"
@@ -7868,22 +7924,17 @@ in
   (t "cc run: register, inline, volatile, restrict and ignored attributes" (dret attrSrc "useAll" [
     4
   ]) 816)
-  (t "cc compile: & of a local (register or not), register at file scope and other attributes throw" (
-    map
-      compileThrows
-      [
-        "int f(int a) { register int x = a; int *p = &x; return *p; }"
-        "register int g;"
-        "inline int g;"
-        "struct __attribute__((aligned(8))) a { int x; };"
-        "int x __attribute__((aligned(4)));"
-        "int f(void) __attribute__((weak));"
-        "struct m { char c; int i __attribute__((packed)); };"
-        "enum __attribute__((packed)) e { A };"
-        "__attribute__((packed)) int y;"
-        "struct s { int a; }; struct __attribute__((packed)) s *p;"
-      ]
-  ) (genList (_: true) 10))
+  (t "cc compile: register at file scope and other attributes throw" (map compileThrows [
+    "register int g;"
+    "inline int g;"
+    "struct __attribute__((aligned(8))) a { int x; };"
+    "int x __attribute__((aligned(4)));"
+    "int f(void) __attribute__((weak));"
+    "struct m { char c; int i __attribute__((packed)); };"
+    "enum __attribute__((packed)) e { A };"
+    "__attribute__((packed)) int y;"
+    "struct s { int a; }; struct __attribute__((packed)) s *p;"
+  ]) (genList (_: true) 9))
   (t "cc run: packed structs as clang lays them out"
     (
       let
@@ -9321,5 +9372,186 @@ in
       true
       14
     ]
+  )
+
+  # Locals in memory
+  (t "cc run: local arrays, structs, unions and & of locals and parameters"
+    (map (c: ret frameSrc (head c) (builtins.tail c)) [
+      [ "squares" ]
+      [ "member" ]
+      [
+        "param"
+        3
+      ]
+      [ "alias" ]
+      [
+        "split"
+        4
+      ]
+      [ "sizes" ]
+      [
+        "blocks"
+        0
+      ]
+      [
+        "blocks"
+        1
+      ]
+      [
+        "reg"
+        6
+      ]
+      [
+        "wide"
+        5
+      ]
+      [
+        "sw"
+        0
+      ]
+      [ "lenOf" ]
+      [
+        "un"
+        16777218
+      ]
+      [ "byEnum" ]
+    ])
+    [
+      14
+      5
+      5
+      9
+      45
+      59047
+      7120
+      7210
+      7
+      20
+      5
+      21
+      3
+      6
+    ]
+  )
+  (t "cc run: recursion keeps a split array and shares a frame"
+    [
+      (ret frameSrc "rec" [ 3 ])
+      (ret frameSrc "shared" [ 2 ])
+    ]
+    [
+      36
+      0
+    ]
+  )
+  (t "cc run: a frame keeps its contents from the call before"
+    (
+      let
+        f = Cc.load frameSrc;
+        a = f.keep M.empty 5 1;
+        b = f.keep a.mem 0 1;
+        c = f.keep b.mem 0 0;
+      in
+      [
+        a.ret
+        b.ret
+        c.ret
+      ]
+    )
+    [
+      5
+      5
+      0
+    ]
+  )
+  (t "cc run: a cached read of a frame sees a store through a pointer"
+    [
+      (ret frameSrc "cached" [ 4 ])
+      (contains "g'" (fnCode frameSrc "cached"))
+    ]
+    [
+      10006
+      true
+    ]
+  )
+  (t "cc compile: a split array is variables and has no frame"
+    (
+      let
+        code = fnCode frameSrc "split";
+        syms = attrNames (Cc.load frameSrc).__data.symbols;
+      in
+      [
+        (contains "d'2'_" code)
+        (contains "M." code)
+        (filter (n: builtins.match "(split|rec|sizes|wide|byEnum)'.*" n != null) syms)
+      ]
+    )
+    [
+      true
+      false
+      [
+        "sizes'n'12'18'frame"
+        "sizes'q'12'36'frame"
+      ]
+    ]
+  )
+  (t "cc data: frames follow the static locals, by function, parameters first"
+    [
+      (offsetsOf frameOrderSrc [
+        "one's1'1'29"
+        "two's2'3'29"
+        "one'v'1'13'frame"
+        "one'a'1'38'frame"
+        "two'q'3'42'frame"
+        "two'x'3'49'frame"
+      ])
+      (Cc.load frameOrderSrc).__data.size
+      (length (attrNames (Cc.load frameOrderSrc).__data.symbols))
+      (dretAll frameOrderSrc [
+        [
+          "one"
+          3
+        ]
+        [ "two" ]
+      ])
+    ]
+    [
+      [
+        0
+        4
+        8
+        12
+        16
+        20
+      ]
+      24
+      6
+      [
+        3
+        7
+      ]
+    ]
+  )
+  (t "cc preprocessed: locals in memory give the same code through one macro"
+    [
+      (sameAsMacro frameSrc)
+      (sameAsMacro frameOrderSrc)
+    ]
+    [
+      true
+      true
+    ]
+  )
+  (t
+    "cc compile: initializers of local arrays and structs, arrays without a length and 8-byte integers in memory throw"
+    (map compileThrows [
+      "void f(void) { char b[4] = \"ab\"; }"
+      "struct s { int a; }; struct s g; void f(void) { struct s x = g; }"
+      "void f(void) { int a[]; }"
+      "void f(void) { long long x; long long *p = &x; }"
+      "void f(long long v) { long long *p = &v; }"
+      "void f(int i) { long long a[2]; a[i] = 1; }"
+      "struct s; void f(void) { struct s x; }"
+    ])
+    (genList (_: true) 7)
   )
 ]

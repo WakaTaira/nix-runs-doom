@@ -21,7 +21,8 @@
 #     symbols    the addresses of the variables with external linkage and of the placed
 #                host data, by name
 #     units      units.<unit> = { base; size; symbols; }, symbols as in the __data of a
-#                single file (internal linkage and static locals included)
+#                single file (internal linkage, static locals and locals in memory
+#                included)
 #     strings    the string literals of all units ([ { addr; size; } ], in unit order)
 #     undefined  the addresses of the variables placed by allowUndefined ({ } otherwise)
 #     init       mem: the memory with the initial values of every unit written

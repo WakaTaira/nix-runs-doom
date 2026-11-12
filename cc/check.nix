@@ -94,8 +94,8 @@
 # the value the generated code would compute (signed int and long wrap to 32 bits), except
 # a division by zero. A constant shift of a 32-bit value by a negative amount or by 32 or
 # more, and of a long long by a negative amount, by 64 or more, or left by 63, is
-# unsupported. The address of a file-scope variable (or of a static local or a string
-# literal) is a pointer "lit", and so is a constant pointer plus or minus a constant
+# unsupported. The address of a file-scope variable (or of a static local, a local in
+# memory or a string literal) is a pointer "lit", and so is a constant pointer plus or minus a constant
 # (member offsets and constant indices). The operand of sizeof, and the condition of a
 # switch for the shape of its node, are also typed without the addresses (typeOnlyEnv),
 # so the placement of the data never waits on an address folded there. An address is
@@ -106,9 +106,10 @@
 # constant in those operands, and a shift by such a value is not checked there.
 #   { kind = "lit"; value; }                     integer constant in the range of type, or
 #                                                a constant address (pointer type)
-#   { kind = "var"; var; }                       local variable or parameter;
-#                                                var = { key; name; type; }; key is unique
-#                                                per declaration
+#   { kind = "var"; var; }                       local variable or parameter, or element
+#                                                of a split array (see "Locals in
+#                                                memory"); var = { key; name; type; };
+#                                                key is unique per declaration
 #   { kind = "old"; }                            the target's value before an assignment;
 #                                                appears only inside an assign's value
 #   { kind = "call"; name; args; }               args converted to the parameter types
@@ -160,10 +161,15 @@
 # Statements (position of the first token):
 #   { kind = "block"; items; }
 #   { kind = "decl"; vars = [ { var; init; } ]; }    init is an expression or null; a
-#                                                     declaration of static locals and
-#                                                     block-scope extern variables also has
-#                                                     statics and externs (see declStmt),
-#                                                     which only this file uses
+#                                                     declaration of static locals,
+#                                                     block-scope extern variables and
+#                                                     locals in memory also has statics,
+#                                                     externs and frames (see declStmt),
+#                                                     which only this file uses. A
+#                                                     declaration that stores initial values
+#                                                     in memory is a "decl" node followed by
+#                                                     "expr" nodes of the stores (a block of
+#                                                     them where one statement is due)
 #   { kind = "expr"; expr; }                          expr may have type void
 #   { kind = "if"; cond; thenStmt; elseStmt; }        elseStmt is a statement or null
 #   { kind = "while"; cond; body; }
@@ -185,7 +191,9 @@
 # unsupported.
 #
 # Typed function (position of its name):
-#   { name; ret; params = [ var ]; body = <block>; linkage; line; col; }
+#   { name; ret; params = [ var ]; body = <block>; linkage; frames; line; col; }
+# frames are the parameters kept in memory (see "Locals in memory"), which the body
+# begins by storing there, and only this file uses them.
 # linkage is "internal" or "external" (C99 6.2.2): internal when the first declaration of
 # the name is `static`. A `static` declaration of a function or variable after one with
 # external linkage is an error, also after a block-scope declaration of the name (a
@@ -202,12 +210,15 @@
 # next offset aligned for its type, from the address dataBase (default 0x00400000), and
 # after them the static locals in source order, each named
 # `<function>'<name>'<line>'<col>` (of its name; `<function>'<name>'<seq>` in a
-# preprocessed file, seq the index of the name token; not a C identifier), and after them the
-# arrays of the string literals that need storage (see stringUses), one for each distinct
+# preprocessed file, seq the index of the name token; not a C identifier), after them the
+# locals in memory (see "Locals in memory") function by function in source order, the
+# parameters first, each named like a static local with `'frame` appended, and after them
+# the arrays of the string literals that need storage (see stringUses), one for each distinct
 # contents, with alignment 1, in the order of the first such literal of each:
 #   { base; size; symbols = [ { name; addr; linkage; } ]; strings = [ { addr; size; } ];
 #     inits = [ { addr; size; value; } ]; }
-# linkage is that of a file-scope variable, or "none" for a static local. size is the end
+# linkage is that of a file-scope variable, or "none" for a static local or a local in
+# memory. size is the end
 # of the last variable or string minus base; strings are in address
 # order. inits are the scalar stores of the initializers whose value is not 0 (size 1, 2
 # or 4 bytes, value in the stored unsigned form), in address order within each variable,
@@ -1308,7 +1319,12 @@ let
       let
         v = env.vars.${name};
       in
-      if v ? object then objectAt ctx e v.type v.object else node e "var" v.type { var = v; }
+      if v ? object then
+        objectAt ctx e v.type v.object
+      else if v ? elems then
+        splitArray ctx e v
+      else
+        node e "var" v.type { var = v; }
     else if hasAttr name ctx.consts then
       litAt e ctx.consts.${name}.type ctx.consts.${name}.value
     else if hasAttr name ctx.globals then
@@ -1571,13 +1587,36 @@ let
         size = 1;
       };
 
+  # The split array v (see "Locals in memory") named alone, which only an operand of sizeof
+  # may do (scanFunc): an array object at a constant of unknown value (see isSymbol).
+  splitArray =
+    ctx: e: v:
+    if ctx.typeOnly then
+      node e "deref" v.type { expr = symbolAt e (ptrTo v.type); }
+    else
+      throw "cc: internal error: split array '${v.name}' used as a value";
+
+  # The element of the split array v at the index of the "index" node e: its variable.
+  splitElement =
+    env: e: v:
+    let
+      i = rv env e.index;
+    in
+    if i.kind == "lit" && isInteger i.type && i.value >= 0 && i.value < length v.elems then
+      node e "var" v.type.of { var = elemAt v.elems i.value; }
+    else
+      throw "cc: internal error: split array '${v.name}' indexed by a value that is not a constant in range";
+
   indexExpr =
     env: e:
     let
+      v = if kindOf e.base == "ident" then env.vars.${e.base.name} or null else null;
       b = rv env e.base;
       i = rv env e.index;
     in
-    if isPtr b.type && isInteger i.type then
+    if v != null && v ? elems then
+      splitElement env e v
+    else if isPtr b.type && isInteger i.type then
       derefOf e (ptrAdd env.ctx e "+" b i)
     else if isInteger b.type && isPtr i.type then
       derefOf e (ptrAdd env.ctx e "+" i b)
@@ -1616,7 +1655,9 @@ let
     else
       memberOf env.ctx e (node e "deref" p.type.to { expr = p; }) e.name;
 
-  # &x: the address of an object in memory. Locals are not in memory.
+  # &x: the address of an object in memory. A local whose address is taken is one (see
+  # "Locals in memory"); a local variable is left only where the scan does not look (a
+  # static initializer, a type), and stays unsupported there.
   addrExpr =
     env: e:
     let
@@ -2093,7 +2134,13 @@ let
     if k == "block" then
       at { items = blockItems (enterBlock env) n.items; }
     else if k == "decl" then
-      declStmt env n
+      let
+        r = declStmt env n;
+      in
+      {
+        node = declBlock n r.nodes;
+        inherit (r) env;
+      }
     else if k == "expr" then
       at { expr = valueOf env n.expr; }
     else if k == "empty" then
@@ -2149,8 +2196,12 @@ let
 
   # A block-scope declaration: local variables (the typed node's vars), static locals
   # (statics, see staticVar), block-scope extern variables (externs, see externVar),
-  # function declarations, and struct, union and enum definitions, each in scope from its
-  # declarator on.
+  # locals in memory (frames, see frameLocal), function declarations, and struct, union
+  # and enum definitions, each in scope from its declarator on. -> { nodes; env; } with
+  # nodes the statements of the declaration in order: "decl" nodes of the variables, and
+  # between them the "expr" nodes that store the initial values of scalars in memory. The
+  # first is a "decl" node, which carries statics, externs, frames and the uses of the
+  # whole declaration; there are none when the declaration leaves nothing to run or place.
   declStmt =
     env: n:
     let
@@ -2190,23 +2241,22 @@ let
         else
           let
             t = resolveType acc.env d d.type;
+            how = storageOf acc.env (localKey d d.name) t;
             # The scope of a name starts after its declarator, so the initializer sees it.
             r = declare acc.env d d.name t;
             init = if d.init == null then null else assignConv d.init t (rv r.env d.init);
           in
           if hasVaList t then
             unsupported d "'va_list'"
-          else if isArray t then
-            unsupported d "local array"
-          else if isRecord t then
-            unsupported d "local ${t.tag} variable"
-          else if isFloat t then
+          else if hasFloat t then
             unsupported d "floating-point variable"
+          else if isArray t || isRecord t || how == "frame" then
+            frameLocal acc d t how
           else
             acc
             // {
               inherit (r) env;
-              vars = acc.vars ++ [
+              items = acc.items ++ [
                 {
                   inherit (r) var;
                   inherit init;
@@ -2216,27 +2266,119 @@ let
             };
       r = foldl' step {
         inherit env;
-        vars = [ ];
+        items = [ ];
         statics = [ ];
         externs = [ ];
+        frames = [ ];
         uses = [ ];
       } n.decls;
+      declNode =
+        vars:
+        posOf n
+        // {
+          kind = "decl";
+          inherit vars;
+        };
+      # A variable joins the "decl" node before it, a store is a statement of its own.
+      join =
+        ns: it:
+        let
+          count = length ns;
+          last = elemAt ns (count - 1);
+        in
+        if it ? var && count > 0 && last.kind == "decl" then
+          genList (i: elemAt ns i) (count - 1) ++ [ (last // { vars = last.vars ++ [ it ]; }) ]
+        else
+          ns ++ [ (if it ? var then declNode [ it ] else it.stmt) ];
+      nodes = foldl' join [ ] r.items;
+      meta =
+        (if r.statics == [ ] then { } else { inherit (r) statics; })
+        // (if r.externs == [ ] then { } else { inherit (r) externs; })
+        // (if r.frames == [ ] then { } else { inherit (r) frames; })
+        // withUses env r.uses;
     in
     {
-      node =
-        if r.vars == [ ] && r.statics == [ ] && r.externs == [ ] then
-          null
+      nodes =
+        if nodes != [ ] && (head nodes).kind == "decl" then
+          [ (head nodes // meta) ] ++ builtins.tail nodes
+        else if r.statics != [ ] || r.externs != [ ] || r.frames != [ ] then
+          [ (declNode [ ] // meta) ] ++ nodes
         else
-          posOf n
-          // {
-            kind = "decl";
-            inherit (r) vars;
-          }
-          // (if r.statics == [ ] then { } else { inherit (r) statics; })
-          // (if r.externs == [ ] then { } else { inherit (r) externs; })
-          // withUses env r.uses;
+          nodes;
       inherit (r) env;
     };
+
+  # The statements nodes of a declaration (see declStmt) as one statement: null for none,
+  # a block for more than one.
+  declBlock =
+    at: nodes:
+    if nodes == [ ] then
+      null
+    else if length nodes == 1 then
+      head nodes
+    else
+      posOf at
+      // {
+        kind = "block";
+        items = nodes;
+      };
+
+  # The automatic local d of type t in the accumulator acc of declStmt, kept in memory
+  # (how is "frame") or split (see "Locals in memory"). An array or struct with an
+  # initializer is unsupported; a scalar in memory stores its initial value where it is
+  # declared.
+  frameLocal =
+    acc: d: t: how:
+    let
+      env = acc.env;
+      name = d.name;
+      sym = frameSym env d name;
+      env' = bindObject env name t sym;
+      elems = genList (elemVar d name t) t.len;
+      frame = {
+        env = env';
+        frames = acc.frames ++ [ (frameObject env d t sym) ];
+      };
+    in
+    builtins.seq (checkLocal env d name) (
+      if isArray t && d.init != null then
+        unsupported d "initializer of a local array"
+      else if isRecord t && d.init != null then
+        unsupported d "initializer of a local ${t.tag} variable"
+      else if isArray t && t.len == null then
+        fail d "definition of variable with array type needs an explicit size or an initializer"
+      else if !isComplete env.ctx t then
+        fail d "variable '${name}' has incomplete type '${showType t}'"
+      else if how == "split" then
+        acc
+        // {
+          env = bindSplit env name t elems;
+          items =
+            acc.items
+            ++ map (v: {
+              var = v;
+              init = null;
+            }) elems;
+        }
+      else if hasLLong t then
+        unsupported d "8-byte integer in a local variable in memory"
+      else if isScalar t then
+        acc
+        // frame
+        // {
+          items =
+            acc.items
+            ++ (
+              if d.init == null then
+                [ ]
+              else
+                [ { stmt = frameStore env' d t sym (assignConv d.init t (rv env' d.init)); } ]
+            );
+          uses = acc.uses ++ usesOf env' d.init;
+        }
+      else
+        acc // frame
+    );
 
   # acc with the env e, which is forced so that its declaration is checked even when
   # nothing reads it.
@@ -2246,6 +2388,23 @@ let
   checkLocal =
     env: at: name:
     !(hasAttr name env.local) || fail at "redefinition of '${name}'";
+
+  # env with name bound to the split array of type t with the element variables elems (see
+  # "Locals in memory").
+  bindSplit =
+    env: name: t: elems:
+    env
+    // {
+      vars = env.vars // {
+        ${name} = {
+          inherit name elems;
+          type = t;
+        };
+      };
+      local = env.local // {
+        ${name} = "object";
+      };
+    };
 
   # env with name bound to the object of type t at the data symbol sym (see identExpr).
   bindObject =
@@ -2315,11 +2474,7 @@ let
     env: d:
     let
       name = d.name;
-      sym =
-        if d ? seq then
-          "${env.fn}'${name}'${toString d.seq}"
-        else
-          "${env.fn}'${name}'${toString d.line}'${toString d.col}";
+      sym = localSym env d name;
       t0 = resolveType env d d.type;
       # The initializer sees the variable itself.
       env' = bindObject env name t sym;
@@ -2349,6 +2504,304 @@ let
           };
         }
     );
+
+  # ---- Locals in memory ----
+  # Before its body is checked, a function is scanned (scanFunc) for the uses of its
+  # automatic locals and parameters, so that the storage of each is known at its
+  # declaration, before any use that would read it. A use is
+  #   { key; use = "plain" | "addr" | "index" | "sizeof"; value; }
+  # with key that of the variable (see declare): "addr" for `&x`, "index" for `x[k]` (value
+  # the integer constant expression k, or null when k is not one, see constIndex), "sizeof"
+  # for `sizeof x`, and "plain" for any other use (`&x[k]` included). The names are resolved
+  # through the scopes of the blocks as the checker resolves them; a name that a
+  # declaration without automatic storage hides (a static or extern variable, a function,
+  # a typedef, an enumerator) is no local. Static initializers and the expressions inside
+  # types are not scanned: they cannot use a local but in an operand of sizeof, which is
+  # only typed (see typeOnlyEnv).
+  #
+  # The storage of a local of type t (storageOf):
+  #   "split"   an array of scalars with a length whose uses are all "sizeof" and "index"
+  #             with a value in [0, length): one variable per element, named `<name>'<k>'`
+  #             (elemVar), each 0 until assigned
+  #   "frame"   any other array, a struct or union, and a scalar with an "addr" use: an
+  #             object at a fixed address in the data (see "Data"), with the data symbol of
+  #             a static local followed by `'frame` (frameSym); its contents are never
+  #             cleared, and a parameter is written there on entry
+  #   "bind"    any other scalar: a variable (see "Typed syntax tree")
+
+  # The key of the local variable or parameter name declared at the node at.
+  localKey = at: name: "${name}@${idOf at}";
+
+  # The data symbol of the static local name declared at the node d in the current function.
+  localSym =
+    env: d: name:
+    if d ? seq then
+      "${env.fn}'${name}'${toString d.seq}"
+    else
+      "${env.fn}'${name}'${toString d.line}'${toString d.col}";
+
+  frameSym =
+    env: d: name:
+    "${localSym env d name}'frame";
+
+  # The value of the index expression e as an integer constant expression, with the
+  # enumerators of file scope that no local name of scope hides, or null when it is none.
+  # Anything else (a sizeof, an enumerator of a block, a division by zero) gives null,
+  # which only keeps an array in memory.
+  constIndex =
+    env: scope: e:
+    let
+      hooks = {
+        ident = name: if hasAttr name scope then null else env.ctx.consts.${name} or null;
+        sizeOf = _: null;
+        resolve = resolveType env;
+      };
+      r = builtins.tryEval (constExpr hooks e).value;
+    in
+    if r.success then r.value else null;
+
+  # The uses of locals in the expression or initializer e (null for none), with scope the
+  # names in scope (a key, or null for a name that is no local).
+  scanExpr =
+    env: scope: e:
+    let
+      k = kindOf e;
+      sub = scanExpr env scope;
+      use =
+        name: u:
+        let
+          key = scope.${name} or null;
+        in
+        if key == null then
+          [ ]
+        else
+          [
+            {
+              inherit key;
+              use = u;
+              value = null;
+            }
+          ];
+      isIdent = x: kindOf x == "ident";
+    in
+    if e == null then
+      [ ]
+    else if k == "ident" then
+      use e.name "plain"
+    else if k == "addr" then
+      if isIdent e.expr then
+        use e.expr.name "addr"
+      else if kindOf e.expr == "index" && isIdent e.expr.base then
+        use e.expr.base.name "plain" ++ sub e.expr.index
+      else
+        sub e.expr
+    else if k == "index" then
+      (
+        if isIdent e.base then
+          map (u: u // { value = constIndex env scope e.index; }) (use e.base.name "index")
+        else
+          sub e.base
+      )
+      ++ sub e.index
+    else if k == "sizeof" then
+      if isIdent e.expr then use e.expr.name "sizeof" else sub e.expr
+    else if k == "call" then
+      (if e ? callee then sub e.callee else use e.name "plain") ++ concatMap sub e.args
+    else if k == "initlist" then
+      concatMap sub e.items
+    else if
+      elem k [
+        "cast"
+        "unary"
+        "deref"
+        "prefix"
+        "postfix"
+        "dot"
+        "arrow"
+      ]
+    then
+      sub e.expr
+    else if
+      elem k [
+        "binary"
+        "assign"
+        "comma"
+      ]
+    then
+      sub e.lhs ++ sub e.rhs
+    else if k == "cond" then
+      sub e.cond ++ sub e.thenExpr ++ sub e.elseExpr
+    else
+      [ ];
+
+  # The names of the block-scope declaration d (a node of the decls of a "decl" statement)
+  # added to scope: an automatic variable by its key, anything else as no local.
+  scanDeclare =
+    scope: d:
+    let
+      k = d.kind;
+      none =
+        names:
+        scope
+        // listToAttrs (
+          map (n: {
+            name = n;
+            value = null;
+          }) names
+        );
+    in
+    if k == "vardecl" then
+      scope // { ${d.name} = if (d.storage or null) == null then localKey d d.name else null; }
+    else if k == "proto" || k == "typedef" then
+      none [ d.name ]
+    else if k == "enum" then
+      none (map (c: c.name) d.consts)
+    else
+      scope;
+
+  # The uses of locals in the statement n with the names scope in scope.
+  # -> { uses; scope; } with scope the names in scope after n.
+  scanStmt =
+    env: scope: n:
+    let
+      k = n.kind;
+      ex = scanExpr env scope;
+      inner = x: if x == null then [ ] else (scanStmt env scope x).uses;
+      done = uses: { inherit uses scope; };
+    in
+    if k == "block" then
+      done (scanItems env scope n.items).uses
+    else if k == "decl" then
+      foldl' (
+        acc: d:
+        let
+          s = scanDeclare acc.scope d;
+          automatic = d.kind == "vardecl" && (d.storage or null) == null;
+        in
+        {
+          scope = s;
+          uses = acc.uses ++ (if automatic then scanExpr env s d.init else [ ]);
+        }
+      ) (done [ ]) n.decls
+    else if k == "expr" then
+      done (ex n.expr)
+    else if k == "if" then
+      done (ex n.cond ++ inner n.thenStmt ++ inner n.elseStmt)
+    else if k == "while" || k == "do" then
+      done (ex n.cond ++ inner n.body)
+    else if k == "for" then
+      let
+        i =
+          if n.init == null then
+            done [ ]
+          else if n.init.kind == "decl" then
+            scanStmt env scope n.init
+          else
+            done (ex n.init);
+      in
+      done (
+        i.uses
+        ++ scanExpr env i.scope n.cond
+        ++ scanExpr env i.scope n.step
+        ++ (scanStmt env i.scope n.body).uses
+      )
+    else if k == "return" then
+      done (ex n.expr)
+    else if k == "switch" then
+      done (ex n.cond ++ inner n.body)
+    else if k == "case" || k == "default" then
+      scanStmt env scope n.stmt
+    else
+      done [ ];
+
+  # The uses of locals in the statements items of one block, in order. -> { uses; scope; }
+  scanItems =
+    env: scope: items:
+    foldl'
+      (
+        acc: n:
+        let
+          r = scanStmt env acc.scope n;
+        in
+        {
+          inherit (r) scope;
+          uses = acc.uses ++ r.uses;
+        }
+      )
+      {
+        inherit scope;
+        uses = [ ];
+      }
+      items;
+
+  # The uses of the parameters and locals of the function definition f (its syntax tree)
+  # by key, in env, the environment of its body.
+  scanFunc =
+    env: f:
+    let
+      scope = listToAttrs (
+        map (p: {
+          inherit (p) name;
+          value = localKey p p.name;
+        }) f.params
+      );
+    in
+    groupBy (u: u.key) (scanItems env scope f.body.items).uses;
+
+  # The storage of the local of type t with the key key in env: "split", "frame" or "bind"
+  # (see "Locals in memory").
+  storageOf =
+    env: key: t:
+    let
+      uses = env.localUses.${key} or [ ];
+      inRange = u: u.value != null && u.value >= 0 && u.value < t.len;
+    in
+    if isArray t then
+      if
+        isScalar t.of && t.len != null && all (u: u.use == "sizeof" || u.use == "index" && inRange u) uses
+      then
+        "split"
+      else
+        "frame"
+    else if isRecord t then
+      "frame"
+    else if isScalar t && any (u: u.use == "addr") uses then
+      "frame"
+    else
+      "bind";
+
+  # The variable of element k of the split array name (of type t) declared at the node d.
+  elemVar = d: name: t: k: {
+    key = "${localKey d name}'${toString k}";
+    name = "${name}'${toString k}'";
+    type = t.of;
+  };
+
+  # A frame object of type t at the data symbol sym, declared at the node d, for the
+  # placement of the data (see placeStatics).
+  frameObject =
+    env: d: t: sym:
+    posOf d
+    // {
+      inherit sym;
+      size = sizeOfT env.ctx t;
+      align = alignOfT env.ctx t;
+      writesAt = _: [ ];
+    };
+
+  # The statement that stores value (a typed expression of the scalar type t) into the
+  # frame object at the data symbol sym, at the node at.
+  frameStore =
+    env: at: t: sym: value:
+    posOf at
+    // {
+      kind = "expr";
+      expr = node at "assign" t {
+        target = objectAt env.ctx at t sym;
+        inherit value;
+        post = false;
+      };
+    };
 
   # A block-scope function declaration: the function of the same name in the translation
   # unit, in scope to the end of the block. Its calls are checked against the file-scope
@@ -2498,7 +2951,13 @@ let
           if any (d: d.kind == "proto" || (d.storage or null) != null) n.init.decls then
             fail n.init "declaration of a non-local variable in a 'for' loop"
           else
-            declStmt fenv n.init
+            let
+              r = declStmt fenv n.init;
+            in
+            {
+              node = declBlock n.init r.nodes;
+              inherit (r) env;
+            }
         else
           {
             node =
@@ -2550,6 +3009,21 @@ let
         inherit env;
       };
 
+  # The statement n checked as an item of a block or a switch body. -> { nodes; env; }, a
+  # declaration giving its statements one by one (see declStmt).
+  stmtNodes =
+    env: n:
+    if n.kind == "decl" then
+      declStmt env n
+    else
+      let
+        r = stmt env n;
+      in
+      {
+        nodes = if r.node == null then [ ] else [ r.node ];
+        inherit (r) env;
+      };
+
   # Items of a block, checked in order.
   blockItems =
     env: items:
@@ -2557,11 +3031,11 @@ let
       step =
         acc: n:
         let
-          r = stmt acc.env n;
+          r = stmtNodes acc.env n;
         in
         {
           inherit (r) env;
-          nodes = acc.nodes ++ (if r.node == null then [ ] else [ r.node ]);
+          nodes = acc.nodes ++ r.nodes;
         };
     in
     (foldl' step {
@@ -2619,8 +3093,8 @@ let
       opened = if l.labels == [ ] then acc.sections else acc.sections ++ [ [ ] ];
       index = length opened - 1;
       labelled = foldl' (addLabel acc.env t index) acc l.labels;
-      r = stmt acc.env l.stmt;
-      nodes = if r.node == null then [ ] else [ r.node ];
+      r = stmtNodes acc.env l.stmt;
+      inherit (r) nodes;
     in
     labelled
     // {
@@ -2841,25 +3315,52 @@ let
           inherit (r) env;
           vars = acc.vars ++ [ r.var ];
         };
+      fenv = env // {
+        inherit (sig) ret;
+        fn = f.name;
+      };
       ps = foldl' step {
-        env = env // {
-          inherit (sig) ret;
-          fn = f.name;
+        env = fenv // {
+          localUses = scanFunc fenv f;
         };
         vars = [ ];
       } (genList (i: i) (length f.params));
-      items = blockItems ps.env f.body.items;
+      # The parameters whose address is taken live in memory (see "Locals in memory"),
+      # written there on entry.
+      framed = filter (i: storageOf ps.env (elemAt ps.vars i).key (elemAt ps.vars i).type == "frame") (
+        genList (i: i) (length f.params)
+      );
+      frameOf =
+        i:
+        let
+          p = elemAt f.params i;
+          var = elemAt ps.vars i;
+        in
+        {
+          inherit p var;
+          sym = frameSym ps.env p p.name;
+        };
+      frameParams = map frameOf framed;
+      benv = foldl' (e: x: bindObject e x.var.name x.var.type x.sym) ps.env frameParams;
+      stores = map (
+        x: frameStore benv x.p x.var.type x.sym (node x.p "var" x.var.type { inherit (x) var; })
+      ) frameParams;
+      items = stores ++ blockItems benv f.body.items;
+      llongFrame = filter (x: x.var.type.tag == "llong") frameParams;
     in
     if sigHasVaList sig then
       unsupported f "'va_list'"
     else if sigHasFloat sig then
       unsupported f "definition of a function with a floating-point parameter or return value"
+    else if llongFrame != [ ] then
+      unsupported (head llongFrame).p "8-byte integer in a local variable in memory"
     else
       posOf f
       // {
         inherit (f) name;
         inherit (sig) ret;
         params = ps.vars;
+        frames = map (x: frameObject benv x.p x.var.type x.sym) frameParams;
         body = posOf f.body // {
           kind = "block";
           inherit items;
@@ -2891,6 +3392,7 @@ let
   fileEnv = acc: {
     vars = { };
     local = { };
+    localUses = { };
     ret = null;
     fn = null;
     jumps = {
@@ -3754,28 +4256,44 @@ let
     field: n: if kindOf n == "decl" then n.${field} or [ ] else concatMap (declsIn field) (subStmts n);
 
   # The objects acc.objects followed by the static locals of the functions acc.defs in
-  # source order, each at the next offset aligned for it. -> { size; objects; }
+  # source order, then by their locals in memory (see "Locals in memory"), function by
+  # function, the parameters first, each at the next offset aligned for it.
+  # -> { size; objects; }
   placeStatics =
     dataBase: acc:
-    foldl' (
-      st: o:
-      let
-        offset = alignUp st.size o.align;
-        addr = dataBase + offset;
-      in
-      {
-        size = offset + o.size;
-        objects = st.objects ++ [
-          {
-            name = o.sym;
-            inherit addr;
-            end = addr + o.size;
-            at = posOf o;
-            writes = o.writesAt addr;
-          }
-        ];
-      }
-    ) { inherit (acc) size objects; } (concatMap (f: declsIn "statics" f.body) acc.defs);
+    foldl'
+      (
+        st: o:
+        let
+          offset = alignUp st.size o.align;
+          addr = dataBase + offset;
+        in
+        {
+          size = offset + o.size;
+          objects = st.objects ++ [
+            {
+              name = o.sym;
+              inherit addr;
+              end = addr + o.size;
+              at = posOf o;
+              writes = o.writesAt addr;
+            }
+          ];
+        }
+      )
+      { inherit (acc) size objects; }
+      (
+        concatMap (f: declsIn "statics" f.body) acc.defs
+        ++ concatMap (f: f.frames ++ framesIn f.body) acc.defs
+      );
+
+  # The frames (see declStmt) of the declarations in the statement n and the statements in
+  # it, those of a for initialization included, in source order.
+  framesIn =
+    n:
+    (if kindOf n == "decl" then n.frames or [ ] else [ ])
+    ++ (if kindOf n == "for" && n.init != null then framesIn n.init else [ ])
+    ++ concatMap framesIn (subStmts n);
 
   # The string literals in the syntax tree n that need storage: all of them but those in
   # the operand of sizeof and in the initializers of static locals (whose literals come
@@ -4168,7 +4686,7 @@ let
   };
 
   # The data symbols of the checked unit r, with the linkage of each: that of a file-scope
-  # variable, "none" for a static local.
+  # variable, "none" for a static local or a local in memory.
   symbolsOf =
     r:
     map (o: {

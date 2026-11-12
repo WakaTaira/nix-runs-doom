@@ -33,8 +33,11 @@
 # compiled function takes the memory trie (lib/mem.nix) and its arguments, and returns the
 # new memory, or { mem; ret; } when it returns a value. `__data.init` (see cc/emit.nix)
 # writes the initial values of the file-scope variables and static locals and the contents
-# of the string literals (placed after them, listed in `__data.strings`); apply it to the
-# memory first. A function pointer holds the number of a function, and a call through one
+# of the string literals (placed after them and after the locals kept in memory, listed in
+# `__data.strings`); apply it to the memory first. Local arrays (but those indexed by
+# constants only, which become one variable per element), structs and unions, and locals
+# whose address is taken live at fixed addresses in the data (one place per declaration,
+# shared by every call of the function, see cc/check.nix). A function pointer holds the number of a function, and a call through one
 # picks the function from a table (see cc/check.nix and cc/emit.nix); a single file
 # numbers its functions as a link of it alone does.
 let

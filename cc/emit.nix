@@ -13,7 +13,8 @@
 # when there are any), and each imported function f bound as `f_fn = X.f;`: X holds the
 # functions of the other units and of the host (cc/link.nix), called like the unit's own,
 # and the tables of the calls through function pointers in X.__tables. __data describes
-# the file-scope variables, static locals and string literals (cc/check.nix, "Data"):
+# the file-scope variables, static locals, locals in memory and string literals
+# (cc/check.nix, "Data"):
 #   { base; size; symbols = { <C name> = <address>; ... };
 #     strings = [ { addr; size; } ... ]; init = mem: <mem>; }
 # init writes the initial values that are not 0 (the contents of the string literals
@@ -171,7 +172,10 @@
 #     before i. An assignment to a local variable evaluates only the value.
 #   - Conditions are Nix booleans; a comparison is 0 or 1 only where its value is used.
 #   - File-scope variables live in memory at fixed addresses, written as integer literals;
-#     they are read and written like any memory through a pointer.
+#     they are read and written like any memory through a pointer. So are static locals
+#     and the locals that cc/check.nix keeps in memory ("Locals in memory"), whose reads
+#     and stores are the same "deref" and "assign" nodes; the elements of a split array are
+#     plain variables.
 #   - Unsigned and pointer arithmetic and conversions wrap modulo 2^32 as in C.
 #   - The results of +, -, *, unary - and << on int and long wrap to [-2^31, 2^31) with
 #     `wrapInt` (R.wrapInt, bound once at the top), and so does signed / and % unless the
