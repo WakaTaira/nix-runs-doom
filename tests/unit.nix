@@ -3,7 +3,7 @@
 # ELF symbol tests from tests/elf.nix, code-region tests from tests/fastpath.nix,
 # host-call libc tests from tests/hostcall.nix, memory tests from tests/mem.nix, C
 # front-end tests from tests/cc.nix, C preprocessor tests from tests/pp.nix and C linker
-# tests from tests/link.nix.
+# tests from tests/link.nix and Doom platform tests from tests/doom.nix.
 # Run: nix eval --json -f tests/unit.nix summary
 # Each test places a small machine-code sequence at address 0, runs it until the trailing
 # EBREAK halts, and compares registers, memory and PC against expected values. Every CPU
@@ -486,7 +486,8 @@ let
     ++ import ./hostcall.nix
     ++ import ./cc.nix
     ++ import ./pp.nix
-    ++ import ./link.nix;
+    ++ import ./link.nix
+    ++ import ./doom.nix;
 
   failures = filter (t: t.got != t.expected) cases;
 in
