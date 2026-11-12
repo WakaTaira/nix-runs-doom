@@ -46,6 +46,12 @@ behaviour.
   shift, a `long long` overflow) are raised only if their value is used: in
   `int x = a / b; return 1;` a `b` of 0 raises nothing, and a failure whose value is
   needed late is raised late.
+- **Forced order.** A generated function forces the memory it receives on entry, and
+  `R.loop` and `R.loopDo` force the memory after every iteration (`cc/emit.nix`,
+  `cc/runtime.nix`). Without this, the chain of lazy bindings grew with the total number of
+  statements executed, and the start of Doom hit `max-call-depth`. The limit that remains:
+  about 1,000 statements in one function with no call and no loop between them still hit
+  `max-call-depth` (500 pass). Doom has no such function.
 
 ### Signed 32-bit arithmetic wraps
 
@@ -107,13 +113,59 @@ behaviour.
 - **What.** A call to a variadic function (when linking) passes the variable arguments,
   after the default argument promotions, as one Nix list after the fixed arguments:
   `<f>_fn mem <fixed>... [ <variable>... ]` (`cc/check.nix`, `cc/emit.nix`). The host's
-  `printf` family reads that list as its `va_list` (`nextArg` in `lib/libc.nix`).
+  `printf` family reads that list as its `va_list` (`nextArg` in `lib/libc.nix`). A
+  variadic function defined in C takes the list as a hidden last parameter. A `va_list`
+  variable is a Nix binding: `va_start` assigns the list to it (any number of times),
+  `va_arg` takes the head and leaves the tail, and `va_copy` is an assignment (`cc/check.nix`,
+  `cc/emit.nix`).
 - **Why.** No argument save area has to be written to memory for each call.
-- **Observable differences.** A `va_list` is a Nix list, not 32-bit data: it cannot be
-  stored in memory or in a struct, have its address taken or be cast. Values of type
-  `va_list` and the definition of variadic functions are not supported yet
-  (`unsupported: 'va_list'`, `unsupported: definition of a variadic function`). A format
-  that needs more arguments than given throws `"libc: too few variadic arguments"`.
+- **Observable differences.**
+  - A `va_list` is a Nix list, not 32-bit data: `=` on a `va_list`, storing it in memory or
+    in a struct, taking its address, a cast, `sizeof` and a function pointer to a variadic
+    function stop compilation with `unsupported: ...`.
+  - The callee's `va_arg` does not advance the caller's list (it is passed by value; in C
+    the caller's `va_list` is indeterminate after that).
+  - A `va_arg` with no argument left, and a format that needs more arguments than given
+    (`"libc: too few variadic arguments"`), stop the evaluation with an error that
+    `builtins.tryEval` cannot catch.
+
+### Floating point
+
+- **What.** `float`, `double` and `long double` values are Nix floats (`cc/emit.nix`,
+  `cc/runtime.nix`, `cc/check.nix`). A `float` is rounded to single precision at every
+  operation, conversion, assignment, argument, return and store to memory (`R.toF32`), so
+  results equal those of C. Only `atof` and `fabs` are host calls (`ccFloatTypes` and
+  `floatCalls` in `lib/hostcall.nix`), and the host's `%f` prints a double.
+- **Why.** Nix has floats; computing in them needs no emulation.
+- **Observable differences.**
+  - A division by zero is a Nix evaluation error that `builtins.tryEval` cannot catch (C
+    gives inf or NaN).
+  - A `double` overflow stays inf and flows on; a conversion to single precision of a value
+    out of range throws; reading an inf or a NaN from memory throws; `-0.0` is stored as
+    +0; a float to integer conversion out of range throws.
+  - `long double` is `double`.
+  - Hexadecimal floating constants and literals of 1e308 or more are `unsupported`.
+  - An `f` suffix goes through a `double` first, so a literal very close to the midpoint of
+    two singles can differ by 1 ulp from clang.
+  - The host's `%f` supports a precision of 6 or less with no width and no flags, and
+    `%.Nf` of a value with |x| >= 2^63 throws.
+  - Doom computes floats only in the constants of `am_map` (folded at compile time),
+    `mouse_acceleration`, the `%f` of the quit-from-menu and timedemo-end messages, and the
+    path of `testcontrols`.
+
+### `goto` is rewritten into flags and loops
+
+- **What.** The parser rewrites `goto` and labels into a flag per label and `do ... while`
+  loops on the syntax tree (`cc/parse.nix`); `cc/emit.nix` is unchanged and sees only
+  structured code. Accepted: forward and backward jumps, jumps to a label inside nested
+  `if`s, and jumps out of loops.
+  `unsupported`: a label inside a loop or a `switch`, a `goto` from inside a `switch`, a
+  forward `goto` from one branch of an `if` to a label in the other branch, and a `goto`
+  that jumps over a declaration used outside the skipped range.
+- **Why.** It needs no new construct in the generated code, and the cost is not on a hot
+  path (`R_AddLine`, which has one, is 0.15% of the instructions).
+- **Observable differences.** None known for the accepted forms; the rejected forms stop
+  compilation.
 
 ### Function pointers are numbers
 
