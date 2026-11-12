@@ -54,6 +54,7 @@
 # index in the translation unit, which identifies them (see fromPp).
 let
   A = import ../lib/ascii.nix;
+  Libc = import ../lib/libc.nix;
   inherit (builtins)
     concatLists
     elemAt
@@ -197,12 +198,7 @@ let
   # Value of a string of octal digits (at most 21, so below 2^63).
   octValue = s: foldl' (acc: c: acc * 8 + hexValues.${c}) 0 (chars s);
 
-  stripZeros =
-    s:
-    let
-      m = match "0*([0-9A-Fa-f]+)" s;
-    in
-    if m == null then s else head m;
+  inherit (Libc) stripZeros;
 
   # Suffix -> { unsigned; long; }, or null if it is not a valid integer suffix.
   parseSuffix =
@@ -280,39 +276,26 @@ let
       };
 
   # A preprocessing number that is a floating-point literal as a token (see the header).
-  # Its value is the double nearest to the decimal number (fromJSON of the number in JSON
-  # form, which rounds correctly); the f and F suffixes only set single.
+  # Its value is the double nearest to the decimal number (decimalToDouble of
+  # lib/libc.nix, as atof reads it); the f and F suffixes only set single.
   floatToken =
     pos: text:
     let
-      m = match "(([0-9]*)[.]([0-9]*)|([0-9]+))(([eE])([-+]?[0-9]+))?([fFlL]?)" text;
+      m = match "(([0-9]*)[.]([0-9]*)|([0-9]+))(([eE])([-+]?)([0-9]+))?([fFlL]?)" text;
       intDigits = if elemAt m 1 != null then elemAt m 1 else elemAt m 3;
       fracDigits = if elemAt m 2 != null then elemAt m 2 else "";
-      intPart = stripDecimalZeros intDigits;
-      json =
-        intPart
-        + (if fracDigits == "" then "" else ".${fracDigits}")
-        + (if elemAt m 4 == null then "" else "e${elemAt m 6}");
-      value = fromJSON json + 0.0;
-      suffix = elemAt m 7;
-      # Whether the value reaches 10^308 (fromJSON fails from about 1.8 * 10^308 on): the
-      # position of the first nonzero digit (the number of integer digits, or minus the
-      # zeros that start the fraction) plus the exponent.
-      expText = if elemAt m 4 == null then "0" else elemAt m 6;
-      expDigits = stripDecimalZeros (head (match "[-+]?([0-9]+)" expText));
-      fracZeros = stringLength (head (match "(0*).*" fracDigits));
-      lead = if intPart != "0" then stringLength intPart else 0 - fracZeros;
-      nonzero = intPart != "0" || fracZeros < stringLength fracDigits;
-      tooLarge =
-        nonzero
-        && substring 0 1 expText != "-"
-        && (stringLength expDigits > 5 || fromJSON expDigits + lead > 308);
+      value = Libc.decimalToDouble {
+        inherit intDigits fracDigits;
+        expNeg = elemAt m 6 == "-";
+        expDigits = if elemAt m 4 == null then "" else elemAt m 7;
+      };
+      suffix = elemAt m 8;
     in
     if match "0[xX].*" text != null then
       unsupported pos "hexadecimal floating-point literal '${text}'"
     else if m == null || (intDigits == "" && fracDigits == "") then
       fail pos "invalid floating-point literal '${text}'"
-    else if tooLarge then
+    else if value == null then
       unsupported pos "floating-point literal of 1e308 or more '${text}'"
     else
       pos
@@ -321,14 +304,6 @@ let
         inherit text value;
         single = suffix == "f" || suffix == "F";
       };
-
-  # The decimal digits s without leading zeros, "0" when nothing is left.
-  stripDecimalZeros =
-    s:
-    let
-      r = head (match "0*([0-9]*)" s);
-    in
-    if r == "" then "0" else r;
 
   # Simple escape sequences: the character after the backslash -> character code.
   escapes = {

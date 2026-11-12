@@ -684,6 +684,7 @@ let
       sizeOf
       fits
       wrapTo
+      numberTo
       classOf
       classTypes
       ;
@@ -918,25 +919,45 @@ let
   # The value of the constant x (a "lit" node of an integer, pointer or floating-point
   # type) converted to the integer, pointer or floating-point type t, as the generated
   # code converts it (cc/runtime.nix): integers wrap, a float rounds to single precision,
-  # and a floating-point value truncates toward zero to an integer, which must lie in the
-  # range of t (an error otherwise, where the generated code throws).
+  # and a floating-point value truncates toward zero to an integer. A value out of the
+  # range of t (a float beyond the largest float, a floating-point value whose truncation
+  # t cannot hold) is an error, where the generated code throws.
   convValue =
     t: x:
     let
-      v = x.value;
       r = rangeOf t;
-      truncated = if v < 0 then builtins.ceil v else builtins.floor v;
     in
+    if isFloat x.type && !isFloat t then
+      (
+        if R.fInRange r.lo r.hi x.value then
+          R.truncF x.value
+        else
+          fail x "floating-point constant out of the range of '${showType t}'"
+      )
+    else
+      numberTo (toF32At x) t x.value;
+
+  # The number v converted to the arithmetic or pointer type t as the generated code
+  # converts it, but for a floating-point v and an integer or pointer type t (see
+  # convValue): rounded to single precision by toFloat for float, a Nix float for double,
+  # and an integer v wrapped to t otherwise.
+  numberTo =
+    toFloat: t: v:
     if t.tag == "float" then
-      R.toF32 v
+      toFloat v
     else if t.tag == "double" then
       v + 0.0
-    else if !isFloat x.type then
-      wrapTo t v
-    else if v <= r.lo - 1.0 || v >= r.hi + 1.0 then
-      fail x "floating-point constant out of the range of '${showType t}'"
     else
-      truncated;
+      wrapTo t v;
+
+  # The number v rounded to single precision (R.roundF32) for a constant at at; a result
+  # beyond the largest float is an error, where the generated code throws.
+  toF32At =
+    at: v:
+    let
+      f = R.roundF32 v;
+    in
+    if R.inF32 f then f else fail at "floating-point constant out of the range of 'float'";
 
   # The type is tested before the value, so the address of a constant pointer is not read.
   isNullConst = x: x.kind == "lit" && isInteger x.type && x.value == 0;
@@ -1026,8 +1047,8 @@ let
 
   # Value of `a op b` (+ - * /) for the floating-point constants a and b of type t, the
   # result rounded to single precision for float, or null when it is not folded (a
-  # division by zero, which the generated code throws, and a result beyond the range of
-  # double).
+  # division by zero and, for float, a result beyond the largest float, which the
+  # generated code throws, and a result beyond the range of double).
   foldFloat =
     t: op: a: b:
     let
@@ -1040,15 +1061,18 @@ let
           a * b
         else
           a / b;
+      f = R.roundF32 r;
     in
     if op == "/" && b == 0 then
       null
     else if r > maxDouble || r < 0.0 - maxDouble then
       null
-    else if t.tag == "float" then
-      R.toF32 r
+    else if t.tag != "float" then
+      r
+    else if R.inF32 f then
+      f
     else
-      r;
+      null;
   maxDouble = 1.7976931348623157e308;
 
   # The "binop" node n folded to a constant when both operands are constants.
@@ -1237,7 +1261,7 @@ let
 
   # The constant of the "floatlit" node e: float (rounded to single precision) for an f or
   # F suffix, double otherwise (also for l and L: long double is double).
-  floatLit = e: if e.single then litAt e tFloat (R.toF32 e.value) else litAt e tDouble e.value;
+  floatLit = e: if e.single then litAt e tFloat (toF32At e e.value) else litAt e tDouble e.value;
 
   # Expression used for its value (void included): an array decays to a pointer to its
   # first element, and struct, union and va_list values are unsupported (see vaValue).

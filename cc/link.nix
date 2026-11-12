@@ -373,14 +373,7 @@ let
           args: genList (i: if elemAt asIs i then elemAt args i else B.u32 (elemAt args i)) (length args)
         else
           map B.u32;
-      retOf =
-        r:
-        if decl.ret.tag == "float" then
-          R.toF32 r
-        else if decl.ret.tag == "double" then
-          r + 0.0
-        else
-          T.wrapTo decl.ret r;
+      retOf = T.numberTo R.toF32 decl.ret;
       result =
         r:
         let

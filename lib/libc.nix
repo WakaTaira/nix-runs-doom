@@ -30,6 +30,8 @@
 # Unsupported functions (floating point, system, the variadic entries that are never
 # called through ecall) throw when called, and exit throws "libc: exit: <status>".
 # floatCalls holds atof and fabs with Nix-float arguments and results, for cc/.
+# stripZeros and decimalToDouble, the decimal conversion of atof, also serve the
+# floating-point literals of cc/lex.nix.
 let
   M = import ./mem.nix;
   B = import ./bits.nix;
@@ -696,12 +698,57 @@ let
     else
       roundBy qj (rh > halfH || rh == halfH && pl > 0) (rh == halfH && pl == 0);
 
+  # The digits s (decimal or hexadecimal) without their leading zeros, "" when none are
+  # left.
+  stripZeros = s: head (match "0*([0-9A-Fa-f]*)" s);
+
+  # The double nearest to the decimal number with the integer digits intDigits, the
+  # fraction digits fracDigits and the exponent digits expDigits (negative when expNeg),
+  # each possibly empty or with leading zeros, or null when the number is nonzero and
+  # reaches 10^308 (fromJSON fails from about 1.8 * 10^308 on). The value is fromJSON of
+  # the number in JSON form, which rounds correctly; a number without fraction digits and
+  # exponent gets `.0`, as fromJSON reads it as an integer otherwise (and fails from 2^63
+  # on).
+  decimalToDouble =
+    {
+      intDigits,
+      fracDigits,
+      expNeg,
+      expDigits,
+    }:
+    let
+      int = stripZeros intDigits;
+      exp = stripZeros expDigits;
+      expValue = if exp == "" then 0 else fromJSON exp;
+      # Whether the value reaches 10^308: the position of the first nonzero digit (the
+      # number of integer digits, or minus the zeros that start the fraction) plus the
+      # exponent.
+      fracZeros = stringLength (head (match "(0*).*" fracDigits));
+      lead = if int != "" then stringLength int else 0 - fracZeros;
+      nonzero = int != "" || fracZeros < stringLength fracDigits;
+      tooLarge = nonzero && !expNeg && (stringLength exp > 5 || expValue + lead > 308);
+      json =
+        (if int == "" then "0" else int)
+        + (
+          if fracDigits != "" then
+            ".${fracDigits}"
+          else if expDigits == "" then
+            ".0"
+          else
+            ""
+        )
+        + (
+          if expDigits == "" then "" else "e${if expNeg then "-" else ""}${if exp == "" then "0" else exp}"
+        );
+    in
+    if tooLarge then null else fromJSON json + 0.0;
+
   # strtod of the bytes bs, as atof reads them: spaces, an optional sign, decimal digits
   # with an optional `.`, and an optional exponent (e or E, an optional sign, digits;
   # left unread without digits), as far as they go; 0.0 without digits. The value is the
-  # double nearest to the number (fromJSON of it in JSON form). Hexadecimal numbers,
-  # infinities and NaNs are not read (they give 0.0, or the value of their leading
-  # digits), and a value from 1e308 on throws.
+  # double nearest to the number (decimalToDouble). Hexadecimal numbers, infinities and
+  # NaNs are not read (they give 0.0, or the value of their leading digits), and a value
+  # from 1e308 on throws.
   atofBytes =
     bs:
     let
@@ -711,7 +758,6 @@ let
       run = k: if isDigit (at k) then run (k + 1) else k;
       skip = k: if isSpaceB (at k) then skip (k + 1) else k;
       text = i: j: bytesToString (genList (k: elemAt bs (i + k)) (j - i));
-      strip = t: head (match "0*([0-9]*)" t);
       i0 = skip 0;
       sign = at i0 == 45 || at i0 == 43;
       i1 = if sign then i0 + 1 else i0;
@@ -719,29 +765,21 @@ let
       dot = at intEnd == 46;
       fracEnd = if dot then run (intEnd + 1) else intEnd;
       fracText = if dot then text (intEnd + 1) fracEnd else "";
-      intText = if strip (text i1 intEnd) == "" then "0" else strip (text i1 intEnd);
       e = at fracEnd;
       expNeg = at (fracEnd + 1) == 45;
       expStart = fracEnd + 1 + (if expNeg || at (fracEnd + 1) == 43 then 1 else 0);
       expEnd = run expStart;
       hasExp = (e == 101 || e == 69) && expEnd > expStart;
-      expDigits = if hasExp then strip (text expStart expEnd) else "";
-      expValue = if expDigits == "" then 0 else fromJSON expDigits;
-      fracZeros = stringLength (head (match "(0*).*" fracText));
-      nonzero = intText != "0" || fracZeros < stringLength fracText;
-      lead = if intText != "0" then stringLength intText else 0 - fracZeros;
-      tooLarge = nonzero && !expNeg && (stringLength expDigits > 5 || expValue + lead > 308);
-      json =
-        intText
-        + (if fracText == "" then "" else ".${fracText}")
-        + (
-          if hasExp then "e${if expNeg then "-" else ""}${if expDigits == "" then "0" else expDigits}" else ""
-        );
-      v = fromJSON json + 0.0;
+      v = decimalToDouble {
+        intDigits = text i1 intEnd;
+        fracDigits = fracText;
+        expNeg = hasExp && expNeg;
+        expDigits = if hasExp then text expStart expEnd else "";
+      };
     in
     if intEnd == i1 && fracText == "" then
       0.0
-    else if tooLarge then
+    else if v == null then
       throw "libc: atof: a value of 1e308 or more"
     else if at i0 == 45 then
       0.0 - v
@@ -1293,7 +1331,7 @@ let
 in
 functions
 // {
-  inherit floatCalls;
+  inherit floatCalls stripZeros decimalToDouble;
 
   # Initial world: an empty heap at heapBase, no open files and no output.
   mkWorld =

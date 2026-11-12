@@ -1901,6 +1901,8 @@ in
             double a2(void) { return atof("  -12.5xyz"); }
             double a3(void) { return atof("x1"); }
             double a4(void) { return atof(".25e-1"); }
+            double a5(void) { return atof("12345678901234567890"); }
+            double a6(void) { return atof("9223372036854775808x-"); }
             double f1(void) { return fabs(-0.25); }
             float f2(float x) { return fabs(x - 1); }
             int f3(void) { return fabs(-3) == 3; }
@@ -1912,6 +1914,8 @@ in
         (ret l "a2" [ ])
         (ret l "a3" [ ])
         (ret l "a4" [ ])
+        (ret l "a5" [ ])
+        (ret l "a6" [ ])
         (ret l "f1" [ ])
         (ret l "f2" [ 0.5 ])
         (ret l "f3" [ ])
@@ -1928,6 +1932,8 @@ in
       (-12.5)
       0.0
       0.025
+      1.2345678901234567e19
+      9223372036854775808.0
       0.25
       0.5
       1

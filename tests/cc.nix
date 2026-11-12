@@ -8737,6 +8737,47 @@ in
       1051372203
     ]
   )
+  (t "cc run: decimal literals from 2^63 on without a fraction or exponent; float overflow"
+    (
+      let
+        src = ''
+          double big(void) { return 9223372036854775808.; }
+          double digits(void) { return 12345678901234567890.; }
+          float bigF(void) { return 18446744073709551616.f; }
+          float maxF(void) { return 3.4028234e38f; }
+          float over(void) { return 1e38f * 10.0f; }
+        '';
+        f = Cc.load src;
+        R = import ../cc/runtime.nix;
+      in
+      [
+        (f.big M.empty).ret
+        (f.digits M.empty).ret
+        (f.bigF M.empty).ret
+        (R.f32Bits (f.maxF M.empty).ret)
+        (tryEval (builtins.deepSeq (f.over M.empty).ret null)).success
+        (map compileThrows [
+          "float g = 1e39f;"
+          "float g = 1e39;"
+          "float f(void) { return 1e39f; }"
+          "float g = 1e38f * 10.0f;"
+        ])
+      ]
+    )
+    [
+      9223372036854775808.0
+      1.2345678901234567e19
+      18446744073709551616.0
+      2139095039
+      false
+      [
+        true
+        true
+        true
+        true
+      ]
+    ]
+  )
   (t "cc compile: invalid floating-point operations and the unsupported forms throw" (map
     compileThrows
     [

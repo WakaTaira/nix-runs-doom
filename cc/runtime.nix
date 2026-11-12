@@ -161,8 +161,8 @@ let
   maxF32 = 340282346638528859811704183484516925440.0;
 
   # The int, float or double x rounded to IEEE single precision (to nearest, ties to
-  # even); a result beyond the largest float throws.
-  toF32 =
+  # even), without a range check: the result may lie beyond the largest float.
+  roundF32 =
     x:
     let
       ax = absF (x + 0.0);
@@ -174,24 +174,40 @@ let
     in
     if ax == 0 then
       0.0
-    else if r > maxF32 then
-      throw "cc: floating-point overflow in a conversion to float"
     else if x < 0 then
       0.0 - r
     else
       r;
 
+  # Whether the float r (a value of roundF32) lies within the range of float.
+  inF32 = r: !(absF r > maxF32);
+
+  # The int, float or double x rounded to IEEE single precision (roundF32); a result
+  # beyond the largest float throws.
+  toF32 =
+    x:
+    let
+      r = roundF32 x;
+    in
+    if inF32 r then r else throw "cc: floating-point overflow in a conversion to float";
+
+  # Whether the float or double x truncates toward zero to an integer in [lo, hi] (the
+  # range of an integer type).
+  fInRange =
+    lo: hi: x:
+    !(x <= lo - 1.0 || x >= hi + 1.0);
+
+  # The float or double x truncated toward zero, as an integer.
+  truncF = x: if x < 0 then builtins.ceil x else builtins.floor x;
+
   # The float or double x truncated toward zero to an integer in [lo, hi] (the range of
   # the target type); a value outside it throws.
   fToInt =
     lo: hi: x:
-    let
-      t = if x < 0 then builtins.ceil x else builtins.floor x;
-    in
-    if x <= lo - 1.0 || x >= hi + 1.0 then
-      throw "cc: floating-point value out of the range of the integer type"
+    if fInRange lo hi x then
+      truncF x
     else
-      t;
+      throw "cc: floating-point value out of the range of the integer type";
 
   # The bits (unsigned 32-bit) of the float x in IEEE single precision. -0.0 gives 0.
   f32Bits =
@@ -291,7 +307,11 @@ in
     wrapInt
     initData
     pow2f
+    roundF32
+    inF32
     toF32
+    fInRange
+    truncF
     fToInt
     f32Bits
     fromF32Bits
