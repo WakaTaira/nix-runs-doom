@@ -282,6 +282,68 @@ let
     (callWith M.empty src fn args).ret;
   compileThrows = src: !(tryEval (Cc.compile src)).success;
 
+  # Variadic definitions (called from Nix with the list of the variable arguments).
+  vaSrc = ''
+    typedef __builtin_va_list va_list;
+    int sum(int n, ...) {
+      va_list ap;
+      int s = 0;
+      __builtin_va_start(ap, n);
+      while (n-- > 0)
+        s += __builtin_va_arg(ap, int);
+      __builtin_va_end(ap);
+      return s;
+    }
+    unsigned mixedOut[6];
+    void mixed(int n, ...) {
+      va_list ap;
+      __builtin_va_start(ap, n);
+      mixedOut[0] = __builtin_va_arg(ap, int);
+      mixedOut[1] = __builtin_va_arg(ap, unsigned);
+      mixedOut[2] = (unsigned)__builtin_va_arg(ap, int);
+      mixedOut[3] = (unsigned)__builtin_va_arg(ap, const char *);
+      mixedOut[4] = (unsigned)__builtin_va_arg(ap, long long);
+      mixedOut[5] = (unsigned char)__builtin_va_arg(ap, int);
+    }
+    float half(int n, ...) {
+      va_list ap;
+      __builtin_va_start(ap, n);
+      return __builtin_va_arg(ap, double) / 2;
+    }
+    int again(int n, ...) {
+      va_list ap;
+      int a, b, c;
+      __builtin_va_start(ap, n);
+      a = __builtin_va_arg(ap, int);
+      b = __builtin_va_arg(ap, int);
+      __builtin_va_start(ap, n);
+      c = __builtin_va_arg(ap, int);
+      return a * 100 + b * 10 + c;
+    }
+    int copied(int n, ...) {
+      va_list a, b;
+      int x, y, z;
+      __builtin_va_start(a, n);
+      __builtin_va_copy(b, a);
+      x = __builtin_va_arg(a, int);
+      y = __builtin_va_arg(a, int);
+      z = __builtin_va_arg(b, int);
+      __builtin_va_end(a);
+      __builtin_va_end(b);
+      return x * 1000 + y * 100 + z * 10 + __builtin_va_arg(a, int);
+    }
+    int take(va_list ap) { return __builtin_va_arg(ap, int); }
+    int twice(int n, ...) {
+      va_list ap;
+      int a, b;
+      __builtin_va_start(ap, n);
+      a = take(ap);
+      b = take(ap);
+      __builtin_va_end(ap);
+      return a * 10 + b;
+    }
+  '';
+
   # Memory with the words ws at address 0x1000 onwards.
   wordsAt =
     ws: foldl' (m: i: M.storeWord m (4096 + 4 * i) (elemAt ws i)) M.empty (genList (i: i) (length ws));
@@ -8101,14 +8163,14 @@ in
     "one"
     [ ]
   ) 1)
-  (t "cc compile: calling or defining a variadic function throws"
+  (t "cc compile: calling a variadic function in a single file throws, defining one does not"
     (map compileThrows [
       "int printf(const char *fmt, ...); int f(void) { return printf(0); }"
       "int v(int a, ...) { return a; }"
     ])
     [
       true
-      true
+      false
     ]
   )
   (t "cc parse: '...' without a named parameter throws" (throws "int bad(...);") true)
@@ -8120,19 +8182,17 @@ in
     int (*fp)(va_list);
     int one(void) { int k(va_list *); typedef va_list w; return 1; }
   '' "one" [ ]) 1)
-  (t "cc compile: a variable, member, value or definition of va_list throws" (map
+  (t "cc compile: a va_list in memory, a cast, sizeof or return of va_list throws" (map
     (s: compileThrows ("typedef __builtin_va_list va_list; int vf(va_list ap); " + s))
     [
       "va_list x;"
       "extern va_list x; int f(void) { return 1; }"
       "va_list *p;"
-      "int f(void) { va_list x; return 1; }"
       "int f(void) { static va_list x; return 1; }"
       "int f(void) { extern va_list x; return 1; }"
       "struct s { va_list a; };"
       "int f(void) { return sizeof(va_list); }"
       "int f(void) { return (int)(va_list)0; }"
-      "int h(va_list a) { return 1; }"
       "va_list h(void);"
       "int f(void) { return vf(0); }"
       "va_list (*fp)(void);"
@@ -8140,7 +8200,155 @@ in
       "struct s { va_list (*fp)(int); };"
       "int f(void) { return sizeof(va_list (*)(void)); }"
     ]
-  ) (genList (_: true) 16))
+  ) (genList (_: true) 14))
+
+  # Variadic definitions and va_list values
+  (t "cc parse: the builtins of stdarg.h are va nodes; va_arg takes a type name"
+    (
+      let
+        es = map (st: st.expr) (lastBody ''
+          void f(int n, ...) {
+            __builtin_va_start(ap, n);
+            __builtin_va_arg(ap, const char *);
+            __builtin_va_copy(bp, ap);
+            __builtin_va_end(ap);
+          }
+        '');
+      in
+      map (e: [
+        e.kind
+        e.op
+        (map show e.args)
+        (if e ? type then showType e.type else null)
+      ]) es
+      ++ [ (head (items "int v(int a, ...) { return a; }")).variadic ]
+    )
+    [
+      [
+        "va"
+        "start"
+        [
+          "ap"
+          "n"
+        ]
+        null
+      ]
+      [
+        "va"
+        "arg"
+        [ "ap" ]
+        "char*"
+      ]
+      [
+        "va"
+        "copy"
+        [
+          "bp"
+          "ap"
+        ]
+        null
+      ]
+      [
+        "va"
+        "end"
+        [ "ap" ]
+        null
+      ]
+      true
+    ]
+  )
+  (t "cc run: a variadic definition takes its variable arguments as one list"
+    (
+      let
+        l = Cc.load vaSrc;
+      in
+      [
+        (l.sum M.empty 3 [
+          1
+          2
+          (-10)
+        ]).ret
+        (l.sum M.empty 0 [ ]).ret
+        (
+          let
+            mem = l.mixed M.empty 0 [
+              (-1)
+              (-2)
+              4294967295
+              4096
+              (-3)
+              4000
+            ];
+          in
+          genList (i: M.loadWord mem (l.__data.symbols.mixedOut + 4 * i)) 6
+        )
+        (l.half M.empty 1 [ 3.0 ]).ret
+        (l.again M.empty 2 [
+          5
+          6
+        ]).ret
+      ]
+    )
+    [
+      (-7)
+      0
+      [
+        4294967295
+        4294967294
+        4294967295
+        4096
+        4294967293
+        160
+      ]
+      1.5
+      565
+    ]
+  )
+  (t "cc run: va_copy and a va_list parameter leave the other list where it was"
+    (
+      let
+        l = Cc.load vaSrc;
+      in
+      [
+        (l.copied M.empty 0 [
+          1
+          2
+          3
+        ]).ret
+        (l.twice M.empty 0 [
+          3
+          4
+        ]).ret
+      ]
+    )
+    [
+      1213
+      33
+    ]
+  )
+  (t "cc compile: other uses of a va_list and misuses of the builtins throw" (map
+    (s: compileThrows ("typedef __builtin_va_list va_list; int vf(va_list ap); " + s))
+    [
+      "int f(int n, ...) { va_list ap; va_list *p = &ap; return 0; }"
+      "int g(void *p); int f(int n, ...) { va_list ap; return g(&ap); }"
+      "int f(int n, ...) { struct { va_list a; } s; return 0; }"
+      "int f(va_list ap) { return vf(*&ap); }"
+      "int f(int n, ...) { va_list ap, bp; __builtin_va_start(ap, n); bp = ap; return 0; }"
+      "int f(int n, ...) { va_list ap; __builtin_va_start(ap, n); va_list bp = ap; return 0; }"
+      "int f(int n, ...) { va_list ap; __builtin_va_start(ap, n); return ap ? 1 : 0; }"
+      "int f(int n, ...) { va_list ap; __builtin_va_start(ap, n); if (ap) return 1; return 0; }"
+      "int f(int n, ...) { va_list ap; return sizeof ap; }"
+      "int f(int n, ...) { va_list a[2]; return 0; }"
+      "int f(int n) { va_list ap; __builtin_va_start(ap, n); return 0; }"
+      "int f(int n, ...) { int ap; __builtin_va_start(ap, n); return 0; }"
+      "int f(int n, ...) { va_list ap; __builtin_va_start(ap); return 0; }"
+      "struct s { int a; }; int f(int n, ...) { va_list ap; __builtin_va_start(ap, n); return __builtin_va_arg(ap, struct s).a; }"
+      "int f(int n, ...) { va_list ap; __builtin_va_start(ap, n); __builtin_va_arg(ap, va_list); return 0; }"
+      "int f(va_list ap) { return 0; } int (*p)(va_list) = f;"
+      "int v(int a, ...) { return a; } int (*p)(int, ...) = v;"
+      "int f(int n, ...) { va_list ap; __builtin_va_start(ap, n); return (int)ap; }"
+    ]
+  ) (genList (_: true) 18))
 
   # Unions
   (t "cc run: union sizes and alignments"

@@ -77,11 +77,29 @@
 # are unsupported outside link mode (in link mode a call gives at least the fixed
 # arguments, and each variable argument is passed after the default argument promotions
 # (argPromote: char and short types to int, float to double); one of struct or union type
-# is unsupported). __builtin_va_list (the va_list of stdarg.h, see cc/parse.nix) may only
-# be named in a typedef and in the parameters of a function declaration: a variable,
-# member, return type, cast or sizeof of a type with it (hasVaList: through pointers,
-# arrays and the return types of function types, not their parameters), the definition of
-# a function with such a parameter and a call to one are unsupported ('va_list').
+# is unsupported).
+#
+# Variable arguments: a value of __builtin_va_list (the va_list of stdarg.h, see
+# cc/parse.nix) is the Nix list of the variable arguments that are left, each in the
+# representation of its promoted type. A variadic function definition (in a single file
+# too) takes them as a hidden last parameter, a list (`va`, see "Typed function"). A
+# va_list is an automatic local or a parameter, bound like any other (never in memory):
+# `__builtin_va_start(ap, last)` assigns the hidden parameter to ap (any number of times;
+# last is not evaluated), `__builtin_va_copy(d, s)` assigns s to d, `__builtin_va_end(ap)`
+# does nothing, and `__builtin_va_arg(ap, T)` assigns the tail of ap to ap and yields its
+# head converted to T as a cast converts a long long (a double for a floating-point T), so
+# any integer or pointer argument converts as its value does; a list that has run out
+# throws in builtins.head. T is a scalar or floating-point type. A va_list passes
+# unconverted to a parameter of type va_list (of a function of the unit, of another unit
+# or of the host), as a value, so the callee's va_arg never advances the caller's. Every
+# other use of a va_list value is unsupported ('va_list'): `=` and an initializer (use
+# va_copy), a variable argument, operators and conditions, and a call through a function
+# pointer to a function type with a va_list parameter. So are a va_list in memory (a
+# file-scope, static or extern variable, a member, an array, a pointer to one, `&`), a
+# cast to it, its sizeof and a function returning it (hasVaList: through pointers, arrays
+# and the return types of function types, not their parameters), and the use as a value
+# of a function with a va_list parameter or return value. Outside a variadic function,
+# va_start is an error.
 #
 # Floating point: float and double (long double is double, see cc/parse.nix) are
 # arithmetic types. Their values are Nix floats, a float value always one that IEEE single
@@ -168,6 +186,10 @@
 #                                                the target's type and may contain "old"; the
 #                                                expression yields the old value when post
 #                                                (postfix ++ and --), the new value otherwise
+#   { kind = "vahead"; expr; }                   the first element of the va_list expr; type
+#                                                long long, or double for a floating-point
+#                                                va_arg (see "Variable arguments")
+#   { kind = "vatail"; expr; }                   the va_list expr without its first element
 # `x op= y`, `++x` and `x--` are "assign" nodes whose value computes from "old".
 # Arrays, structs and unions are objects in memory: while an expression is checked they are
 # "deref" nodes of array, struct or union type (the address in expr), which never reach
@@ -220,7 +242,9 @@
 # name) per label.
 #
 # Typed function (position of its name):
-#   { name; ret; params = [ var ]; body = <block>; linkage; frames; line; col; }
+#   { name; ret; params = [ var ]; va; body = <block>; linkage; frames; line; col; }
+# va is the var of the hidden parameter of a variadic function (type __builtin_va_list,
+# named `va'`, no C name), after params, or null.
 # frames are the parameters kept in memory (see "Locals in memory"), which the body
 # begins by storing there, and only this file uses them.
 # linkage is "internal" or "external" (C99 6.2.2): internal when the first declaration of
@@ -1148,6 +1172,7 @@ let
           "prefix"
           "postfix"
           "call"
+          "va"
         ]
       )
       (
@@ -1205,6 +1230,8 @@ let
       assignExpr env e
     else if k == "comma" then
       commaExpr env e
+    else if k == "va" then
+      vaExpr env e
     else
       fail e "unexpected expression '${k}'";
 
@@ -1213,7 +1240,7 @@ let
   floatLit = e: if e.single then litAt e tFloat (R.toF32 e.value) else litAt e tDouble e.value;
 
   # Expression used for its value (void included): an array decays to a pointer to its
-  # first element, and struct and union values are unsupported.
+  # first element, and struct, union and va_list values are unsupported (see vaValue).
   valueOf =
     env: e:
     let
@@ -1225,6 +1252,8 @@ let
       x.expr
     else if isRecord x.type then
       unsupported e "${x.type.tag} value"
+    else if x.type.tag == "valist" then
+      unsupported e "'va_list'"
     else
       x;
 
@@ -1488,6 +1517,8 @@ let
     in
     if f.variadic then
       unsupported e "variadic function '${name}' used as a value"
+    else if sigHasVaList f then
+      unsupported e "'va_list'"
     else
       node e "deref" p.to {
         expr = if env.ctx.typeOnly then symbolAt e p else litAt e p (env.ctx.fnNum name);
@@ -1495,6 +1526,9 @@ let
 
   # Whether the signature f has a parameter or return value of a va_list type (hasVaList).
   sigHasVaList = f: hasVaList f.ret || any hasVaList f.params;
+  # Whether the signature f has a return value of a va_list type, or a parameter of a type
+  # with a va_list other than va_list itself (see "Variable arguments").
+  sigVaListUnsupported = f: hasVaList f.ret || any (p: p.tag != "valist" && hasVaList p) f.params;
 
   callExpr =
     env: e: if e ? callee then indirectCall env e (valueOf env e.callee) else directCall env e;
@@ -1509,8 +1543,9 @@ let
         i:
         let
           a = elemAt e.args i;
+          p = elemAt f.params i;
         in
-        assignConv a (elemAt f.params i) (rv env a);
+        if p.tag == "valist" then vaValue env a else assignConv a p (rv env a);
       # A variable argument: its value after the default argument promotions.
       vaArg =
         i:
@@ -1537,7 +1572,7 @@ let
       fail e "call to undeclared function '${e.name}'"
     else if f.variadic && env.ctx.link == null then
       unsupported e "call to the variadic function '${e.name}'"
-    else if sigHasVaList f then
+    else if sigVaListUnsupported f then
       unsupported e "'va_list'"
     else if f.unspecified && m > 0 then
       unsupported e "call with arguments to the function '${e.name}' declared without a prototype"
@@ -2089,6 +2124,70 @@ let
       rhs = b;
     };
 
+  # A builtin of stdarg.h, the "va" node e (see "Variable arguments").
+  vaExpr =
+    env: e:
+    let
+      n = length e.args;
+      want =
+        {
+          start = 2;
+          arg = 1;
+          end = 1;
+          copy = 2;
+        }
+        .${e.op};
+      ap = vaValue env (head e.args);
+      discard = x: node e "cast" (ty "void") { expr = x; };
+      assignAp =
+        value:
+        node e "assign" ap.type {
+          target = ap;
+          inherit value;
+          post = false;
+        };
+      t = resolveType env e e.type;
+      # ap advanced to its tail, yielding the list before.
+      next = node e "assign" ap.type {
+        target = ap;
+        value = node e "vatail" ap.type { expr = oldOf ap; };
+        post = true;
+      };
+    in
+    if n != want then
+      fail e "too ${
+        if n < want then "few" else "many"
+      } arguments to function call, expected ${toString want}, have ${toString n}"
+    else if e.op == "start" then
+      if (env.va or null) == null then
+        fail e "'va_start' used in function with fixed args"
+      else
+        discard (assignAp (node e "var" ap.type { var = env.va; }))
+    else if e.op == "end" then
+      discard ap
+    else if e.op == "copy" then
+      discard (assignAp (vaValue env (elemAt e.args 1)))
+    else if hasVaList t then
+      unsupported e "'va_list'"
+    else if !(isScalar t || isFloat t) then
+      unsupported e "'va_arg' of type '${showType t}'"
+    else
+      mkCast t (node e "vahead" (if isFloat t then tDouble else tLLong) { expr = next; });
+
+  # The va_list value of the expression a: a variable or parameter of type va_list (also
+  # the one that a builtin of stdarg.h assigns).
+  vaValue =
+    env: a:
+    let
+      x = ex env a;
+    in
+    if x.type.tag != "valist" then
+      fail a "incompatible conversion from '${showType x.type}' to '__builtin_va_list'"
+    else if x.kind != "var" then
+      unsupported a "'va_list'"
+    else
+      x;
+
   # ---- Integer constant expressions ----
   # constExpr hooks e: the expression node e (cc/parse.nix) evaluated at compile time to a
   # typed "lit" node of an integer type, with the types, conversions and wrapping of the
@@ -2437,7 +2536,7 @@ let
             r = declare acc.env d d.name t;
             init = if d.init == null then null else assignConv d.init t (rv r.env d.init);
           in
-          if hasVaList t then
+          if hasVaList t && t.tag != "valist" then
             unsupported d "'va_list'"
           else if isArray t || isRecord t || how == "frame" then
             frameLocal acc d t how
@@ -3738,8 +3837,19 @@ let
           inherit (r) env;
           vars = acc.vars ++ [ r.var ];
         };
+      # The hidden parameter of a variadic function (see "Variable arguments").
+      va =
+        if sig.variadic then
+          {
+            key = localKey f "va'";
+            name = "va'";
+            type = ty "valist";
+          }
+        else
+          null;
       fenv = env // {
         inherit (sig) ret;
+        inherit va;
         fn = f.name;
       };
       ps = foldl' step {
@@ -3771,7 +3881,7 @@ let
       items = stores ++ blockItems benv f.body.items;
       llongFrame = filter (x: x.var.type.tag == "llong") frameParams;
     in
-    if sigHasVaList sig then
+    if sigVaListUnsupported sig then
       unsupported f "'va_list'"
     else if llongFrame != [ ] then
       unsupported (head llongFrame).p "8-byte integer in a local variable in memory"
@@ -3780,6 +3890,7 @@ let
       // {
         inherit (f) name;
         inherit (sig) ret;
+        inherit va;
         params = ps.vars;
         frames = map (x: frameObject benv x.p x.var.type x.sym) frameParams;
         body = posOf f.body // {

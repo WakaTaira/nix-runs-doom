@@ -70,16 +70,16 @@
 #   { kind = "typedef"; name; type; }
 #   { kind = "proto"; name; ret = <type>; params = [ <param> ]; variadic; unspecified;
 #     storage; }
-#   { kind = "func"; name; ret = <type>; params = [ <param> ]; storage; body = <block>; }
+#   { kind = "func"; name; ret = <type>; params = [ <param> ]; variadic; storage;
+#     body = <block>; }
 #   { kind = "global"; name; type; storage; init = <initializer or null>; }
 #       file-scope variable; storage is null, "static" or "extern".
 #   One declaration may declare several names (`int f(int), g(void);`); each becomes
 #   its own item. A declarator whose type is a function declares a proto or a func (ret,
 #   params, variadic and unspecified are those of the function type), whose storage is
-#   null, "static" or "extern" as for variables. Defining a variadic function is
-#   unsupported. The `()` of a definition specifies no parameters (a func has no
-#   unspecified); every other function declarator with `()` (of a proto, a function
-#   pointer type, a parameter or a type name) is unspecified.
+#   null, "static" or "extern" as for variables. The `()` of a definition specifies no
+#   parameters (a func has no unspecified); every other function declarator with `()` (of
+#   a proto, a function pointer type, a parameter or a type name) is unspecified.
 #
 # Tag definitions (position: the `struct`, `union` or `enum` keyword), at file scope as
 # items and at block scope in the decls of a "decl" statement. They come before the
@@ -170,6 +170,12 @@
 #   { kind = "assign"; op; lhs; rhs; }                     position: the operator
 #       op: "=" "*=" "/=" "%=" "+=" "-=" "<<=" ">>=" "&=" "^=" "|="
 #   { kind = "comma"; lhs; rhs; }                          `lhs, rhs`; position: the `,`
+#   { kind = "va"; op; args = [ <expression> ]; }          a call of __builtin_va_start
+#       (op "start"), __builtin_va_end ("end") or __builtin_va_copy ("copy"), the macros
+#       of stdarg.h; position: the name. The number of arguments is left to the checker.
+#   { kind = "va"; op = "arg"; args = [ <expression> ]; type; }
+#       `__builtin_va_arg(ap, type)`, whose second operand is a type name; position: the
+#       name
 # Parentheses leave no node. Binary operators and the comma operator are
 # left-associative, and `?:` and assignment are right-associative, with C precedence (from
 # loosest): comma, assignment, ?:, ||, &&, |, ^, &, == !=, < > <= >=, << >>, + -, * / %;
@@ -1695,9 +1701,7 @@ let
           unnamed = builtins.filter (p: p.name == null) params;
           body = compound (shadowAll tn (map (p: p.name) params)) d.i;
         in
-        if d.type.variadic then
-          unsupported d.nameTok "definition of a variadic function"
-        else if unnamed != [ ] then
+        if unnamed != [ ] then
           fail (head unnamed) "parameter name omitted in a function definition"
         else
           {
@@ -1705,7 +1709,7 @@ let
               (mk d.nameTok "func" {
                 inherit (d) name;
                 inherit params;
-                inherit (d.type) ret;
+                inherit (d.type) ret variadic;
                 inherit (sp) storage;
                 body = structureGotos body.node;
               })
@@ -2250,6 +2254,8 @@ let
             };
             i = expect idx.i "]";
           }
+        else if x == "(" && e.node.kind == "ident" && hasAttr e.node.name vaOps then
+          postfixOps tn (vaCall tn e)
         else if x == "(" then
           postfixOps tn {
             node = mk e.node "call" (
@@ -2281,6 +2287,41 @@ let
             }
         else
           e;
+
+      # The builtins of stdarg.h (see the "va" node in the header).
+      vaOps = {
+        __builtin_va_start = "start";
+        __builtin_va_arg = "arg";
+        __builtin_va_end = "end";
+        __builtin_va_copy = "copy";
+      };
+      # The "va" node of the call of such a builtin, its name the node of e and its `(` at
+      # e.i -> { node; i; } with i after `)`.
+      vaCall =
+        tn: e:
+        let
+          op = vaOps.${e.node.name};
+          ap = assignExpr tn (e.i + 1);
+          ty = typeName tn (expect ap.i ",");
+          args = argList tn (e.i + 1);
+        in
+        if op == "arg" then
+          {
+            node = mk e.node "va" {
+              inherit op;
+              args = [ ap.node ];
+              inherit (ty) type;
+            };
+            i = expect ty.i ")";
+          }
+        else
+          {
+            node = mk e.node "va" {
+              inherit op;
+              args = args.list;
+            };
+            inherit (args) i;
+          };
 
       # Arguments after `(` -> { list; i; } with i after `)`.
       argList =

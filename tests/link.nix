@@ -1127,7 +1127,7 @@ in
       true
     ]
   )
-  (t "cc link 13: linkFiles with a shared header (struct typedef and extern declarations)"
+  (t "cc link: linkFiles with a shared header (struct typedef and extern declarations)"
     [
       (ret pts "useB" [ ])
       (attrNames pts.__units)
@@ -1685,8 +1685,8 @@ in
       "int sn(char *b) { return snprintf(b, 4); }"
       "struct s { int a; } g; void run(void) { printf(\"%d\", g); }"
       "void run(void) { vprintf(\"x\", (va_list)0); }"
-      "void run(va_list ap) { vprintf(\"x\", ap); }"
-      "int mine(int a, ...) { return a; }"
+      "void run(va_list ap) { printf(\"%p\", ap); }"
+      "int mine(int a, ...) { va_list ap; va_start(ap, a); return mine(0, ap); }"
     ]
     ++ [
       (compileThrows ''int printf(const char *, ...); int f(void) { return printf("x"); }'')
@@ -1697,6 +1697,111 @@ in
       ))
     ]
   ) (genList (_: true) 8))
+  (t "cc link: a variadic definition reads its strings up to NULL, twice (M_StringJoin)" (outOf
+    (withStd {
+      "a.c" = ''
+        #include <stdio.h>
+        char *join(const char *first, ...);
+        void run(void) {
+          printf("%s|%s|", join("ab", "cd", "", "e", NULL), join("x", NULL));
+        }
+      '';
+      "b.c" = ''
+        #include <stdarg.h>
+        #include <stddef.h>
+        #include <stdlib.h>
+        #include <string.h>
+        char *join(const char *first, ...) {
+          va_list parts;
+          const char *p;
+          size_t n = strlen(first) + 1;
+          char *out;
+          va_start(parts, first);
+          for (;;) {
+            p = va_arg(parts, const char *);
+            if (p == NULL)
+              break;
+            n += strlen(p);
+          }
+          va_end(parts);
+          out = malloc(n);
+          strcpy(out, first);
+          va_start(parts, first);
+          for (;;) {
+            p = va_arg(parts, const char *);
+            if (p == NULL)
+              break;
+            strcpy(out + strlen(out), p);
+          }
+          va_end(parts);
+          return out;
+        }
+      '';
+    })
+    [
+      [ "run" ]
+    ]
+  ) "abcde|x|")
+  (t
+    "cc link 13: a variadic definition passes its va_list to a function that passes it to vsnprintf (M_snprintf)"
+    (printed (printfSrc ''
+      int fmtInto(char *buf, size_t len, const char *f, va_list args) {
+        int r;
+        if (len < 1)
+          return 0;
+        r = vsnprintf(buf, len, f, args);
+        if (r < 0 || r >= len) {
+          buf[len - 1] = '\0';
+          r = len - 1;
+        }
+        return r;
+      }
+      int fmt(char *buf, size_t len, const char *f, ...) {
+        va_list args;
+        int r;
+        va_start(args, f);
+        r = fmtInto(buf, len, f, args);
+        va_end(args);
+        return r;
+      }
+      void run(void) {
+        char b[32];
+        char c[6];
+        int n = fmt(b, sizeof b, "%d-%s-%c-%u", -12, "ok", 'z', 7u);
+        int m = fmt(c, sizeof c, "%s", "truncated");
+        printf("%s %d %s %d", b, n, c, m);
+      }
+    ''))
+    "-12-ok-z-7 10 trunc 5"
+  )
+  (t "cc link: va_arg of integer, pointer and double arguments, va_copy and a va_list passed on"
+    (printed (printfSrc ''
+      void show(int n, ...) {
+        va_list ap, bp;
+        va_start(ap, n);
+        va_copy(bp, ap);
+        int i = va_arg(ap, int);
+        unsigned u = va_arg(ap, unsigned);
+        const char *s = va_arg(ap, const char *);
+        long long ll = va_arg(ap, long long);
+        double d = va_arg(ap, double);
+        double f = va_arg(ap, double);
+        char c = va_arg(ap, int);
+        unsigned w = va_arg(ap, unsigned);
+        printf("%d %u %s %lld %f %f %c %u", i, u, s, ll, d, f, c, w);
+        printf(" / %d", va_arg(bp, int));
+        vprintf(" / %u %s", bp);
+        va_end(ap);
+        va_end(bp);
+      }
+      void run(void) {
+        float q = 0.25f;
+        short h = -2;
+        show(0, -5, 3000000000u, "str", -7LL, 2.5, q, 'z', h);
+      }
+    ''))
+    "-5 3000000000 str -7 2.500000 0.250000 z 4294967294 / -5 / 3000000000 str"
+  )
   (t "cc link: %f and %.Nf of snprintf round the exact binary value, ties to even"
     [
       (printed (printfSrc ''

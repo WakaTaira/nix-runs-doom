@@ -27,7 +27,11 @@
 #     depth bounded, since otherwise demanding the final memory walks back, nested,
 #     through every statement run so far. A call to a variadic function (link mode) is
 #     `<f>_fn mem <fixed arguments> [ <variable arguments> ]`, the list empty when there are
-#     none, its elements in the representation of their (promoted) types.
+#     none, its elements in the representation of their (promoted) types. A variadic
+#     function is `mem: <params>: va'_0:`, which takes that list. A va_list is a variable
+#     whose value is such a list ([ ] before an assignment); va_arg binds
+#     `builtins.tail <list>` to it and converts `builtins.head <list>` (cc/check.nix,
+#     "Variable arguments").
 #   - A call through a function pointer (cc/check.nix, "Function pointers") is
 #     `(elemAt tab'<shape> <pointer>) mem <arguments>`, with the pointer, then the
 #     arguments, evaluated left to right, and no test of the number: 0 gives the element
@@ -289,8 +293,16 @@ let
           atom (lit ax);
     in
     if x < 0 then neg pos else pos;
-  # The zero of the type t as code: 0.0 for float and double, whose values are Nix floats.
-  zeroOf = t: if T.isFloat t then floatNum 0.0 else num 0;
+  # The zero of the type t as code: 0.0 for float and double, whose values are Nix floats,
+  # and the empty list for a va_list.
+  zeroOf =
+    t:
+    if T.isFloat t then
+      floatNum 0.0
+    else if t.tag == "valist" then
+      atom "[ ]"
+    else
+      num 0;
   wrap = max: c: if c.prec <= max then c.code else "(${c.code})";
   app = f: args: cv 1 (concatStringsSep " " ([ f ] ++ map (wrap 0) args));
   # Left-associative and non-associative infix operators of strength p.
@@ -694,6 +706,10 @@ let
       assign s e true
     else if k == "comma" then
       afterLhs expr s e
+    else if k == "vahead" then
+      mapC (expr s e.expr) (c: app "builtins.head" [ c ])
+    else if k == "vatail" then
+      mapC (expr s e.expr) (c: app "builtins.tail" [ c ])
     else
       throw "cc: internal error: unexpected expression '${k}'";
 
@@ -3566,7 +3582,8 @@ let
   func =
     f:
     let
-      params = f.params;
+      # The hidden parameter of a variadic function comes last.
+      params = f.params ++ (if (f.va or null) == null then [ ] else [ f.va ]);
       s0 = {
         n = 1;
         mem = "mem";
