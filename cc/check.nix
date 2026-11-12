@@ -153,7 +153,8 @@
 # "deref" nodes of array, struct or union type (the address in expr), which never reach
 # the typed tree, and so are function designators (see "Function pointers"). An array used
 # as a value decays to a pointer to its first element; a
-# struct or union is only used through its members, its address and sizeof. A string
+# struct or union is only used through its members, its address, sizeof and the copies of
+# "Struct and union assignment". A string
 # literal is such an array object of type char[N] (N counts the 0 at the end) at a
 # constant address; its contents are read from memory, never folded, so it is not part
 # of an integer constant expression (but sizeof of it is).
@@ -173,7 +174,10 @@
 #                                                     in memory is a "decl" node followed by
 #                                                     "expr" nodes of the stores (a block of
 #                                                     them where one statement is due)
-#   { kind = "expr"; expr; }                          expr may have type void
+#   { kind = "expr"; expr; }                          expr may have type void; a struct
+#                                                     or union assignment is a block of
+#                                                     "decl" and "expr" nodes instead (see
+#                                                     "Struct and union assignment")
 #   { kind = "if"; cond; thenStmt; elseStmt; }        elseStmt is a statement or null
 #   { kind = "while"; cond; body; }
 #   { kind = "do"; body; cond; }
@@ -262,6 +266,25 @@
 # a name that is a function stays a direct call. A call through a pointer to a variadic
 # function type, or to one with a floating-point, va_list, struct or union parameter or
 # return value, is unsupported.
+#
+# Struct and union assignment
+# ---------------------------
+# An expression statement `a = b` whose operands are objects of one struct or union type
+# (types that agree, see typesAgree; complete), wherever they are (file-scope variables,
+# locals in memory, `*p`, `p->m`, array elements), copies the bytes of b into a, and so
+# does the initializer of a local struct or union from such an object (`struct S x = y;`,
+# see frameLocal). The copy is a "block" of existing nodes (recordCopy): a "decl" node
+# that binds the address of b, unless it is a constant or a variable, and then reads each
+# unit of b into a variable, then a "decl" node that binds the address of a likewise, then
+# one "expr" node with the "assign" of each unit to a, in order of offset. Every read
+# comes before the first store, so overlapping objects copy the values that b had before
+# the assignment. A unit is a 4-byte word when the alignment of the type is 4 or more,
+# otherwise a 2-byte half or a byte as the alignment gives (a packed type is copied byte
+# by byte); there is no loop. The variables are named `copy'src`, `copy'dst` and
+# `copy'<k>` for the unit k, with the key `<name>@<position of the assignment or the
+# declarator>`. An assignment whose value is used (`x = a = b`, `(a = b).m`, any other
+# position than a whole expression statement, the clauses of a for included), a compound
+# assignment, and passing, returning and comparing a struct or union stay unsupported.
 let
   B = import ../lib/bits.nix;
   inherit (builtins)
@@ -2146,7 +2169,17 @@ let
         inherit (r) env;
       }
     else if k == "expr" then
-      at { expr = valueOf env n.expr; }
+      let
+        e = n.expr;
+        lhs = if kindOf e == "assign" && e.op == "=" then ex env e.lhs else null;
+      in
+      if lhs != null && isRecord lhs.type then
+        {
+          node = recordAssign env e lhs // linkUses env [ e ];
+          inherit env;
+        }
+      else
+        at { expr = valueOf env e; }
     else if k == "empty" then
       {
         node = null;
@@ -2340,7 +2373,7 @@ let
   # time the declaration is reached: a local in memory stores every scalar of it in order
   # and 0 in the bytes that it leaves out (fillZeros), and a split array binds its
   # elements, 0 for those that it leaves out (splitInits). A struct or union initialized
-  # from an expression is unsupported.
+  # from an expression copies that object (see recordFrom).
   frameLocal =
     acc: d: t: how:
     let
@@ -2350,6 +2383,7 @@ let
       env' = bindObject env name t sym;
       elems = genList (elemVar d name t) t.len;
       senv = bindSplit env name t elems;
+      copied = isRecord t && d.init != null && d.init.kind != "initlist";
       writes = localWrites env t d.init;
       # The expressions of its scalars, whose string literals need storage (see stringUses).
       strings =
@@ -2360,9 +2394,7 @@ let
       };
     in
     builtins.seq (checkLocal env d name) (
-      if isRecord t && d.init != null && d.init.kind != "initlist" then
-        unsupported d "initializer of a local ${t.tag} variable"
-      else if isArray t && t.len == null then
+      if isArray t && t.len == null then
         fail d "definition of variable with array type needs an explicit size or an initializer"
       else if !isComplete env.ctx t then
         fail d "variable '${name}' has incomplete type '${showType t}'"
@@ -2380,7 +2412,14 @@ let
         acc
         // frame
         // {
-          items = acc.items ++ map (w: { stmt = frameInitStore env' d sym w; }) (fillZeros env.ctx t writes);
+          items =
+            acc.items
+            ++ (
+              if copied then
+                [ { stmt = recordFrom env.ctx d (objectAt env.ctx d t sym) (ex env' d.init); } ]
+              else
+                map (w: { stmt = frameInitStore env' d sym w; }) (fillZeros env.ctx t writes)
+            );
           inherit strings;
           uses = acc.uses ++ usesOf env' d.init;
         }
@@ -2656,8 +2695,8 @@ let
   # those of its scalars and stores of 0 in every byte that the initializer leaves out
   # (words, halves or bytes as the offsets and the alignment of its type allow, padding
   # included); a split array binds its elements, 0 for those that it leaves out. A struct
-  # or union initialized from an expression, and a braced initializer of a "bind" scalar,
-  # are unsupported.
+  # or union initialized from an expression copies the object (see "Struct and union
+  # assignment"); a braced initializer of a "bind" scalar is unsupported.
 
   # The key of the local variable or parameter name declared at the node at.
   localKey = at: name: "${name}@${idOf at}";
@@ -2933,6 +2972,110 @@ let
         inherit value;
         post = false;
       };
+    };
+
+  # The statement of the struct or union assignment e (`a = b` as an expression statement,
+  # see "Struct and union assignment"), with dst its typed left operand.
+  recordAssign =
+    env: e: dst:
+    recordFrom env.ctx e dst (ex env e.rhs);
+
+  # The statement at the node at that copies the object src into the struct or union object
+  # dst, or the error when src is not an object of a type that agrees with that of dst.
+  recordFrom =
+    ctx: at: dst: src:
+    if !isComplete ctx dst.type then
+      fail at "incomplete type '${showType dst.type}' is not assignable"
+    else if !(isRecord src.type && typesAgree dst.type src.type) then
+      fail at "incompatible conversion from '${showType src.type}' to '${showType dst.type}'"
+    else
+      recordCopy ctx at dst src;
+
+  # The statement at the node at that copies the struct or union object src into the object
+  # dst ("deref" nodes of one complete record type): a block that binds the address of src,
+  # then reads each unit of src into a variable, then binds the address of dst, then stores
+  # the units into dst in order, so every read comes before the first store. An address
+  # that is neither a constant nor a variable is bound to a variable, so it is evaluated
+  # once. A unit is a word when the alignment of the type is 4 or more, otherwise a half or
+  # a byte as the alignment gives.
+  recordCopy =
+    ctx: at: dst: src:
+    let
+      align = alignOfT ctx dst.type;
+      u =
+        if align >= 4 then
+          4
+        else if align >= 2 then
+          2
+        else
+          1;
+      ut = unsignedOfSize u;
+      count = div (sizeOfT ctx dst.type) u;
+      # The names contain a ', so they are no C names, and they end with no ', so they
+      # are no element of a split array either.
+      temp = name: type: {
+        key = "${name}@${idOf at}";
+        inherit name type;
+      };
+      varNode = v: node at "var" v.type { var = v; };
+      # -> { vars; addr; } with vars the binding of the address p, when it needs one.
+      bound =
+        name: p:
+        if p.kind == "lit" || p.kind == "var" then
+          {
+            vars = [ ];
+            addr = p;
+          }
+        else
+          let
+            v = temp name p.type;
+          in
+          {
+            vars = [
+              {
+                var = v;
+                init = p;
+              }
+            ];
+            addr = varNode v;
+          };
+      from = bound "copy'src" src.expr;
+      to = bound "copy'dst" dst.expr;
+      unitAt = p: i: node at "deref" ut { expr = addBytes at (ptrTo ut) p (i * u); };
+      units = genList (i: temp "copy'${toString i}" ut) count;
+      decl =
+        vars:
+        posOf at
+        // {
+          kind = "decl";
+          inherit vars;
+        };
+      store =
+        i:
+        posOf at
+        // {
+          kind = "expr";
+          expr = node at "assign" ut {
+            target = unitAt to.addr i;
+            value = varNode (elemAt units i);
+            post = false;
+          };
+        };
+    in
+    posOf at
+    // {
+      kind = "block";
+      items = [
+        (decl (
+          from.vars
+          ++ imap0 (i: v: {
+            var = v;
+            init = unitAt from.addr i;
+          }) units
+        ))
+      ]
+      ++ (if to.vars == [ ] then [ ] else [ (decl to.vars) ])
+      ++ genList store count;
     };
 
   # A block-scope function declaration: the function of the same name in the translation

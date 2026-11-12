@@ -1964,6 +1964,59 @@ let
     int splitWords(void) { char *w[2] = { "no", "yes" }; return w[0][1] * 1000 + w[1][2]; }
     int braced(int k) { int x = { k + 1 }; int *p = &x; return *p; }
   '';
+  # Struct and union assignments and struct initializers from objects. t (10 bytes, 2-byte
+  # aligned) and the buffers that overlap and loopCopy take are filled by the tests.
+  recordSrc = ''
+    struct S { int a; short b; char c; };
+    struct S g;
+    int toGlobal(void) { struct S l; l.a = 1; l.b = 2; l.c = 3; g = l; return g.a + g.b + g.c; }
+    struct T { short h[3]; unsigned char b[4]; };
+    struct T t[3];
+    void elems(void) { t[1] = t[0]; }
+    void elemsAt(int i, int j) { t[i] = t[j]; }
+    struct H { short h[4]; };
+    struct P { short x, y; struct H m; };
+    void overlap(struct P *p) { struct H *q = (struct H *)((char *)p + 2); p->m = *q; }
+    struct Q { int a, b, c; };
+    struct W { int k; struct Q m; };
+    void overlapWords(struct W *p) { p->m = *(struct Q *)p; }
+    struct V { int x; int y; };
+    struct V gv;
+    int loopCopy(struct V *p, int n) {
+      struct V v; int s = 0; int i;
+      for (i = 0; i < n; i++) { p->x = i; p->y = 2 * i; v = *p; s = s + v.x * 10 + v.y; }
+      return s;
+    }
+    int loopBack(int n) {
+      struct V v; int s = 0; int i;
+      v.x = 0; v.y = 0;
+      for (i = 0; i < n; i++) { v.x = v.x + 1; v.y = v.y + 2; gv = v; s = s + gv.x * 10 + gv.y; }
+      return s;
+    }
+    int loopHit(struct V *p, int n) {
+      struct V v; int s = 0; int i;
+      for (i = 0; i < n; i++) { v.x = i; v.y = i + 1; *p = v; s = s + gv.x * 10 + gv.y; }
+      return s;
+    }
+    union U { int i; unsigned char c[6]; };
+    union U ua, ub;
+    int unions(int k) {
+      ub.i = k; ub.c[4] = 9; ub.c[5] = 8; ua = ub;
+      return ua.c[0] + ua.c[4] * 1000 + ua.c[5] * 100000;
+    }
+    union R { short s; unsigned char c[3]; };
+    int unionHalves(int k) { union R a, b; b.s = k; b.c[2] = 5; a = b; return a.c[0] + a.c[2] * 1000; }
+    int declared(int k) {
+      struct S y; y.a = k; y.b = 2; y.c = 3;
+      struct S x = y;
+      y.a = 0;
+      return x.a * 100 + x.b * 10 + x.c + y.a;
+    }
+    int declElem(int i) { struct T x = t[i]; return x.h[2] * 1000 + x.b[3]; }
+    struct __attribute__((packed)) K { char a; int b; };
+    struct K k0, k1;
+    int packed(void) { k0.a = 1; k0.b = 70000; k1 = k0; return k1.a + k1.b; }
+  '';
 
 in
 [
@@ -3965,9 +4018,9 @@ in
     (compileThrows "struct s; int f(int *p) { return p->a; }")
     true
   )
-  (t "cc compile: struct assignment throws"
+  (t "cc compile: struct assignment as an expression statement compiles"
     (compileThrows "struct s { int a; }; struct s x, y; void f(void) { x = y; }")
-    true
+    false
   )
   (t "cc compile: struct passed or returned by value throws"
     (map compileThrows [
@@ -7808,7 +7861,7 @@ in
     ]
   )
   (t "cc compile: union values and parameters throw" (map compileThrows [
-    "union u { int a; }; union u x, y; void f(void) { x = y; }"
+    "union u { int a; }; union u x, y; int f(void) { return (x = y).a; }"
     "union u { int a; }; void f(union u x) { }"
     "union u { int a; }; union u f(void);"
     "union u { int a; }; union u g = 1;"
@@ -9591,18 +9644,13 @@ in
       true
     ]
   )
-  (t
-    "cc compile: a struct initialized from a value, arrays without a length and 8-byte integers in memory throw"
-    (map compileThrows [
-      "struct s { int a; }; struct s g; void f(void) { struct s x = g; }"
-      "void f(void) { int a[]; }"
-      "void f(void) { long long x; long long *p = &x; }"
-      "void f(long long v) { long long *p = &v; }"
-      "void f(int i) { long long a[2]; a[i] = 1; }"
-      "struct s; void f(void) { struct s x; }"
-    ])
-    (genList (_: true) 6)
-  )
+  (t "cc compile: arrays without a length and 8-byte integers in memory throw" (map compileThrows [
+    "void f(void) { int a[]; }"
+    "void f(void) { long long x; long long *p = &x; }"
+    "void f(long long v) { long long *p = &v; }"
+    "void f(int i) { long long a[2]; a[i] = 1; }"
+    "struct s; void f(void) { struct s x; }"
+  ]) (genList (_: true) 5))
 
   # Initializers of locals in memory and of split arrays
   (t "cc run: an initializer stores 0 in what it leaves out on every call"
@@ -9785,4 +9833,159 @@ in
       "void f(void) { int y = { 1, 2 }; int *q = &y; }"
     ]
   ) (genList (_: true) 5))
+
+  # Struct and union assignments
+  (t "cc run: a local struct assigned to a global copies its members"
+    [
+      (dret recordSrc "toGlobal" [ ])
+      (contains "copy'1_" (fnCode recordSrc "toGlobal"))
+      (contains "copy'2_" (fnCode recordSrc "toGlobal"))
+    ]
+    [
+      6
+      true
+      false
+    ]
+  )
+  (t "cc run: an assignment between elements of a 2-byte aligned array copies 10 bytes"
+    (
+      let
+        d = loadData Cc.load recordSrc;
+        at = d.f.__data.symbols.t;
+        mem = foldl' (m: i: M.storeByte m (at + i) (i + 1)) d.mem (genList (i: i) 30);
+        bytes = m: genList (i: M.loadByte m (at + i)) 30;
+        from = k: genList (i: k + i + 1) 10;
+      in
+      [
+        (bytes (d.f.elems mem))
+        (bytes (d.f.elemsAt mem 2 0))
+        (contains "M.storeHalf" (fnCode recordSrc "elems"))
+        (contains "copy'4_" (fnCode recordSrc "elems"))
+        (contains "storeRun" (fnCode recordSrc "elems"))
+      ]
+    )
+    [
+      (genList (i: i + 1) 10 ++ genList (i: i + 1) 10 ++ genList (i: i + 21) 10)
+      (genList (i: i + 1) 20 ++ genList (i: i + 1) 10)
+      true
+      true
+      false
+    ]
+  )
+  (t "cc run: an overlapping struct assignment copies the values before it"
+    [
+      (genList (
+        i:
+        M.loadHalf (callWith (wordsAt [
+          131073
+          262147
+          393221
+        ]) recordSrc "overlap" [ 4096 ]) (4096 + 2 * i)
+      ) 6)
+      (genList (
+        i:
+        M.loadWord (callWith (wordsAt [
+          1
+          2
+          3
+          4
+        ]) recordSrc "overlapWords" [ 4096 ]) (4096 + 4 * i)
+      ) 4)
+    ]
+    [
+      [
+        1
+        2
+        2
+        3
+        4
+        5
+      ]
+      [
+        1
+        1
+        2
+        3
+      ]
+    ]
+  )
+  (t "cc run: a struct assigned in a loop is read with its new values"
+    (
+      let
+        d = loadData Cc.load recordSrc;
+        gv = d.f.__data.symbols.gv;
+      in
+      [
+        (d.f.loopCopy d.mem 4096 4).ret
+        (d.f.loopBack d.mem 4).ret
+        (d.f.loopHit d.mem gv 4).ret
+        (d.f.loopHit d.mem 4096 4).ret
+        (contains "hit_" (fnCode recordSrc "loopHit"))
+      ]
+    )
+    [
+      72
+      120
+      70
+      0
+      true
+    ]
+  )
+  (t "cc run: union assignments copy words or halves"
+    [
+      (dret recordSrc "unions" [ 7 ])
+      (dret recordSrc "unionHalves" [ 7 ])
+      (contains "M.storeHalf" (fnCode recordSrc "unionHalves"))
+    ]
+    [
+      809007
+      5007
+      true
+    ]
+  )
+  (t "cc run: a local struct initialized from an object copies it"
+    (
+      let
+        d = loadData Cc.load recordSrc;
+        at = d.f.__data.symbols.t;
+        mem = foldl' (m: i: M.storeByte m (at + i) (i + 1)) d.mem (genList (i: i) 30);
+      in
+      [
+        (d.f.declared d.mem 4).ret
+        (d.f.declElem mem 2).ret
+      ]
+    )
+    [
+      423
+      6681030
+    ]
+  )
+  (t "cc run: a packed struct is copied byte by byte"
+    [
+      (dret recordSrc "packed" [ ])
+      (contains "copy'4_" (fnCode recordSrc "packed"))
+      (contains "copy'5_" (fnCode recordSrc "packed"))
+    ]
+    [
+      70001
+      true
+      false
+    ]
+  )
+  (t "cc preprocessed: struct assignments give the same code through one macro"
+    (sameAsMacro recordSrc)
+    true
+  )
+  (t "cc compile: struct assignments used as values and invalid ones throw" (map compileThrows [
+    "struct s { int a; }; struct s x, y, z; void f(void) { x = y = z; }"
+    "struct s { int a; }; struct s x, y; int f(void) { return (x = y).a; }"
+    "struct s { int a; }; struct s x, y; int f(void) { if ((x = y).a) return 1; return 0; }"
+    "struct s { int a; }; struct s x, y; int f(void) { return x == y; }"
+    "struct s { int a; }; struct s x, y; void f(void) { x += y; }"
+    "struct s { int a; }; struct t { int a; }; struct s x; struct t y; void f(void) { x = y; }"
+    "struct s { int a; }; struct s x; void f(void) { x = 1; }"
+    "struct s; extern struct s x, y; void f(void) { x = y; }"
+    "struct s { int a; }; struct t { int a; }; struct t y; void f(void) { struct s x = y; }"
+    "struct s { int a; }; void f(void) { struct s x = 1; }"
+  ]) (genList (_: true) 10))
 ]

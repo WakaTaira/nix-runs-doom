@@ -434,6 +434,15 @@ let
     int g(void) { struct { int x; char c[3]; } q; q.x = 3; q.c[2] = 4; return q.x + q.c[2]; }
   '';
   frameUnit = lk [ (u "a" frameUnitSrc) ];
+  # Struct assignments to and from a variable of another unit.
+  recordUnits = lk [
+    (u "a" "struct V { int x; short y; }; struct V gv = { 5, 6 };")
+    (u "b" ''
+      struct V { int x; short y; };
+      extern struct V gv;
+      int back(int k) { struct V v = gv; v.x = v.x + k; gv = v; return gv.x * 10 + gv.y; }
+    '')
+  ];
   # Initializers of locals as the format, the arguments and the buffer of a host call.
   frameInitIo = withStd {
     "a.c" = ''
@@ -2253,6 +2262,22 @@ in
         0
       ]
       2
+    ]
+  )
+  (t "cc link: struct assignments to and from a variable of another unit"
+    (runCalls recordUnits [
+      [
+        "back"
+        3
+      ]
+      [
+        "back"
+        3
+      ]
+    ])
+    [
+      86
+      116
     ]
   )
 ]
