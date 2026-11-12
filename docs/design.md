@@ -146,6 +146,31 @@ behaviour.
     addresses, and a value that is no function (`(actionf_v)(-1)`) only serves as a mark
     to compare with and is never called.
 
+### Locals in memory live in a fixed frame
+
+- **What.** Arrays, structs, unions, and variables and parameters whose address is taken
+  (`&x`) live in memory, in a frame at a fixed address in the data area: one frame per
+  function, not per call (`cc/check.nix`, "Locals in memory"). A parameter whose address
+  is taken is written to its place at entry. The frame is not cleared at entry or at the
+  declaration, so it keeps the values of the previous run (C leaves them indeterminate);
+  an initializer is run each time the declaration is reached, writes the whole object,
+  and the parts it does not mention become 0. An array of scalars that is only used
+  through constant indices (`a[2]`) is not put in the frame but split into Nix bindings
+  `<name>'<k>'`; an element without an initializer reads as 0 until it is assigned.
+- **Why.** Speed. The frame costs nothing per call. A frame addressed from a stack
+  pointer costs 0.5 to 0.7 us more in every call (measured over a million calls).
+- **Observable differences.**
+  - A function that is entered again while it runs (recursion, mutual recursion, or a
+    call through a function pointer) overwrites the frame of the outer run with the
+    inner one, and the outer run then reads the inner values. This is not diagnosed.
+  - A local that is read before it is written holds the value of the last run instead of
+    an unpredictable one; a split array holds 0.
+  - Doom's sources do not depend on this: of the 64 functions with such locals (75
+    objects, 2,900 bytes of frames) only `P_NewChaseDir` can be entered again, and its
+    array is used through constant indices only, so it is split into bindings. (Its
+    re-entry needs a lost soul, which the shareware WAD does not have; the demo of the
+    scaffold never enters it twice at once.)
+
 ### The host state lives in the memory
 
 - **What.** The state of the host functions (the heap break, open files, output, clock,
