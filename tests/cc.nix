@@ -1340,9 +1340,11 @@ let
     32
     40
   ];
-  # The output of plain by the compiler of slice 5 (981b978), which has no bulk loop.
+  # The output of plain by the compiler of slice 5 (981b978), which has no bulk loop, with
+  # the body wrapped in the forcing of the memory on entry (slice 13).
   plainCode = concatStringsSep "\n" [
     "    mem: d_0: n_0:"
+    "    builtins.seq mem ("
     "    let"
     "      l_8 = R.loopDo ("
     "        v_1:"
@@ -1362,7 +1364,8 @@ let
     "          v_1 // { n = n_2; exit = true; }"
     "      ) { mem = mem; d = d_0; n = n_0; s = 0; };"
     "    in"
-    "    { mem = l_8.mem; ret = l_8.s; };"
+    "    { mem = l_8.mem; ret = l_8.s; }"
+    "    );"
   ];
 
   fixmulSrc = import ../cc/examples/spike.nix;
@@ -2016,6 +2019,28 @@ let
     struct __attribute__((packed)) K { char a; int b; };
     struct K k0, k1;
     int packed(void) { k0.a = 1; k0.b = 70000; k1 = k0; return k1.a + k1.b; }
+  '';
+
+  # ---- Slice 13: evaluation order ----
+  # Straight-line code that runs 1000 increments of a global through nested calls, and a
+  # double loop with a 2-byte store (no bulk form): without forcing the memory on function
+  # entry and after every loop iteration, demanding the result nests as deep as the
+  # statements run and exceeds the evaluator's call depth.
+  deepCallsSrc =
+    let
+      level =
+        i:
+        "void f${toString i}(void) { ${
+          concatStringsSep " " (genList (_: "f${toString (i - 1)}();") 10)
+        } }\n";
+    in
+    "int g;\nvoid f0(void) { g = g + 1; }\n"
+    + concatStringsSep "" (genList (i: level (i + 1)) 3)
+    + "int run(void) { f3(); return g; }\n";
+  nestedLoopsSrc = ''
+    short a[200 * 200];
+    void fill(void) { int x, y; for (y = 0; y < 200; y++) for (x = 0; x < 200; x++) a[x * 200 + y] = y; }
+    int run(void) { fill(); return a[0] + a[199] * 1000 + a[200 * 199 + 198] * 1000000; }
   '';
 
 in
@@ -10073,4 +10098,16 @@ in
     "struct s { int a; }; struct t { int a; }; struct t y; void f(void) { struct s x = y; }"
     "struct s { int a; }; void f(void) { struct s x = 1; }"
   ]) (genList (_: true) 10))
+  (t "cc run: 1000 statements run through nested calls do not exceed the call depth" (dret
+    deepCallsSrc
+    "run"
+    [ ]
+  ) 1000)
+  (t "cc run: a double loop of 40000 iterations does not exceed the call depth" (dret nestedLoopsSrc
+    "run"
+    [ ]
+  ) 198199000)
+  (t "cc compile: a function body forces the memory on entry" (contains "builtins.seq mem (" (
+    fnCode deepCallsSrc "f0"
+  )) true)
 ]

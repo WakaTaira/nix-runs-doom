@@ -70,8 +70,12 @@ let
   # loop carries (always including mem). Each iteration runs `body` while `cond`
   # holds; `body` may set `exit = true` to leave after the current iteration.
   # Iterations are folded 64 at a time, every carried variable is forced after each
-  # chunk to keep thunk chains short, and the recursion is per chunk.
+  # chunk to keep thunk chains short, and the recursion is per chunk. The mem of every
+  # iteration is forced as well: an inner loop leaves its memory as one thunk, and a
+  # chain of them across the iterations of an outer loop would nest as deep as their
+  # number when demanded.
   chunkLen = 64;
+  forceMem = r: seq r.mem r;
   chunkTicks = genList (_: null) chunkLen;
   forceVars = v: foldl' (acc: x: seq x acc) v (attrValues v);
   runLoop =
@@ -92,13 +96,13 @@ let
       if v.exit then
         v
       else if cond v then
-        body v
+        forceMem (body v)
       else
         v // { exit = true; }
     );
 
   # `loop` without a condition: each iteration runs `body` until it sets `exit = true`.
-  loopDo = body: runLoop (v: _: if v.exit then v else body v);
+  loopDo = body: runLoop (v: _: if v.exit then v else forceMem (body v));
 in
 {
   inherit

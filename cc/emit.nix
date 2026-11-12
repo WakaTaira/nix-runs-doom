@@ -22,7 +22,10 @@
 # calling the functions. The translation is
 # mechanical, except for the loop driver and the cached reads described below:
 #   - A C function becomes `mem: <params>:` returning the new memory, or { mem; ret; }
-#     when it returns a value. A call to a variadic function (link mode) is
+#     when it returns a value. Its body is `builtins.seq mem ( ... )`: forcing the memory
+#     on entry (and, in R.loop and R.loopDo, after every iteration) keeps the evaluation
+#     depth bounded, since otherwise demanding the final memory walks back, nested,
+#     through every statement run so far. A call to a variadic function (link mode) is
 #     `<f>_fn mem <fixed arguments> [ <variable arguments> ]`, the list empty when there are
 #     none, its elements in the representation of their (promoted) types.
 #   - A call through a function pointer (cc/check.nix, "Function pointers") is
@@ -3503,7 +3506,7 @@ let
       body = stmtK handlers s0 f.body (st: end st (num 0));
       signature = concatStringsSep " " ([ "mem:" ] ++ map (v: "${v.name}_0:") params);
     in
-    "  ${f.name}_fn =\n    ${indent (indent "${signature}\n${renderLet body.binds body.code}")};\n";
+    "  ${f.name}_fn =\n    ${indent (indent "${signature}\nbuiltins.seq mem (\n${renderLet body.binds body.code}\n)")};\n";
 
   # ---- Data ----
 
