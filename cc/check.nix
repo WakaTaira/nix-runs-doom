@@ -1704,7 +1704,13 @@ let
 
   unaryExpr = env: e: typeUnary e e.op (rv env e.expr);
 
-  # Typing of the unary operator op (- ~ !) on the typed operand x.
+  # Whether the expression e (untyped) is one of the operators + - ~ !, which give no
+  # lvalue. & and assignment test the expression, not its typed node: typeUnary returns
+  # the node of the operand itself for a + that keeps the type (a float, or an int without
+  # promotion), which is a "var" or "deref" node when the operand is an lvalue.
+  isUnaryOp = e: e.kind == "unary";
+
+  # Typing of the unary operator op (+ - ~ !) on the typed operand x.
   typeUnary =
     at: op: x:
     let
@@ -1868,7 +1874,7 @@ let
     in
     if x ? bitfield then
       fail e "address of a bit-field requested"
-    else if e.expr.kind == "unary" then
+    else if isUnaryOp e.expr then
       fail e "cannot take the address of an rvalue of type '${showType x.type}'"
     else if x.kind == "deref" && inFrameObject env e.expr then
       unsupported e "address of a local variable"
@@ -2313,7 +2319,7 @@ let
       unsupported e "${x.type.tag} assignment"
     else if x.type.tag == "fn" then
       fail e "non-object type '${showType x.type}' is not assignable"
-    else if (x.kind == "var" || x.kind == "deref") && e.kind != "unary" then
+    else if (x.kind == "var" || x.kind == "deref") && !isUnaryOp e then
       x
     else
       fail e "expression is not assignable";
@@ -4781,7 +4787,8 @@ let
   # constant or an address constant (a constant address, such as &g, &a[1], &s.m or an
   # array name, plus or minus constants); a float or double an arithmetic constant
   # expression (floatConst), stored in IEEE single or double precision. A double is
-  # stored as two words, the low one first, in words (see objectInits).
+  # stored as two words, the low one first, in words instead of size and value (see
+  # objectInits).
   scalarInit =
     env: t: a: x:
     let
@@ -4797,20 +4804,12 @@ let
     in
     {
       addr = a;
-      inherit size;
-      # The check sits on the value, so that walking the stores for their string literals
-      # (stringUses) raises no error before the values are read in order.
-      value =
-        if t.tag == "float" then
-          R.f32Bits v
-        else if t.tag == "double" then
-          w.lo
-        else
-          bitAnd v (B.pow2 (8 * size) - 1);
       # The initializer, whose string literals need storage (see stringUses).
       expr = x;
     }
     // (
+      # The check sits on the value, so that walking the stores for their string literals
+      # (stringUses) raises no error before the values are read in order.
       if t.tag == "double" then
         {
           words = [
@@ -4827,7 +4826,10 @@ let
           ];
         }
       else
-        { }
+        {
+          inherit size;
+          value = if t.tag == "float" then R.f32Bits v else bitAnd v (B.pow2 (8 * size) - 1);
+        }
     );
 
   # The value of the initializer x of the floating-point type t: an arithmetic constant
