@@ -16,6 +16,8 @@
 #               lib/hostcall.nix for its precision), screen the 320x200 palette
 #               indices (list of 64000 bytes) and palette 256 { r; g; b; }. screen and
 #               palette are read lazily from the memory snapshot taken at the call.
+#   keys        the pending key events, oldest first: { pressed; key; } (pressed 0 or 1,
+#               key a number of doomkeys.h); DG_GetKey takes them from the front
 { screenBufferAddr, colorsAddr }:
 let
   M = import ../lib/mem.nix;
@@ -25,7 +27,9 @@ let
     div
     elemAt
     genList
+    head
     seq
+    tail
     ;
 
   width = 320;
@@ -70,6 +74,7 @@ in
     ms = 0;
     frameCount = 0;
     frames = [ ];
+    keys = [ ];
   };
 
   impls = {
@@ -95,7 +100,22 @@ in
 
     DG_GetTicksMs = world: _: result world (B.u32 world.ms);
 
-    # No key events (input is not modelled yet).
-    DG_GetKey = world: _: result world 0;
+    # Takes the oldest pending key event, writing pressed (a word) and key (a byte) to
+    # the two addresses and returning 1, or returns 0 and writes nothing when there is none.
+    DG_GetKey =
+      world: a:
+      if world.keys == [ ] then
+        result world 0
+      else
+        let
+          event = head world.keys;
+        in
+        result (
+          world
+          // {
+            mem = M.storeByte (M.storeWord world.mem (elemAt a 0) event.pressed) (elemAt a 1) event.key;
+            keys = tail world.keys;
+          }
+        ) 1;
   };
 }
