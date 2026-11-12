@@ -8,8 +8,7 @@
 #              unsigned (bool, a u/U suffix) and long (0, 1 or 2: none, l/L, ll/LL)
 #   "float"    floating-point literal (decimal: digits with a `.` or an exponent, and an
 #              optional f, F, l or L suffix); also has value (a Nix float, the double
-#              nearest to the number) and single (bool, an f/F suffix), and unsigned,
-#              which throws (for the #if expressions of cc/pp.nix)
+#              nearest to the number) and single (bool, an f/F suffix)
 #   "char"     character literal; also has value (the byte value 0..255 of its one
 #              character: plain char is unsigned, so '\377' is 255)
 #   "string"   string literal; also has bytes (the byte values 0..255 of its contents,
@@ -321,9 +320,6 @@ let
         kind = "float";
         inherit text value;
         single = suffix == "f" || suffix == "F";
-        # The #if expressions of cc/pp.nix read `unsigned` of every number (fromPpToken):
-        # for a floating-point literal, that is the error of C.
-        unsigned = fail pos "floating constant in preprocessor expression";
       };
 
   # The decimal digits s without leading zeros, "0" when nothing is left.

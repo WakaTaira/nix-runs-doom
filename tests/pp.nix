@@ -962,20 +962,40 @@ in
   # ---- The two stages, the joining of strings, anonymous types ----
   (t "pp stages: preprocess keeps numbers and literals as written; compileFile checks them"
     [
-      (pp "double d = 1.5e+3; char *s = \"\\q\";")
-      (compileThrows "double d = 1.5e+3;")
+      (pp "double d = 0x1.8p+3; char *s = \"\\q\";")
+      (compileThrows "double d = 0x1.8p+3;")
       (compileThrows "char *s = \"\\q\";")
       (compileThrows "#define H #\nint H;")
       (compileThrows "int a = 'x;")
       (run "#define N 5\nint f(void) { return N + 1; }" "f" [ ])
     ]
     [
-      "double d = 1.5e+3 ; char * s = \"\\q\" ;"
+      "double d = 0x1.8p+3 ; char * s = \"\\q\" ;"
       true
       true
       true
       true
       6
+    ]
+  )
+  (t "pp stages: a floating-point literal with an exponent sign compiles; in #if it stops"
+    [
+      (pp "#define D 1.5e+3\ndouble d = D;")
+      (runCalls "double d = 1.5e+3;\ndouble f(void) { return d; }" [ [ "f" ] ])
+      (runCalls "#define D 1.5e+3f\ndouble d = D;\ndouble f(void) { return d + 0.25; }" [ [ "f" ] ])
+      (ppThrows "#if 1.0\n#endif")
+      (ppThrows "#define V 2.5\n#if V > 1\n#endif")
+      (ppThrows "#if 1 + .5e1\n#endif")
+      (pp "#if 0\nx = 1.0;\n#endif\ny = 2e+1;")
+    ]
+    [
+      "double d = 1.5e+3 ;"
+      [ 1500.0 ]
+      [ 1500.25 ]
+      true
+      true
+      true
+      "y = 2e+1 ;"
     ]
   )
   (t "pp strings: adjacent literals are joined after expansion"

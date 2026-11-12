@@ -916,13 +916,16 @@ let
     else
       bool (a != 0 || b != 0);
 
-  # The value of an integer or character constant token t of an #if expression.
+  # The value of an integer or character constant token t of an #if expression. A
+  # floating-point literal is an error, as in C.
   literalValue =
     t:
     let
       c = L.fromPpToken t;
     in
-    if t.kind == "number" && c.unsigned then
+    if c.kind == "float" then
+      fail t "floating constant in preprocessor expression"
+    else if t.kind == "number" && c.unsigned then
       unsupported t "unsigned integer in a preprocessor expression"
     else
       c.value;
