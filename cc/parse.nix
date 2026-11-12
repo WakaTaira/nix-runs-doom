@@ -474,18 +474,20 @@ let
   # Whether a statement in the statement s (s included) has pred.
   anyStmt = pred: s: pred s || any (anyStmt pred) (childStmts s);
 
+  # The indices of the elements of xs with pred, ascending.
+  indicesWith = pred: xs: filter (k: pred (elemAt xs k)) (genList (k: k) (length xs));
   # The index of the first (firstWith) or the last (lastWith) element of xs with pred, or
   # null when none has it.
   firstWith =
     pred: xs:
     let
-      ks = filter (k: pred (elemAt xs k)) (genList (k: k) (length xs));
+      ks = indicesWith pred xs;
     in
     if ks == [ ] then null else head ks;
   lastWith =
     pred: xs:
     let
-      ks = filter (k: pred (elemAt xs k)) (genList (k: k) (length xs));
+      ks = indicesWith pred xs;
     in
     if ks == [ ] then null else elemAt ks (length ks - 1);
   take = n: xs: genList (elemAt xs) n;
@@ -618,7 +620,24 @@ let
   # that a goto names lab. A statement is identified by its path from body: the index of
   # an item of a block, "t" and "e" for the branches of an if, "b" for the body of a loop
   # and "s" for the statement of a label, each after a "-". The nodes made for a statement
-  # take their sub from a letter for their role and its path.
+  # take their sub from a letter for their role and its path; the roles are:
+  #   s          a goto, as `goto'<name> = 1;` (s), or in a loop as the block (s) of that
+  #              assignment (s'1) and a break (s'2)
+  #   k<path>    in a loop, the block of the loop at path that holds a goto and of
+  #              `if (goto'<name>) break;` (k<path>'b) after it
+  #   w<path>    `if (!goto'<name>) { ... }` around the items after the item at path that
+  #              holds a goto (or the label, in the loop of backward gotos)
+  #   z<path>    the labelled statement at path as `{ goto'<name> = 0; <statement> }`, the
+  #              assignment z<path>'0
+  #   c<path>    the condition of the if at path on the way to the label, with the test of
+  #              the flag c<path>'f
+  #   p<path>    `if (!goto'<name>) { ... }` around the items before the one that holds the
+  #              label in the block at path, entered with the flag set
+  #   d<path>    the `do { ... } while (goto'<name>);` of backward gotos in the block at
+  #              path, with its body d<path>'b and condition d<path>'c
+  # and, made in structureGotos, flag (the declaration of goto'<name>, with its 0 flag'0)
+  # and flags (the declaration statement of all flags at the top of the body). Inside a
+  # node, a suffix after a "'" tells its parts apart (as in ref, setFlag and notFlag).
   rewriteLabel =
     used: lab: body:
     let

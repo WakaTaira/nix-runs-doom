@@ -341,16 +341,15 @@ let
 
   # The host function h in the convention of the generated code, for its declaration decl
   # (an import, or at least { ret; }): `mem: a1: ... aN:` (and `va:` when h is variadic),
-  # returning the memory,
-  # or { mem; ret; } unless decl returns void. The fixed arguments go to h.call as u32,
-  # but those that decl declares with a floating-point or va_list type, which go as they
-  # are (Nix floats and lists), and so does va. The result is converted to the declared
-  # return type: as a cast converts an unsigned 32-bit value, or to a Nix float (rounded to
-  # single precision for float). Which arguments pass as they are is decided once, from
-  # the types of decl, not at each call. The world is mem.host with mem, and the new world
-  # goes back into the memory under `host`. Every field of the new host state is forced,
-  # and the small libc fields completely, so no thunk keeps old states alive (as
-  # lib/hostcall.nix dispatch does).
+  # returning the memory, or { mem; ret; } unless decl returns void. The fixed arguments
+  # go to h.call as u32, except those that decl declares with a floating-point or va_list
+  # type, which go as they are (Nix floats and lists), as va does. The result is converted
+  # to the declared return type: as a cast converts an unsigned 32-bit value, or to a Nix
+  # float (rounded to single precision for float). Which arguments pass as they are is
+  # decided once, from the types of decl, not at each call. The world is mem.host with
+  # mem, and the new world goes back into the memory under `host`. Every field of the new
+  # host state is forced, and the small libc fields completely, so no thunk keeps old
+  # states alive (as lib/hostcall.nix dispatch does).
   wrapHost =
     h: decl:
     let

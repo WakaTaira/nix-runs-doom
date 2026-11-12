@@ -25,9 +25,9 @@
 # lib/libc.nix floatCalls), but the compiler runtime (the names that start with `__`):
 # printf, fprintf, snprintf and sscanf are variadic and run vprintf, vfprintf, vsnprintf
 # and vsscanf with va as the va_list, which take the va_list as their last argument (a
-# list; they can be called from C once va_list values are supported). exit throws
-# "libc: exit: <status>", so the output not yet shown is lost. DG_DrawFrame records a
-# frame from the variables DG_ScreenBuffer and colors in symbols, and throws when called
+# list; C code calls them with a va_list of a variadic definition, set by va_start). exit
+# throws "libc: exit: <status>", so the output not yet shown is lost. DG_DrawFrame records
+# a frame from the variables DG_ScreenBuffer and colors in symbols, and throws when called
 # in a link without them. Its data is hostData of lib/hostcall.nix (errno). The initial
 # state is the world of lib/libc.nix mkWorld (the heap from dataEnd rounded up to a
 # multiple of 4096, errno at symbols.errno or not written, and wad, { hex; size; } or

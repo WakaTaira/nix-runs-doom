@@ -2189,9 +2189,8 @@ let
   # to a label at the top level), beta and betaElse (a forward goto to the head of a later
   # if body or else branch), gammaLoop (a backward goto from the end, n times), look and
   # missile (gotos from both branches of an if, and from an if body that ends in a return,
-  # to a label at the top level, as seeyou and nomissile). trace
-  # records the calls of note. The expected results are those of the same C built by gcc
-  # (-fwrapv -funsigned-char).
+  # to a label at the top level, as seeyou and nomissile). trace records the calls of note.
+  # The expected results are those of the same C built by gcc (-fwrapv -funsigned-char).
   gotoSrc = ''
     int trace;
     int note(int d) { trace = trace * 10 + d; return d; }
@@ -8799,13 +8798,16 @@ in
     ]
   ) (genList (_: true) 15))
   (t "cc run: unary + promotes and is no lvalue"
-    [
-      (ret "int f(char c) { return +c; } int g(void) { float x = 1.5f; return (int)(+x * 2); }" "f" [
-        200
-      ])
-      (ret "int f(char c) { return +c; } int g(void) { float x = 1.5f; return (int)(+x * 2); }" "g" [ ])
-      (compileThrows "int g; int *f(void) { return &+g; }")
-    ]
+    (
+      let
+        src = "int f(char c) { return +c; } int g(void) { float x = 1.5f; return (int)(+x * 2); }";
+      in
+      [
+        (ret src "f" [ 200 ])
+        (ret src "g" [ ])
+        (compileThrows "int g; int *f(void) { return &+g; }")
+      ]
+    )
     [
       200
       3

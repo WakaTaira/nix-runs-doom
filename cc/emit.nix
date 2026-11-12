@@ -269,6 +269,8 @@ let
       sub (cv 2 "-9223372036854775807") (num 1)
     else
       cv (if n < 0 then 2 else 0) (toString n);
+  # 2^-1022, the smallest normal double (`2.2250738585072014e-308` as lit writes it).
+  minNormal = 2.2250738585072014e-308;
   # A Nix float as Nix source that reads back as the same value: the shortest digits of
   # toJSON, always with a `.` (Nix reads `1e5` as an application and needs a `.` in a
   # float), the exponent as toJSON writes it (`1.0e+22`, `1.0e-05`), a negative value as a
@@ -287,8 +289,8 @@ let
         + (if elemAt m 1 == null then ".0" else elemAt m 1)
         + (if elemAt m 2 == null then "" else elemAt m 2);
       pos =
-        if ax != 0 && ax < 2.2250738585072014e-308 then
-          mul (atom (lit (ax * R.pow2f 1022))) (atom "2.2250738585072014e-308")
+        if ax != 0 && ax < minNormal then
+          mul (atom (lit (ax * R.pow2f 1022))) (atom (lit minNormal))
         else
           atom (lit ax);
     in

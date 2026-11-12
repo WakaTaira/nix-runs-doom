@@ -248,14 +248,14 @@ let
       ax = absF x;
       e = ilog2 ax;
       s = if x < 0 then 2147483648 else 0;
-      sub = e < -1022;
+      subnormal = e < -1022;
       # The significand without its leading 1 (below 2^52), and the biased exponent.
       m =
-        if sub then
+        if subnormal then
           builtins.floor (ax / pow2f (-1074))
         else
           builtins.floor (ax / pow2f (e - 52)) - 4503599627370496;
-      ef = if sub then 0 else e + 1023;
+      ef = if subnormal then 0 else e + 1023;
     in
     if ax == 0 then
       {

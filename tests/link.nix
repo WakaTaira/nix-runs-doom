@@ -1127,7 +1127,7 @@ in
       true
     ]
   )
-  (t "cc link: linkFiles with a shared header (struct typedef and extern declarations)"
+  (t "cc link 13: linkFiles with a shared header (struct typedef and extern declarations)"
     [
       (ret pts "useB" [ ])
       (attrNames pts.__units)
@@ -1743,7 +1743,7 @@ in
     ]
   ) "abcde|x|")
   (t
-    "cc link 13: a variadic definition passes its va_list to a function that passes it to vsnprintf (M_snprintf)"
+    "cc link: a variadic definition passes its va_list to a function that passes it to vsnprintf (M_snprintf)"
     (printed (printfSrc ''
       int fmtInto(char *buf, size_t len, const char *f, va_list args) {
         int r;
