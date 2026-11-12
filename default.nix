@@ -3,6 +3,7 @@
 #   nix eval --json -f . fizzbuzz.stats     # executed instruction count and exit code
 #   nix eval --raw -f . tests.check         # unit tests
 #   nix eval --raw -f . bench.report        # performance budget (see bench/default.nix)
+#   nix eval --json -f . doom.report        # doomgeneric compiled to Nix (see doom/default.nix)
 let
   C = import ./lib/cpu.nix;
   E = import ./lib/elf.nix;
@@ -98,6 +99,8 @@ in
   bench = import ./bench;
 
   scaffold = import ./scaffold;
+
+  doom = import ./doom;
 
   cc = import ./cc;
 }
