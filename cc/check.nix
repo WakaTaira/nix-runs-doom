@@ -194,8 +194,10 @@
 #       into the sections). cases = [ { value; section; } ] in source order, with value
 #       converted to the type of cond; default is the index of its section or null.
 # Empty statements, block-scope typedefs, function declarations and struct, union and enum
-# definitions leave no node. Labels anywhere but directly in the body of a switch are
-# unsupported.
+# definitions leave no node. Case and default labels anywhere but directly in the body of a
+# switch are unsupported. Gotos and named labels never reach the checker: cc/parse.nix
+# rewrites them into the statements above, with a local int flag `goto'<label>` (no C
+# name) per label.
 #
 # Typed function (position of its name):
 #   { name; ret; params = [ var ]; body = <block>; linkage; frames; line; col; }
@@ -338,8 +340,12 @@ let
     else
       { inherit (n) line col; };
   # The identity of the node n in keys and names: its position "<line>:<col>", or in a
-  # preprocessed file "#<seq>" (the tokens of one macro expansion share a position).
-  idOf = n: if n ? seq then "#${toString n.seq}" else "${toString n.line}:${toString n.col}";
+  # preprocessed file "#<seq>" (the tokens of one macro expansion share a position),
+  # followed by "'<sub>" for a node made by the rewrite of goto (see cc/parse.nix).
+  idOf =
+    n:
+    (if n ? seq then "#${toString n.seq}" else "${toString n.line}:${toString n.col}")
+    + (if n ? sub then "'${n.sub}" else "");
   posText = n: "${if n ? file then "${n.file}:" else ""}${toString n.line}:${toString n.col}";
   fail = n: msg: throw "cc: ${posText n}: ${msg}";
   unsupported = n: what: fail n "unsupported: ${what}";

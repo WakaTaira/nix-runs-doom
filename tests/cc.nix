@@ -2043,6 +2043,255 @@ let
     int run(void) { fill(); return a[0] + a[199] * 1000 + a[200 * 199 + 198] * 1000000; }
   '';
 
+  # ---- Slice 13: goto ----
+  # Each function has the shape of gotos in Doom, in code of its own: stop (a forward goto
+  # from an else into a label two ifs deep), slide (a backward goto to the top, and a
+  # forward and a backward goto into an if body sharing a label), hit (five forward gotos,
+  # one to three ifs deep, to a label in the same if body), addline (gotos to two labels at
+  # the top level, the second after a return), crunch and crunch2 (out of one or two loops
+  # to a label at the top level), beta and betaElse (a forward goto to the head of a later
+  # if body or else branch), gammaLoop (a backward goto from the end, n times), look and
+  # missile (gotos from both branches of an if, and from an if body that ends in a return,
+  # to a label at the top level, as seeyou and nomissile). trace
+  # records the calls of note. The expected results are those of the same C built by gcc
+  # (-fwrapv -funsigned-char).
+  gotoSrc = ''
+    int trace;
+    int note(int d) { trace = trace * 10 + d; return d; }
+
+    /* stopattack: a forward goto from inside an else into a label two ifs deep. */
+    int stop(int a, int b, int c) {
+      int r = 0;
+      if (a) {
+        r = 1;
+      } else {
+        if (b)
+          goto stopattack;
+        r = 2;
+        note(2);
+      }
+      if (c == 5) {
+        note(3);
+      }
+      note(4);
+      if (note(6) && c > 1) {
+        if (c > 3 || note(7)) {
+        stopattack:
+          r = r + 100;
+          note(5);
+        }
+      }
+      return r * 100000 + trace;
+    }
+
+    /* P_SlideMove: a backward goto to the top, and forward and backward gotos into an if body. */
+    int tries;
+    int tryMove(int k) { tries++; return k; }
+    int slide(int n, int m) {
+      int count;
+      int out;
+      out = 0;
+      count = 0;
+    again:
+      if (++count == 3)
+        goto stairs;
+      out = out * 10 + 1;
+      if (n == count) {
+      stairs:
+        out = out * 10 + 2;
+        if (!tryMove(m == 7))
+          out = out * 10 + 3;
+        return out * 100 + count * 10 + tries;
+      }
+      out = out * 10 + 4;
+      if (m > count) {
+        out = out * 10 + 5;
+        if (!tryMove(m != 4))
+          goto stairs;
+      }
+      out = out * 10 + 6;
+      if (!tryMove(m != 5)) {
+        goto again;
+      }
+      return -out;
+    }
+
+    /* hitline: five forward gotos, one to three ifs deep, to a label in the same if body. */
+    int hit(int a, int b, int c, int d) {
+      int r = 0;
+      if (a > 0) {
+        r = 1;
+        if (b == 1)
+          goto hitline;
+        r = r * 10 + 2;
+        if (c == 0) {
+          if (d == 1)
+            goto hitline;
+          r = r * 10 + 3;
+          if (d == 2)
+            goto hitline;
+        } else {
+          if (c == 1) {
+            if (d == 3)
+              goto hitline;
+          }
+          r = r * 10 + 4;
+          if (c == 2) {
+            r = r * 10 + 5;
+            if (d == 4)
+              goto hitline;
+          }
+        }
+        return r;
+      hitline:
+        r = r * 10 + 9;
+        if (d == 5)
+          return -r;
+        r = r + 1000;
+      }
+      return r;
+    }
+
+    /* R_AddLine: gotos to two labels at the top level, the second after a return. */
+    int solid, pass;
+    void addline(int x, int y) {
+      if (x == y)
+        return;
+      if (x < 0)
+        goto clipsolid;
+      if (y < 0) {
+        note(1);
+        goto clipsolid;
+      }
+      if (x > y)
+        goto clippass;
+      if (x + y == 10) {
+        return;
+      }
+    clippass:
+      pass = pass + x;
+      return;
+    clipsolid:
+      solid = solid + y;
+    }
+    int addRun(int x, int y) {
+      addline(x, y);
+      return solid * 10000 + pass * 100 + trace;
+    }
+
+    /* crunch: out of a while (and out of two nested loops) to a label at the top level. */
+    int crunch(int n, int stop) {
+      int i = 0, s = 0;
+      while (i < n) {
+        s = s + i;
+        i++;
+        if (i == stop) {
+          s = s + 100;
+          goto crunch;
+        }
+      }
+      s = s + 1000;
+    crunch:
+      return s * 100 + i;
+    }
+    int crunch2(int n, int stop) {
+      int i, j, s = 0;
+      for (i = 0; i < n; i++) {
+        for (j = 0; j < n; j++) {
+          s = s + 1;
+          if (i * n + j == stop)
+            goto out;
+        }
+        s = s + 10;
+      }
+      s = s + 1000;
+    out:
+      return s * 100 + i * 10 + j;
+    }
+
+    /* beta: a forward goto to the head of a later if body (and to an else branch). */
+    int beta(int a, int b) {
+      int r = 0;
+      if (a == 1)
+        goto inside;
+      r = 5;
+      if (note(b)) {
+      inside:
+        r = r + 10;
+      }
+      return r * 1000 + trace;
+    }
+    int betaElse(int a, int b) {
+      int r = 0;
+      if (a == 1)
+        goto other;
+      r = 5;
+      if (note(b))
+        r = r + 1;
+      else {
+      other:
+        r = r + 10;
+      }
+      return r * 1000 + trace;
+    }
+
+    /* gamma: a backward goto from an if at the end to a label at the top, n times. */
+    int gammaLoop(int n) {
+      int k = 0, s = 0;
+    again:
+      k++;
+      s = s + k;
+      if (k < n)
+        goto again;
+      return s * 100 + k;
+    }
+
+    /* seeyou and nomissile: gotos from both branches of an if/else, and from an if body that
+       ends in a return, to a label at the top level. */
+    int look(int t, int a, int s) {
+      int r = 0;
+      if (t) {
+        r = 1;
+        if (a) {
+          if (s)
+            goto seen;
+        } else
+          goto seen;
+      }
+      if (!note(t + a + 2))
+        return r;
+    seen:
+      r = r + 10;
+      return r * 100000 + trace;
+    }
+    int missile(int m, int f, int c) {
+      int r = 0;
+      if (m) {
+        if (f && c) {
+          goto nomissile;
+        }
+        if (!note(c + 1))
+          goto nomissile;
+        r = 5;
+        return r;
+      }
+    nomissile:
+      r = r + 7;
+      return r * 100000 + trace;
+    }
+  '';
+  gotoData = loadData Cc.load gotoSrc;
+  # The result of the function fn of gotoSrc called with args on the initialized data.
+  gotoRet = fn: args: (foldl' (g: a: g a) (gotoData.f.${fn} gotoData.mem) args).ret;
+  upTo = n: genList (i: i) n;
+  # The results of fn for each argument list of the cross product of the lists ls.
+  gotoRets =
+    fn: ls:
+    map (gotoRet fn) (foldl' (acc: l: concatMap (args: map (x: args ++ [ x ]) l) acc) [ [ ] ] ls);
+  # The identities of the nodes made by the rewrite of goto (as cc/check.nix idOf).
+  madeIds =
+    tree: map (n: "${toString n.line}:${toString n.col}'${n.sub}") (filter (n: n ? sub) (nodesIn tree));
+
 in
 [
   # Lexer
@@ -2523,7 +2772,6 @@ in
   )
 
   # Parser: outside the subset
-  (t "cc parse: goto throws" (throws "void f(void) { goto x; }") true)
   (t "cc parse: union, bit-field, function pointer, variadic prototype, comma and float parse"
     [
       (map (i: i.kind) (items "union u { int a; };"))
@@ -4033,7 +4281,6 @@ in
   (t "cc compile: switch on a pointer throws" (compileThrows "void f(int *p) { switch (p) { } }")
     true
   )
-  (t "cc compile: goto throws" (compileThrows "void f(void) { goto x; x: ; }") true)
   (t "cc compile: a block-scope struct variable compiles"
     (compileThrows "void f(void) { struct s { int a; } x; }")
     false
@@ -10110,4 +10357,346 @@ in
   (t "cc compile: a function body forces the memory on entry" (contains "builtins.seq mem (" (
     fnCode deepCallsSrc "f0"
   )) true)
+  (t "cc parse: goto and labels leave no goto or label node, with a flag per used label"
+    (
+      let
+        tree = P.parse gotoSrc;
+        kinds = map (n: n.kind) (nodesIn tree);
+        slide = head (filter (i: i.name == "slide") tree.items);
+        ids = madeIds tree;
+      in
+      [
+        (elem "goto" kinds || elem "label" kinds)
+        (map (d: d.name) (head slide.body.items).decls)
+        (
+          length ids == length (
+            builtins.attrNames (
+              builtins.listToAttrs (
+                map (i: {
+                  name = i;
+                  value = true;
+                }) ids
+              )
+            )
+          )
+        )
+      ]
+    )
+    [
+      false
+      [
+        "goto'again"
+        "goto'stairs"
+      ]
+      true
+    ]
+  )
+  (t "cc parse: goto to an undeclared label and a second label of one name throw" (map throws [
+    "void f(void) { goto x; }"
+    "void f(void) { x: ; x: ; }"
+    "void f(int a) { if (a) { x: a = 1; } x: a = 2; goto x; }"
+  ]) (genList (_: true) 3))
+  (t
+    "cc compile: goto into a switch, a loop or the other branch of an if, and across a used declaration, throw"
+    (map compileThrows [
+      "void f(int a) { switch (a) { case 1: goto x; } x: ; }"
+      "void f(int a) { switch (a) { case 1: x: return; } goto x; }"
+      "void f(int a) { while (a) { x: a--; } goto x; }"
+      "int f(int a) { if (a) goto x; else { x: return 1; } return 0; }"
+      "int f(int a) { if (a) goto x; int b = 2; x: return b; }"
+      "int f(int a) { x: a--; int b = a; if (a) goto x; return b; }"
+    ])
+    (genList (_: true) 6)
+  )
+  (t "cc compile: a skipped declaration unused after the goto and a label without a goto compile" (map
+    compileThrows
+    [
+      "int f(int a) { if (a) goto x; { int b = 2; a = b; } x: return a; }"
+      "int f(int a) { if (a) goto x; int b = 2; a = b; x: return a; }"
+      "int f(int a) { x: return a; }"
+    ]
+  ) (genList (_: false) 3))
+  (t "cc run: goto from an else into a label two ifs deep (stopattack)"
+    (gotoRets "stop" [
+      (upTo 2)
+      (upTo 2)
+      (upTo 7)
+    ])
+    [
+      200246
+      200246
+      10224675
+      10224675
+      10202465
+      10223465
+      10202465
+      10000005
+      10000005
+      10000005
+      10000005
+      10000005
+      10000005
+      10000005
+      100046
+      100046
+      10104675
+      10104675
+      10100465
+      10103465
+      10100465
+      100046
+      100046
+      10104675
+      10104675
+      10100465
+      10103465
+      10100465
+    ]
+  )
+  (t "cc run: backward goto to the top and forward and backward gotos into an if body (P_SlideMove)"
+    (gotoRets "slide" [
+      [
+        1
+        2
+        3
+      ]
+      [
+        3
+        4
+        5
+        6
+        7
+      ]
+    ])
+    [
+      12311
+      12311
+      12311
+      12311
+      1211
+      (-1456)
+      1452312
+      145612323
+      (-1456)
+      (-1456)
+      (-1456)
+      1452312
+      (-414325729)
+      (-1456)
+      (-1456)
+    ]
+  )
+  (t "cc run: five forward gotos one to three ifs deep (hitline)"
+    (
+      gotoRets "hit" [
+        [ 1 ]
+        (upTo 2)
+        (upTo 4)
+        (upTo 6)
+      ]
+      ++ [
+        (gotoRet "hit" [
+          0
+          1
+          0
+          1
+        ])
+      ]
+    )
+    [
+      123
+      1129
+      2239
+      123
+      123
+      123
+      124
+      124
+      124
+      1129
+      124
+      124
+      1245
+      1245
+      1245
+      1245
+      13459
+      1245
+      124
+      124
+      124
+      124
+      124
+      124
+      1019
+      1019
+      1019
+      1019
+      1019
+      (-19)
+      1019
+      1019
+      1019
+      1019
+      1019
+      (-19)
+      1019
+      1019
+      1019
+      1019
+      1019
+      (-19)
+      1019
+      1019
+      1019
+      1019
+      1019
+      (-19)
+      0
+    ]
+  )
+  (t "cc run: gotos to labels at the top level, after a return and from both branches of an if"
+    (
+      map (gotoRet "addRun") [
+        [
+          3
+          3
+        ]
+        [
+          (-1)
+          5
+        ]
+        [
+          2
+          (-4)
+        ]
+        [
+          7
+          2
+        ]
+        [
+          4
+          6
+        ]
+        [
+          1
+          2
+        ]
+      ]
+      ++ gotoRets "look" [
+        (upTo 2)
+        (upTo 2)
+        (upTo 2)
+      ]
+      ++ gotoRets "missile" [
+        (upTo 2)
+        (upTo 2)
+        [
+          (-1)
+          0
+          1
+        ]
+      ]
+    )
+    [
+      0
+      50000
+      (-39999)
+      700
+      0
+      100
+      1000002
+      1000002
+      1000003
+      1000003
+      1100000
+      1100000
+      1100004
+      1100000
+      700000
+      700000
+      700000
+      700000
+      700000
+      700000
+      700000
+      5
+      5
+      700000
+      5
+      700000
+    ]
+  )
+  (t "cc run: goto out of a while and out of two for loops to the top level (crunch)"
+    (
+      gotoRets "crunch" [
+        [ 4 ]
+        (upTo 6)
+      ]
+      ++ gotoRets "crunch2" [
+        [ 4 ]
+        [
+          0
+          3
+          6
+          9
+          12
+          15
+        ]
+      ]
+    )
+    [
+      100604
+      10001
+      10102
+      10303
+      10604
+      100604
+      100
+      403
+      1712
+      3021
+      4330
+      4633
+    ]
+  )
+  (t "cc run: goto to the head of a later if body or else branch, and falling into it"
+    (
+      gotoRets "beta" [
+        (upTo 2)
+        (upTo 2)
+      ]
+      ++ gotoRets "betaElse" [
+        (upTo 2)
+        (upTo 2)
+      ]
+    )
+    [
+      5000
+      15001
+      10000
+      10000
+      15000
+      6001
+      10000
+      10000
+    ]
+  )
+  (t "cc run: backward goto from the end to the top, n times"
+    (gotoRets "gammaLoop" [
+      [
+        1
+        2
+        3
+        4
+      ]
+    ])
+    [
+      101
+      302
+      603
+      1004
+    ]
+  )
+  (t "cc preprocessed: goto rewrites give the same code through one macro" (sameAsMacro gotoSrc) true)
 ]

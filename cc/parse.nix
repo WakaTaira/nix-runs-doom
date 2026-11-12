@@ -171,6 +171,41 @@
 # then casts, prefix operators and sizeof; then postfix operators. As in C, arguments and
 # initializers are assignment expressions and the middle operand of `?:` is an expression.
 #
+# goto and labels
+# ---------------
+# `goto <name>;` and a labelled statement `<name>: <statement>` are parsed into
+#   { kind = "goto"; name; }                                  position: `goto`
+#   { kind = "label"; name; stmt; }                           position: the name
+# and then, for each function body, rewritten into the statements above (structureGotos),
+# so no node of the tree is a goto or a named label. A goto to a name that no label of the
+# function has is an error ("use of undeclared label '<name>'"), and so is a second label
+# of one name ("redefinition of label '<name>'"). Each label that a goto names gets a flag,
+# a local int `goto'<name>` (no C name), declared with 0 by a "decl" statement put first in
+# the body; a label without gotos is dropped. The labels are rewritten one at a time, from
+# the last in the source to the first, each in the result of the ones after it. The LCA of
+# a goto is the innermost block that holds both the goto and the label.
+# - A goto sets the flag (`goto'<name> = 1;`) and leaves the statements around it up to its
+#   LCA: inside a loop it breaks out of the loop, and `if (goto'<name>) break;` after an
+#   inner loop that it left breaks out of the next one; outside loops, the statements after
+#   the one that holds the goto in each block are put in `if (!goto'<name>) { ... }`.
+# - In the LCA of a forward goto (before the label), the statements between the one that
+#   holds the goto and the one that holds the label are skipped in the same way.
+# - In the LCA of a backward goto (after the label), the statements from the one that holds
+#   the label to the last one that holds such a goto become
+#   `do { ... } while (goto'<name>);`. Forward and backward gotos share the flag.
+# - From the outermost LCA down to the label, an if whose branch holds the label tests
+#   `goto'<name> || <cond>` (then branch) or `!goto'<name> && <cond>` (else branch), and in
+#   each block below that LCA the statements before the one that holds the label are put in
+#   `if (!goto'<name>) { ... }`. The label becomes `{ goto'<name> = 0; <statement> }`.
+# Unsupported: a label inside a loop or a switch (the loop made for a later label
+# excepted), a goto inside a switch, a forward goto from one branch of an if into the other
+# ("'goto' into the other branch of an 'if'"), and a declaration that the rewrite moves
+# into a block of its own (skipped, or in the loop) when a statement after that block uses
+# the name or tag that it declares ("'goto' across a declaration"). Every node made by the
+# rewrite has the position (line, col, and file and seq where given) of the goto or label
+# that it comes from and sub, a string that tells it apart from that node and from the
+# other nodes made from it (cc/check.nix idOf appends it to the identity).
+#
 # Left to the type checker: lvalue checks, the types of literals, implicit conversions,
 # calls to undeclared functions, `return` placement, the placement of `break`,
 # `continue`, `case` and `default`, constant expressions (array lengths, bit-field widths,
@@ -180,12 +215,19 @@
 let
   L = import ./lex.nix;
   inherit (builtins)
+    any
+    attrNames
     concatLists
+    elem
     elemAt
+    filter
+    foldl'
     genericClosure
     genList
     hasAttr
     head
+    isAttrs
+    isList
     length
     listToAttrs
     map
@@ -395,6 +437,431 @@ let
       nodes = genList (k: (elemAt items k).r.node) (n - 1);
       s = (elemAt items (n - 1)).s;
     };
+
+  # ---- goto and labels (see "goto and labels" in the header) ----
+
+  # The statements directly inside the statement s.
+  childStmts =
+    s:
+    let
+      k = s.kind;
+    in
+    if k == "block" then
+      s.items
+    else if k == "if" then
+      [ s.thenStmt ] ++ (if s.elseStmt == null then [ ] else [ s.elseStmt ])
+    else if k == "while" || k == "do" || k == "for" || k == "switch" then
+      [ s.body ]
+    else if k == "case" || k == "default" || k == "label" then
+      [ s.stmt ]
+    else
+      [ ];
+
+  # The statements with pred in the statement s (s included), in source order.
+  stmtsWith =
+    pred: s: (if pred s then [ s ] else [ ]) ++ concatLists (map (stmtsWith pred) (childStmts s));
+  # Whether a statement in the statement s (s included) has pred.
+  anyStmt = pred: s: pred s || any (anyStmt pred) (childStmts s);
+
+  # The index of the first (firstWith) or the last (lastWith) element of xs with pred, or
+  # null when none has it.
+  firstWith =
+    pred: xs:
+    let
+      ks = filter (k: pred (elemAt xs k)) (genList (k: k) (length xs));
+    in
+    if ks == [ ] then null else head ks;
+  lastWith =
+    pred: xs:
+    let
+      ks = filter (k: pred (elemAt xs k)) (genList (k: k) (length xs));
+    in
+    if ks == [ ] then null else elemAt ks (length ks - 1);
+  take = n: xs: genList (elemAt xs) n;
+  drop = n: xs: genList (k: elemAt xs (n + k)) (length xs - n);
+  imap0 = f: xs: genList (k: f k (elemAt xs k)) (length xs);
+
+  # A node made by the rewrite, at the position of the goto or label o that it comes from,
+  # with sub, which tells it apart from o and from the other nodes made from o.
+  synth =
+    o: sub: kind: fields:
+    {
+      inherit kind sub;
+      inherit (o) line col;
+    }
+    // (if o ? file then { inherit (o) file; } else { })
+    // (if o ? seq then { inherit (o) seq; } else { })
+    // fields;
+
+  # The ordinary identifiers and the tags ("<struct|union|enum> <name>") that the "decl"
+  # statement d declares.
+  declaredBy = d: {
+    names = concatLists (
+      map (
+        x:
+        if x.kind == "vardecl" || x.kind == "proto" then
+          [ x.name ]
+        else if x.kind == "enum" then
+          map (c: c.name) x.consts
+        else
+          [ ]
+      ) d.decls
+    );
+    tags = concatLists (
+      map (
+        x:
+        if x.kind == "struct" || x.kind == "union" || x.kind == "enum" then
+          [ "${x.kind} ${x.name}" ]
+        else
+          [ ]
+      ) d.decls
+    );
+  };
+  # Whether the value x (nodes and types, in lists and attribute sets) uses one of the
+  # names (as a variable or the name of a call) or one of the tags.
+  mentions =
+    names: tags: x:
+    if isList x then
+      any (mentions names tags) x
+    else if isAttrs x then
+      (x ? kind && (x.kind == "ident" || x.kind == "call") && x ? name && elem x.name names)
+      || (x ? tag && x ? name && elem "${x.tag} ${toString x.name}" tags)
+      || any (k: mentions names tags x.${k}) (attrNames x)
+    else
+      false;
+  # Stop when a declaration among the statements xs, which the rewrite moves into a block of
+  # their own, declares a name or tag that one of the statements after (after) uses.
+  checkCross =
+    xs: after:
+    let
+      bad = filter (
+        x:
+        x.kind == "decl"
+        && (
+          let
+            d = declaredBy x;
+          in
+          mentions d.names d.tags after
+        )
+      ) xs;
+    in
+    if bad == [ ] then null else unsupported (head bad) "'goto' across a declaration";
+
+  # The function body body (a block) with its gotos and labels rewritten (see the header).
+  structureGotos =
+    body:
+    let
+      labels = stmtsWith (x: x.kind == "label") body;
+      gotos = stmtsWith (x: x.kind == "goto") body;
+      n = length labels;
+      isUsed = l: any (g: g.name == l.name) gotos;
+      dups = filter (k: any (j: (elemAt labels j).name == (elemAt labels k).name) (genList (j: j) k)) (
+        genList (k: k) n
+      );
+      named = listToAttrs (
+        map (l: {
+          inherit (l) name;
+          value = true;
+        }) labels
+      );
+      undeclared = filter (g: !(hasAttr g.name named)) gotos;
+      used = filter isUsed labels;
+      # From the last label to the first.
+      rewritten = foldl' (b: l: rewriteLabel (isUsed l) l b) body (
+        genList (k: elemAt labels (n - 1 - k)) n
+      );
+      flagDecl =
+        l:
+        synth l "flag" "vardecl" {
+          name = "goto'${l.name}";
+          type = {
+            tag = "int";
+          };
+          storage = null;
+          init = synth l "flag'0" "intlit" {
+            value = 0;
+            unsigned = false;
+            long = 0;
+            text = "0";
+          };
+        };
+    in
+    if labels == [ ] && gotos == [ ] then
+      body
+    else if dups != [ ] then
+      let
+        l = elemAt labels (head dups);
+      in
+      fail l "redefinition of label '${l.name}'"
+    else if undeclared != [ ] then
+      fail (head undeclared) "use of undeclared label '${(head undeclared).name}'"
+    else
+      rewritten
+      // {
+        items =
+          (if used == [ ] then [ ] else [ (synth (head used) "flags" "decl" { decls = map flagDecl used; }) ])
+          ++ rewritten.items;
+      };
+
+  # The function body body with the label lab and the gotos to it rewritten; used tells
+  # that a goto names lab. A statement is identified by its path from body: the index of
+  # an item of a block, "t" and "e" for the branches of an if, "b" for the body of a loop
+  # and "s" for the statement of a label, each after a "-". The nodes made for a statement
+  # take their sub from a letter for their role and its path.
+  rewriteLabel =
+    used: lab: body:
+    let
+      inherit (lab) name;
+      flag = "goto'${name}";
+      isGoto = x: x.kind == "goto" && x.name == name;
+      isLab = x: x.kind == "label" && x.name == name;
+      hasGoto = anyStmt isGoto;
+      hasLab = anyStmt isLab;
+      firstGoto = s: head (stmtsWith isGoto s);
+
+      # Nodes made from o: sub p, and p with a suffix for the nodes inside.
+      ref = o: p: synth o p "ident" { name = flag; };
+      setFlag =
+        o: p: v:
+        synth o p "expr" {
+          expr = synth o "${p}'a" "assign" {
+            op = "=";
+            lhs = ref o "${p}'l";
+            rhs = synth o "${p}'r" "intlit" {
+              value = v;
+              unsigned = false;
+              long = 0;
+              text = toString v;
+            };
+          };
+        };
+      notFlag =
+        p:
+        synth lab p "unary" {
+          op = "!";
+          expr = ref lab "${p}'x";
+        };
+      block =
+        o: p: items:
+        synth o p "block" { inherit items; };
+      # `if (!flag) { xs }`
+      unless =
+        p: xs:
+        synth lab p "if" {
+          cond = notFlag "${p}'c";
+          thenStmt = block lab "${p}'t" xs;
+          elseStmt = null;
+        };
+      # `if (flag) break;`
+      breakOut =
+        p:
+        synth lab p "if" {
+          cond = ref lab "${p}'c";
+          thenStmt = synth lab "${p}'t" "break" { };
+          elseStmt = null;
+        };
+
+      # The statement s at path with every goto to the label in it setting the flag and
+      # leaving s: by break out of the loops in s (with `if (flag) break;` after an inner
+      # one), and by skipping the rest of each block outside them.
+      suppress =
+        inLoop: path: s:
+        let
+          k = s.kind;
+        in
+        if !(hasGoto s) then
+          s
+        else if isGoto s then
+          if inLoop then
+            block s "s" [
+              (setFlag s "s'1" 1)
+              (synth s "s'2" "break" { })
+            ]
+          else
+            setFlag s "s" 1
+        else if k == "block" then
+          s
+          // {
+            items =
+              if inLoop then
+                imap0 (j: suppress true "${path}-${toString j}") s.items
+              else
+                skipAfter path 0 s.items;
+          }
+        else if k == "if" then
+          s
+          // {
+            thenStmt = suppress inLoop "${path}-t" s.thenStmt;
+            elseStmt = if s.elseStmt == null then null else suppress inLoop "${path}-e" s.elseStmt;
+          }
+        else if k == "while" || k == "do" || k == "for" then
+          let
+            loop = s // {
+              body = suppress true "${path}-b" s.body;
+            };
+          in
+          if inLoop then
+            block lab "k${path}" [
+              loop
+              (breakOut "k${path}'b")
+            ]
+          else
+            loop
+        else if k == "switch" then
+          unsupported (firstGoto s) "'goto' inside a switch"
+        else
+          s // { stmt = suppress inLoop "${path}-s" s.stmt; };
+
+      # The items xs, from the index i of the block at path, with the gotos in them
+      # suppressed, and the items after each item that holds one skipped while the flag is
+      # set.
+      skipAfter =
+        path: i: xs:
+        let
+          j = firstWith hasGoto xs;
+          rest = drop (j + 1) xs;
+          at = "${path}-${toString (i + j)}";
+        in
+        if j == null then
+          xs
+        else
+          take j xs
+          ++ [ (suppress false at (elemAt xs j)) ]
+          ++ (if rest == [ ] then [ ] else [ (unless "w${at}" (skipAfter path (i + j + 1) rest)) ]);
+
+      # Whether the statement s that holds the label has a goto to it outside the block on
+      # the way to the label: in the labelled statement, or in the other branch of an if.
+      ownGotos =
+        s:
+        let
+          k = s.kind;
+        in
+        if isLab s then
+          hasGoto s.stmt
+        else if k == "label" then
+          ownGotos s.stmt
+        else if k == "if" then
+          if hasLab s.thenStmt then
+            ownGotos s.thenStmt || s.elseStmt != null && hasGoto s.elseStmt
+          else
+            hasGoto s.thenStmt || ownGotos s.elseStmt
+        else
+          false;
+
+      # The statement s at path that holds the label, where control may arrive with the
+      # flag set when enter.
+      entry =
+        enter: path: s:
+        let
+          k = s.kind;
+        in
+        if isLab s then
+          let
+            st = suppress false "${path}-s" s.stmt;
+          in
+          if used then
+            block lab "z${path}" [
+              (setFlag lab "z${path}'0" 0)
+              st
+            ]
+          else
+            st
+        else if k == "label" then
+          s // { stmt = entry enter "${path}-s" s.stmt; }
+        else if k == "block" then
+          rewriteBlock enter path s
+        else if k == "if" then
+          if hasLab s.thenStmt then
+            s
+            // {
+              cond =
+                if enter then
+                  synth lab "c${path}" "binary" {
+                    op = "||";
+                    lhs = ref lab "c${path}'f";
+                    rhs = s.cond;
+                  }
+                else
+                  s.cond;
+              thenStmt = entry enter "${path}-t" s.thenStmt;
+              elseStmt = if s.elseStmt == null then null else suppress false "${path}-e" s.elseStmt;
+            }
+          else if hasGoto s.thenStmt then
+            unsupported (firstGoto s.thenStmt) "'goto' into the other branch of an 'if'"
+          else
+            s
+            // {
+              cond =
+                if enter then
+                  synth lab "c${path}" "binary" {
+                    op = "&&";
+                    lhs = notFlag "c${path}'f";
+                    rhs = s.cond;
+                  }
+                else
+                  s.cond;
+              elseStmt = entry enter "${path}-e" s.elseStmt;
+            }
+        # The loop of the rewrite of a later label runs its body at least once.
+        else if k == "do" && s ? sub then
+          s // { body = entry enter "${path}-b" s.body; }
+        else if k == "switch" || k == "case" || k == "default" then
+          unsupported lab "label inside a switch"
+        else
+          unsupported lab "label inside a loop";
+
+      # The block b at path that holds the label, where control may arrive with the flag
+      # set when entering (from a goto outside b).
+      rewriteBlock =
+        entering: path: b:
+        let
+          xs = b.items;
+          l = firstWith hasLab xs;
+          lp = "${path}-${toString l}";
+          item = elemAt xs l;
+          pre = take l xs;
+          post = drop (l + 1) xs;
+          fwd = firstWith hasGoto pre;
+          lastBack = lastWith hasGoto post;
+          backHere = ownGotos item;
+          back = backHere || lastBack != null;
+          enter = entering || fwd != null || back;
+          item' = entry enter lp item;
+          pre' =
+            if entering && pre != [ ] then
+              [ (unless "p${path}" (skipAfter path 0 pre)) ]
+            else
+              skipAfter path 0 pre;
+          looped = if lastBack == null then [ ] else take (lastBack + 1) post;
+          rest = drop (length looped) post;
+          loopBody = [
+            item'
+          ]
+          ++ (
+            if backHere && looped != [ ] then
+              [ (unless "w${lp}" (skipAfter path (l + 1) looped)) ]
+            else
+              skipAfter path (l + 1) looped
+          );
+          doLoop = synth lab "d${path}" "do" {
+            body = block lab "d${path}'b" loopBody;
+            cond = ref lab "d${path}'c";
+          };
+          skippedPre =
+            if entering then
+              pre
+            else if fwd == null then
+              [ ]
+            else
+              drop (fwd + 1) pre;
+        in
+        builtins.seq (checkCross skippedPre ([ item ] ++ post)) (
+          builtins.seq (checkCross looped rest) (
+            b // { items = pre' ++ (if back then [ doLoop ] else [ item' ]) ++ rest; }
+          )
+        );
+    in
+    rewriteBlock false "" body;
 
   parseTokens =
     toks:
@@ -1240,7 +1707,7 @@ let
                 inherit params;
                 inherit (d.type) ret;
                 inherit (sp) storage;
-                body = body.node;
+                body = structureGotos body.node;
               })
             ];
             s = {
@@ -1481,13 +1948,31 @@ let
               inherit (st) i;
             }
           else if x == "goto" then
-            unsupported t "'goto' statement"
+            let
+              nt = tok (i + 1);
+            in
+            if nt.kind != "ident" then
+              fail nt "expected a label name but found ${describe nt}"
+            else
+              {
+                node = node "goto" { name = nt.text; };
+                i = expect (i + 2) ";";
+              }
           else if hasAttr x declKeywords then
             fail t "expected a statement but found a declaration"
           else
             exprStmt tn i
         else if t.kind == "ident" && isP (i + 1) ":" then
-          unsupported t "label"
+          let
+            st = stmt tn (i + 2);
+          in
+          {
+            node = node "label" {
+              name = x;
+              stmt = st.node;
+            };
+            inherit (st) i;
+          }
         else
           exprStmt tn i;
 
