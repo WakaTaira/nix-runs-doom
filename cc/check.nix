@@ -164,8 +164,11 @@
 #                                                     declaration of static locals,
 #                                                     block-scope extern variables and
 #                                                     locals in memory also has statics,
-#                                                     externs and frames (see declStmt),
-#                                                     which only this file uses. A
+#                                                     externs and frames, and one with
+#                                                     braced or string initializers of
+#                                                     automatic locals has strings (see
+#                                                     declStmt), which only this file
+#                                                     uses. A
 #                                                     declaration that stores initial values
 #                                                     in memory is a "decl" node followed by
 #                                                     "expr" nodes of the stores (a block of
@@ -228,7 +231,8 @@
 # in braces, also as an element or member without braces): its bytes are stored, the
 # rest of the array keeps 0, the array may leave out the 0 at the end, and an array
 # without a length takes N. A literal there and in the operand of sizeof needs no storage;
-# every other one does, which is decided from the syntax tree and the types only.
+# every other one does, which is decided from the syntax tree and the types only. The same
+# rules hold for the initializers of automatic locals (see "Locals in memory").
 #
 # Function pointers
 # -----------------
@@ -2200,8 +2204,10 @@ let
   # and enum definitions, each in scope from its declarator on. -> { nodes; env; } with
   # nodes the statements of the declaration in order: "decl" nodes of the variables, and
   # between them the "expr" nodes that store the initial values of scalars in memory. The
-  # first is a "decl" node, which carries statics, externs, frames and the uses of the
-  # whole declaration; there are none when the declaration leaves nothing to run or place.
+  # first is a "decl" node, which carries statics, externs, frames, strings (the
+  # initializers whose string literals stringsIn leaves out, see stringUses) and the uses
+  # of the whole declaration; there are none when the declaration leaves nothing to run or
+  # place.
   declStmt =
     env: n:
     let
@@ -2240,7 +2246,8 @@ let
           }
         else
           let
-            t = resolveType acc.env d d.type;
+            # An array without a length takes it from its initializer list.
+            t = sizedType acc.env d (resolveType acc.env d d.type);
             how = storageOf acc.env (localKey d d.name) t;
             # The scope of a name starts after its declarator, so the initializer sees it.
             r = declare acc.env d d.name t;
@@ -2252,6 +2259,8 @@ let
             unsupported d "floating-point variable"
           else if isArray t || isRecord t || how == "frame" then
             frameLocal acc d t how
+          else if d.init != null && d.init.kind == "initlist" then
+            unsupported d.init "initializer list"
           else
             acc
             // {
@@ -2262,6 +2271,7 @@ let
                   inherit init;
                 }
               ];
+              strings = acc.strings ++ (if initStrings d then [ d.init ] else [ ]);
               uses = acc.uses ++ usesOf r.env d.init;
             };
       r = foldl' step {
@@ -2270,6 +2280,7 @@ let
         statics = [ ];
         externs = [ ];
         frames = [ ];
+        strings = [ ];
         uses = [ ];
       } n.decls;
       declNode =
@@ -2295,13 +2306,14 @@ let
         (if r.statics == [ ] then { } else { inherit (r) statics; })
         // (if r.externs == [ ] then { } else { inherit (r) externs; })
         // (if r.frames == [ ] then { } else { inherit (r) frames; })
+        // (if r.strings == [ ] then { } else { inherit (r) strings; })
         // withUses env r.uses;
     in
     {
       nodes =
         if nodes != [ ] && (head nodes).kind == "decl" then
           [ (head nodes // meta) ] ++ builtins.tail nodes
-        else if r.statics != [ ] || r.externs != [ ] || r.frames != [ ] then
+        else if r.statics != [ ] || r.externs != [ ] || r.frames != [ ] || r.strings != [ ] then
           [ (declNode [ ] // meta) ] ++ nodes
         else
           nodes;
@@ -2324,9 +2336,11 @@ let
       };
 
   # The automatic local d of type t in the accumulator acc of declStmt, kept in memory
-  # (how is "frame") or split (see "Locals in memory"). An array or struct with an
-  # initializer is unsupported; a scalar in memory stores its initial value where it is
-  # declared.
+  # (how is "frame") or split (see "Locals in memory"). Its initializer, if any, runs each
+  # time the declaration is reached: a local in memory stores every scalar of it in order
+  # and 0 in the bytes that it leaves out (fillZeros), and a split array binds its
+  # elements, 0 for those that it leaves out (splitInits). A struct or union initialized
+  # from an expression is unsupported.
   frameLocal =
     acc: d: t: how:
     let
@@ -2335,15 +2349,18 @@ let
       sym = frameSym env d name;
       env' = bindObject env name t sym;
       elems = genList (elemVar d name t) t.len;
+      senv = bindSplit env name t elems;
+      writes = localWrites env t d.init;
+      # The expressions of its scalars, whose string literals need storage (see stringUses).
+      strings =
+        acc.strings ++ (if initStrings d then map (w: w.expr) (filter (w: w ? type) writes) else [ ]);
       frame = {
         env = env';
         frames = acc.frames ++ [ (frameObject env d t sym) ];
       };
     in
     builtins.seq (checkLocal env d name) (
-      if isArray t && d.init != null then
-        unsupported d "initializer of a local array"
-      else if isRecord t && d.init != null then
+      if isRecord t && d.init != null && d.init.kind != "initlist" then
         unsupported d "initializer of a local ${t.tag} variable"
       else if isArray t && t.len == null then
         fail d "definition of variable with array type needs an explicit size or an initializer"
@@ -2352,33 +2369,135 @@ let
       else if how == "split" then
         acc
         // {
-          env = bindSplit env name t elems;
-          items =
-            acc.items
-            ++ map (v: {
-              var = v;
-              init = null;
-            }) elems;
+          env = senv;
+          items = acc.items ++ splitInits senv d t elems writes;
+          inherit strings;
+          uses = acc.uses ++ usesOf senv d.init;
         }
       else if hasLLong t then
         unsupported d "8-byte integer in a local variable in memory"
-      else if isScalar t then
+      else
         acc
         // frame
         // {
-          items =
-            acc.items
-            ++ (
-              if d.init == null then
-                [ ]
-              else
-                [ { stmt = frameStore env' d t sym (assignConv d.init t (rv env' d.init)); } ]
-            );
+          items = acc.items ++ map (w: { stmt = frameInitStore env' d sym w; }) (fillZeros env.ctx t writes);
+          inherit strings;
           uses = acc.uses ++ usesOf env' d.init;
         }
-      else
-        acc // frame
     );
+
+  # The scalar slot of type t at the offset a of an initializer of a local (see
+  # initWritesWith), with its expression x, which is checked where it is stored.
+  localScalar = env: t: a: x: {
+    addr = a;
+    size = sizeOf t;
+    type = t;
+    expr = x;
+  };
+
+  # The writes of the initializer x (null for none) of a local of type t in env, by offset
+  # in the object, in the order of the initializer: those of its scalars (with type and
+  # expr, see localScalar) and the bytes of its strings. Their structure reads no address.
+  localWrites =
+    env: t: x:
+    if x == null then [ ] else initWritesWith localScalar env t 0 x;
+
+  # The writes of a local in memory of type t: writes (see localWrites) with the stores of 0
+  # that fill the bytes between them and after the last (see zeroWrites), when there are
+  # any writes.
+  fillZeros =
+    ctx: t: writes:
+    let
+      n = length writes;
+      endOf = i: if i == 0 then 0 else (elemAt writes (i - 1)).addr + (elemAt writes (i - 1)).size;
+      align = alignOfT ctx t;
+    in
+    if writes == [ ] then
+      [ ]
+    else
+      concatLists (
+        genList (i: zeroWrites align (endOf i) (elemAt writes i).addr ++ [ (elemAt writes i) ]) n
+      )
+      ++ zeroWrites align (endOf n) (sizeOfT ctx t);
+
+  # The stores of 0 to the bytes at the offsets [from, to) of an object aligned to align:
+  # words where the offsets and the alignment allow them, otherwise halves and bytes.
+  zeroWrites =
+    align: from: to:
+    let
+      u =
+        if align >= 4 then
+          4
+        else if align >= 2 then
+          2
+        else
+          1;
+      up = alignUp from u;
+      a = if up < to then up else to;
+      b = a + div (to - a) u * u;
+      zero = addr: size: {
+        inherit addr size;
+        value = 0;
+      };
+      # The at most 3 bytes before a or after b, in halves where they are aligned.
+      small =
+        p: q:
+        if p >= q then
+          [ ]
+        else
+          let
+            size = if u >= 2 && bitAnd p 1 == 0 && q - p >= 2 then 2 else 1;
+          in
+          [ (zero p size) ] ++ small (p + size) q;
+    in
+    if from >= to then
+      [ ]
+    else
+      small from a ++ genList (i: zero (a + i * u) u) ((b - a) / u) ++ small b to;
+
+  # The unsigned type of a store of size bytes.
+  unsignedOfSize =
+    size:
+    if size == 4 then
+      tUInt
+    else if size == 2 then
+      ty "ushort"
+    else
+      ty "uchar";
+
+  # The statement of the write w of fillZeros into the frame object at the data symbol
+  # sym, at the node at.
+  frameInitStore =
+    env: at: sym: w:
+    let
+      t = w.type or (unsignedOfSize w.size);
+      value = if w ? type then assignConv w.expr t (rv env w.expr) else litAt at t w.value;
+    in
+    frameStore env at t sym w.addr value;
+
+  # The element variables elems of the split array d of type t with their initial values in
+  # env: those that writes (see localWrites) give, null (0) for the others.
+  splitInits =
+    env: d: t: elems: writes:
+    let
+      size = sizeOfT env.ctx t.of;
+      byIndex = listToAttrs (
+        map (w: {
+          name = toString (w.addr / size);
+          value = w;
+        }) writes
+      );
+      initOf =
+        w:
+        if w ? type then
+          assignConv w.expr t.of (rv env w.expr)
+        else
+          mkCast t.of (litAt d (unsignedOfSize w.size) w.value);
+    in
+    imap0 (k: v: {
+      var = v;
+      init = if hasAttr (toString k) byIndex then initOf byIndex.${toString k} else null;
+    }) elems;
 
   # acc with the env e, which is forced so that its declaration is checked even when
   # nothing reads it.
@@ -2520,14 +2639,25 @@ let
   # only typed (see typeOnlyEnv).
   #
   # The storage of a local of type t (storageOf):
-  #   "split"   an array of scalars with a length whose uses are all "sizeof" and "index"
-  #             with a value in [0, length): one variable per element, named `<name>'<k>'`
-  #             (elemVar), each 0 until assigned
+  #   "split"   an array of scalars with a length (an array without one takes it from its
+  #             initializer) whose uses are all "sizeof" and "index" with a value in
+  #             [0, length): one variable per element, named `<name>'<k>'` (elemVar), each 0
+  #             until assigned
   #   "frame"   any other array, a struct or union, and a scalar with an "addr" use: an
   #             object at a fixed address in the data (see "Data"), with the data symbol of
   #             a static local followed by `'frame` (frameSym); its contents are never
   #             cleared, and a parameter is written there on entry
   #   "bind"    any other scalar: a variable (see "Typed syntax tree")
+  # The initializer of a split array or a local in memory (an expression for a scalar, a
+  # braced list, or a string for a character array) follows the rules of file-scope
+  # variables (see "Initializers") but for constants: its expressions may be any values of
+  # the slot types. It runs each time the declaration is reached, its expressions in the
+  # order of the initializer: a local in memory gets "assign" nodes at constant addresses,
+  # those of its scalars and stores of 0 in every byte that the initializer leaves out
+  # (words, halves or bytes as the offsets and the alignment of its type allow, padding
+  # included); a split array binds its elements, 0 for those that it leaves out. A struct
+  # or union initialized from an expression, and a braced initializer of a "bind" scalar,
+  # are unsupported.
 
   # The key of the local variable or parameter name declared at the node at.
   localKey = at: name: "${name}@${idOf at}";
@@ -2789,15 +2919,17 @@ let
       writesAt = _: [ ];
     };
 
-  # The statement that stores value (a typed expression of the scalar type t) into the
-  # frame object at the data symbol sym, at the node at.
+  # The statement that stores value (a typed expression of the scalar type t) at the offset
+  # off of the frame object at the data symbol sym, at the node at.
   frameStore =
-    env: at: t: sym: value:
+    env: at: t: sym: off: value:
     posOf at
     // {
       kind = "expr";
       expr = node at "assign" t {
-        target = objectAt env.ctx at t sym;
+        target = node at "deref" t {
+          expr = addressAt env.ctx at (ptrTo t) (addressOf env.ctx sym + off);
+        };
         inherit value;
         post = false;
       };
@@ -3343,7 +3475,7 @@ let
       frameParams = map frameOf framed;
       benv = foldl' (e: x: bindObject e x.var.name x.var.type x.sym) ps.env frameParams;
       stores = map (
-        x: frameStore benv x.p x.var.type x.sym (node x.p "var" x.var.type { inherit (x) var; })
+        x: frameStore benv x.p x.var.type x.sym 0 (node x.p "var" x.var.type { inherit (x) var; })
       ) frameParams;
       items = stores ++ blockItems benv f.body.items;
       llongFrame = filter (x: x.var.type.tag == "llong") frameParams;
@@ -4053,9 +4185,13 @@ let
   # ---- Initializers ----
   # An initializer becomes the stores of its scalars: [ { addr; size; value; } ] with value
   # in the stored unsigned form. Slots without an initializer keep the 0 of the memory.
+  # The stores of the scalar slots are made by a function scalar (env: t: a: x: store),
+  # scalarInit for static storage and localScalar for a local in memory (see frameLocal).
 
-  initWrites =
-    env: t: a: x:
+  initWrites = initWritesWith scalarInit;
+
+  initWritesWith =
+    scalar: env: t: a: x:
     let
       s = stringInit t x;
     in
@@ -4064,14 +4200,14 @@ let
     else if isAggregate t then
       (
         if x.kind == "initlist" then
-          fillList env t a x
+          fillList scalar env t a x
         else
           fail x "initializer for an array or struct must be a braced list"
       )
     else if x.kind == "initlist" then
-      scalarList env t a x
+      scalarList scalar env t a x
     else
-      [ (scalarInit env t a x) ];
+      [ (scalar env t a x) ];
 
   # The string literal that initializes the array t from the initializer x: x itself, or
   # the only item of a braced x, when t is an array of a character type; null when x is
@@ -4117,9 +4253,9 @@ let
     }) (length bytes);
 
   fillList =
-    env: t: a: list:
+    scalar: env: t: a: list:
     let
-      r = fillFrom env t a list.items 0;
+      r = fillFromWith scalar env t a list.items 0;
     in
     if r.i < length list.items then
       fail (elemAt list.items r.i) "excess elements in initializer"
@@ -4128,14 +4264,14 @@ let
 
   # `{ x }` for a scalar.
   scalarList =
-    env: t: a: list:
+    scalar: env: t: a: list:
     let
       x = head list.items;
     in
     if length list.items != 1 || x.kind == "initlist" then
       fail list "too many initializers or braces for a scalar"
     else
-      [ (scalarInit env t a x) ];
+      [ (scalar env t a x) ];
 
   # The slot k of the aggregate type t: { type; offset; }.
   slotOf =
@@ -4170,8 +4306,10 @@ let
   # The items from index i0 assigned to the slots of t at address a in order. A nested
   # aggregate takes a braced list, or without braces as many items as it has slots.
   # -> { writes; i; count; } with i the first item left and count the slots given.
-  fillFrom =
-    env: t: a: items: i0:
+  fillFrom = fillFromWith scalarInit;
+
+  fillFromWith =
+    scalar: env: t: a: items: i0:
     let
       inherit (env) ctx;
       n = slotCount ctx t;
@@ -4185,14 +4323,14 @@ let
           r =
             if x.kind == "initlist" || (x.kind == "strlit" && isCharArray slot.type) then
               {
-                writes = initWrites env slot.type sa x;
+                writes = initWritesWith scalar env slot.type sa x;
                 i = st.i + 1;
               }
             else if isAggregate slot.type then
-              fillFrom env slot.type sa items st.i
+              fillFromWith scalar env slot.type sa items st.i
             else
               {
-                writes = [ (scalarInit env slot.type sa x) ];
+                writes = [ (scalar env slot.type sa x) ];
                 i = st.i + 1;
               };
         in
@@ -4284,20 +4422,21 @@ let
       { inherit (acc) size objects; }
       (
         concatMap (f: declsIn "statics" f.body) acc.defs
-        ++ concatMap (f: f.frames ++ framesIn f.body) acc.defs
+        ++ concatMap (f: f.frames ++ declFieldIn "frames" f.body) acc.defs
       );
 
-  # The frames (see declStmt) of the declarations in the statement n and the statements in
-  # it, those of a for initialization included, in source order.
-  framesIn =
-    n:
-    (if kindOf n == "decl" then n.frames or [ ] else [ ])
-    ++ (if kindOf n == "for" && n.init != null then framesIn n.init else [ ])
-    ++ concatMap framesIn (subStmts n);
+  # The list field (frames or strings, see declStmt) of the declarations in the statement n
+  # and the statements in it, those of a for initialization included, in source order.
+  declFieldIn =
+    field: n:
+    (if kindOf n == "decl" then n.${field} or [ ] else [ ])
+    ++ (if kindOf n == "for" && n.init != null then declFieldIn field n.init else [ ])
+    ++ concatMap (declFieldIn field) (subStmts n);
 
   # The string literals in the syntax tree n that need storage: all of them but those in
-  # the operand of sizeof and in the initializers of static locals (whose literals come
-  # from their stores, see stringUses).
+  # the operand of sizeof, in the initializers of static locals (whose literals come from
+  # their stores, see stringUses) and in the initializers of automatic locals that are a
+  # string literal or a braced list (whose literals come from the "decl" nodes).
   stringsIn = collect (x: kindOf x == "strlit") (
     x:
     elem (kindOf x) [
@@ -4305,16 +4444,29 @@ let
       "sizeof"
       "sizeoftype"
     ]
-    || kindOf x == "vardecl" && x.storage == "static"
+    || kindOf x == "vardecl" && (x.storage == "static" || x.storage == null && initStrings x)
   );
 
-  # The string literals that need storage: those in the function bodies, and those in the
-  # scalar initializers of the placed objects (a literal that initializes a character
-  # array is not one of them). Both are found from the syntax tree and the types, without
-  # the addresses, which depend on them.
+  # Whether the string literals of the initializer of the automatic local d come from its
+  # "decl" node (see stringsIn): an initializer that is a string literal or a braced list.
+  initStrings =
+    d:
+    d.init != null
+    && elem (kindOf d.init) [
+      "strlit"
+      "initlist"
+    ];
+
+  # The string literals that need storage: those in the function bodies, those in the
+  # scalar initializers of the automatic locals that stringsIn leaves out (the strings of
+  # the "decl" nodes of the typed functions defs, see declStmt), and those in the scalar
+  # initializers of the placed objects (a literal that initializes a character array is
+  # not one of them). All are found from the syntax tree and the types, without the
+  # addresses, which depend on them.
   stringUses =
-    items: objects:
+    items: defs: objects:
     concatMap (i: if i.kind == "func" then stringsIn i.body else [ ]) items
+    ++ concatMap (f: concatMap stringsIn (declFieldIn "strings" f.body)) defs
     ++ concatMap (o: concatMap (w: if w ? expr then stringsIn w.expr else [ ]) o.writes) objects;
 
   # Whether the node a comes before the node b in the source (by seq in a preprocessed
@@ -4407,7 +4559,7 @@ let
           value = o.addr;
         }) placed.objects
       );
-      strings = placeStrings dataBase placed.size (stringUses items placed.objects);
+      strings = placeStrings dataBase placed.size (stringUses items r.defs placed.objects);
       # Outside link mode, the functions are numbered as a link of this unit alone numbers
       # them (see "Function pointers").
       localNums = listToAttrs (

@@ -126,8 +126,8 @@
 #
 # Block-scope declarators (position: the declared name):
 #   { kind = "vardecl"; name; type; storage; init = <initializer or null>; }
-#       storage is null, "static" or "extern"; the initializer is an expression, or an
-#       "initlist" for a static one (for others it is unsupported). An extern one has
+#       storage is null, "static" or "extern"; the initializer is an expression or an
+#       "initlist" (cc/check.nix decides which locals may have one). An extern one has
 #       no initializer.
 #   { kind = "proto"; name; ret; params; variadic; unspecified; storage; }
 #                                                         function declaration; storage
@@ -1313,8 +1313,6 @@ let
             fail (tok d.i) "illegal initializer"
           else if hasInit && sp.storage == "extern" then
             fail (tok d.i) "block-scope 'extern' declaration with an initializer"
-          else if isList && sp.storage != "static" then
-            unsupported (tok (d.i + 1)) "initializer list"
           else if isP next "," then
             {
               decls = [ item ] ++ rest.decls;

@@ -434,6 +434,21 @@ let
     int g(void) { struct { int x; char c[3]; } q; q.x = 3; q.c[2] = 4; return q.x + q.c[2]; }
   '';
   frameUnit = lk [ (u "a" frameUnitSrc) ];
+  # Initializers of locals as the format, the arguments and the buffer of a host call.
+  frameInitIo = withStd {
+    "a.c" = ''
+      #include <stdio.h>
+      int fm(char *out, int k) {
+        char fmt[] = "<%d|%s>";
+        char *w[2] = { "no", "yes" };
+        char buf[12] = { 0 };
+        int n = snprintf(buf, sizeof buf, fmt, k, w[1]);
+        int i;
+        for (i = 0; i < 12; i++) out[i] = buf[i];
+        return n;
+      }
+    '';
+  };
 
   strio = withStd {
     "a.c" = ''
@@ -2202,6 +2217,42 @@ in
         5
         7
       ]
+    ]
+  )
+  (t "cc link: initialized locals as the format, arguments and buffer of snprintf"
+    (
+      let
+        st = afterCalls frameInitIo [
+          [
+            "fm"
+            65536
+            42
+          ]
+        ];
+      in
+      [
+        st.rets
+        (genList (i: M.loadByte st.mem (65536 + i)) 12)
+        (length frameInitIo.__data.strings)
+      ]
+    )
+    [
+      [ 8 ]
+      [
+        60
+        52
+        50
+        124
+        121
+        101
+        115
+        62
+        0
+        0
+        0
+        0
+      ]
+      2
     ]
   )
 ]

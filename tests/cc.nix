@@ -1914,6 +1914,56 @@ let
     struct Q { short h; char c; };
     int two(void) { static char s2; struct Q q; int x = 4; int *p = &x; q.h = 1; q.c = 2; return q.h + q.c + *p + s2; }
   '';
+  # Initializers of locals in memory and of split arrays, run each time the declaration
+  # is reached, with 0 in what they leave out. The functions that read a member (by its
+  # number m) fill their frame with 0xff before they return, so that the 0s of the next
+  # call are seen to be stored.
+  frameInitSrc = ''
+    unsigned again(unsigned t) {
+      unsigned r[4] = { t * 2, 0, 50 };
+      unsigned v = r[0] + r[1] + r[2] + r[3];
+      r[(t >> 1) + 1] = 7;
+      return v;
+    }
+    int count(void) { int s[] = { 1, 2, 3 }; return sizeof s / sizeof s[0]; }
+    int names(void) { char n[2][4] = { "abc", "wxyz" }; return n[1][3]; }
+    struct In { short h; char c[3]; };
+    struct Out { int a; struct In in[2]; unsigned char tail; int z; };
+    static void spoil(unsigned char *p, int n) { int i; for (i = 0; i < n; i++) p[i] = 255; }
+    int nested(int k, int m) {
+      struct Out o = { k, { { 1, { 2, 3 } }, { 4 } }, 9 };
+      int v;
+      switch (m) {
+      case 0: v = o.a; break;
+      case 1: v = o.in[0].h; break;
+      case 2: v = o.in[0].c[0] * 10 + o.in[0].c[1]; break;
+      case 3: v = o.in[0].c[2]; break;
+      case 4: v = o.in[1].h; break;
+      case 5: v = o.in[1].c[0] + o.in[1].c[1] + o.in[1].c[2]; break;
+      case 6: v = o.tail; break;
+      default: v = o.z; break;
+      }
+      spoil((unsigned char *)&o, sizeof o);
+      return v;
+    }
+    int elided(int m) {
+      struct In e[2] = { 5, 6, 7, 8, 9 };
+      int v = m ? e[1].h * 100 + e[1].c[0] * 10 + e[1].c[2] : e[0].h * 100 + e[0].c[0] * 10 + e[0].c[2];
+      spoil((unsigned char *)e, sizeof e);
+      return v;
+    }
+    int text(int i) { char b[8] = "ab"; int v = b[i & 7]; spoil((unsigned char *)b, 8); return v; }
+    struct V { int x; int y; };
+    int rebuilt(int n) {
+      int s = 0; int i;
+      for (i = 0; i < n; i++) { struct V v = { i }; v.y = v.y + 5; s = s + v.x * 10 + v.y; }
+      return s;
+    }
+    int one(int k) { int d[3] = { k }; return d[0] * 100 + d[1] * 10 + d[2] + 1; }
+    int words(int k) { char *w[3] = { "no", "yes" }; return w[k & 1][0] * 1000 + (w[2] == 0); }
+    int splitWords(void) { char *w[2] = { "no", "yes" }; return w[0][1] * 1000 + w[1][2]; }
+    int braced(int k) { int x = { k + 1 }; int *p = &x; return *p; }
+  '';
 
 in
 [
@@ -9120,7 +9170,7 @@ in
     "int a[] = \"abc\";"
     "int a[4] = \"abc\";"
     "char s[4] = { \"abc\", \"d\" };"
-    "void f(void) { char buf[] = \"abc\"; }"
+    "void f(void) { char buf[2] = \"abc\"; }"
     "int f(int x) { switch (x) { case \"abc\"[1]: return 1; } return 0; }"
     "int x = \"abc\"[0];"
     "int x = (int)\"abc\";"
@@ -9542,9 +9592,8 @@ in
     ]
   )
   (t
-    "cc compile: initializers of local arrays and structs, arrays without a length and 8-byte integers in memory throw"
+    "cc compile: a struct initialized from a value, arrays without a length and 8-byte integers in memory throw"
     (map compileThrows [
-      "void f(void) { char b[4] = \"ab\"; }"
       "struct s { int a; }; struct s g; void f(void) { struct s x = g; }"
       "void f(void) { int a[]; }"
       "void f(void) { long long x; long long *p = &x; }"
@@ -9552,6 +9601,188 @@ in
       "void f(int i) { long long a[2]; a[i] = 1; }"
       "struct s; void f(void) { struct s x; }"
     ])
-    (genList (_: true) 7)
+    (genList (_: true) 6)
   )
+
+  # Initializers of locals in memory and of split arrays
+  (t "cc run: an initializer stores 0 in what it leaves out on every call"
+    (
+      let
+        d = loadData Cc.load frameInitSrc;
+        a = d.f.again d.mem 5;
+        b = d.f.again a.mem 5;
+      in
+      [
+        a.ret
+        b.ret
+        (M.loadWord b.mem (
+          d.f.__data.symbols.${
+            head (filter (n: builtins.match "again'r'.*" n != null) (attrNames d.f.__data.symbols))
+          }
+          + 12
+        ))
+      ]
+    )
+    [
+      60
+      60
+      7
+    ]
+  )
+  (t "cc run: an array without a length takes it from its initializer" (dret frameInitSrc "count"
+    [ ]
+  ) 3)
+  (t "cc run: a string fills a row of a 2-dimensional char array without its 0" (dret frameInitSrc
+    "names"
+    [ ]
+  ) 122)
+  (t "cc run: a nested struct initializer stores its values and 0 elsewhere"
+    (
+      let
+        d = loadData Cc.load frameInitSrc;
+        step =
+          st: m:
+          let
+            r = d.f.nested st.mem 7 m;
+          in
+          {
+            inherit (r) mem;
+            rets = st.rets ++ [ r.ret ];
+          };
+      in
+      (foldl' step {
+        inherit (d) mem;
+        rets = [ ];
+      } (genList (m: m) 8)).rets
+    )
+    [
+      7
+      1
+      23
+      0
+      4
+      0
+      9
+      0
+    ]
+  )
+  (t "cc run: initializers with elided braces, strings, pointers and braced scalars"
+    (
+      let
+        d = loadData Cc.load frameInitSrc;
+        run =
+          calls:
+          (foldl'
+            (
+              st: c:
+              let
+                r = d.f.${head c} st.mem (elemAt c 1);
+              in
+              {
+                inherit (r) mem;
+                rets = st.rets ++ [ r.ret ];
+              }
+            )
+            {
+              inherit (d) mem;
+              rets = [ ];
+            }
+            calls
+          ).rets;
+      in
+      run [
+        [
+          "elided"
+          0
+        ]
+        [
+          "elided"
+          1
+        ]
+        [
+          "text"
+          0
+        ]
+        [
+          "text"
+          5
+        ]
+        [
+          "words"
+          1
+        ]
+        [
+          "words"
+          0
+        ]
+        [
+          "braced"
+          4
+        ]
+      ]
+    )
+    [
+      568
+      900
+      97
+      0
+      121001
+      110001
+      5
+    ]
+  )
+  (t "cc run: a struct initialized in a loop is read with its new values"
+    [
+      (dret frameInitSrc "rebuilt" [ 4 ])
+      (contains "M.loadWord" (fnCode frameInitSrc "rebuilt"))
+    ]
+    [
+      80
+      true
+    ]
+  )
+  (t "cc compile: a split array takes its initializer as variables"
+    (
+      let
+        syms = attrNames (Cc.load frameInitSrc).__data.symbols;
+      in
+      [
+        (dret frameInitSrc "one" [ 7 ])
+        (contains "M." (fnCode frameInitSrc "one"))
+        (dret frameInitSrc "splitWords" [ ])
+        (filter (n: builtins.match "(one|splitWords|count)'.*" n != null) syms)
+      ]
+    )
+    [
+      701
+      false
+      111115
+      [ ]
+    ]
+  )
+  (t "cc data: the strings of a char array initializer need no storage"
+    [
+      (Cc.load "int f(int i) { char b[4] = \"abc\"; char c[] = { \"de\" }; return b[i & 3] + c[i & 1]; }")
+      .__data.strings
+      (length (Cc.load frameInitSrc).__data.strings)
+    ]
+    [
+      [ ]
+      2
+    ]
+  )
+  (t "cc preprocessed: initializers of locals give the same code through one macro"
+    (sameAsMacro frameInitSrc)
+    true
+  )
+  (t "cc compile: a braced scalar that stays a variable and invalid local initializers throw" (map
+    compileThrows
+    [
+      "int f(void) { int x = { 1 }; return x; }"
+      "void f(void) { int a[2] = { 1, 2, 3 }; }"
+      "void f(void) { int a[2] = 5; }"
+      "void f(void) { int a[2] = { { 1, 2 } }; }"
+      "void f(void) { int y = { 1, 2 }; int *q = &y; }"
+    ]
+  ) (genList (_: true) 5))
 ]
