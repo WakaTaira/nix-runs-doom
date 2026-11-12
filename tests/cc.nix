@@ -78,6 +78,8 @@ let
       "(? ${show e.cond} ${show e.thenExpr} ${show e.elseExpr})"
     else if k == "charlit" then
       "(char ${toString e.value})"
+    else if k == "floatlit" then
+      "(float ${e.text})"
     else if k == "initlist" then
       "{${concatStringsSep "," (map show e.items)}}"
     else if k == "comma" then
@@ -1490,6 +1492,79 @@ let
         + sizeof(real) * 100000 + (p == 0) * 1000000;
     }
   '';
+
+  # Floating-point values (expected values from gcc -O0 on the same source).
+  floatRunSrc = ''
+    int zoomIn(void) { return (int)(1.02 * 65536); }
+    int zoomOut(void) { return (int)(65536 / 1.02); }
+    int corner(void) { return (int)(-.867 * 65536); }
+    int scaled = (int)(0.7 * 65536);
+    float accel = 2.0;
+    double offset = -2.5;
+    float table[3] = { 1.5f, -0.25, 3 };
+    struct rec { char c; double d; float f; } rs = { 1, 0.1, 0.1f };
+    float addF(float a, float b) { return a + b; }
+    double addD(double a, double b) { return a + b; }
+    float mulF(float a, float b) { return a * b; }
+    int sumF(void) { return (int)addF(16777216.0f, 1.0f); }
+    int sumD(void) { return (int)addD(16777216.0, 1.0); }
+    int toInt(float x) { return (int)x; }
+    int negs(void) { float a = -2.75f; double b = -0.5; return (int)a * 10 + (int)b + (int)-1.9; }
+    float (*op)(float, float) = addF;
+    int viaPtr(int k) {
+      float (*p)(float, float) = k ? addF : mulF;
+      return (int)(p(1.5f, 2.25f) * 4) + (int)(op(0.25f, 0.5f) * 100);
+    }
+    double viaGlobal(void) { op = mulF; return op(3, 0.5); }
+    int ops(int k) {
+      double x = k;
+      float y = x / 4;
+      y += 0.5f; y *= 2; y -= 1; y /= 2;
+      y++; --y;
+      int c = (y > 1.0) + 2 * (y == y) + 4 * !y + 8 * (y && x) + 16 * (x < 0 || y < 0) + 32 * (y >= 2.25 ? 1 : 0);
+      return c * 1000 + (int)(y * 100) + (int)(-x / 3);
+    }
+    int memOps(void) {
+      rs.d = rs.d * 2;
+      rs.f = rs.f + table[1];
+      table[2] = -table[2];
+      accel = accel * 0.5f + 1;
+      return (int)(rs.d * 1000) + (int)(rs.f * 10000) + (int)(table[2] * 100000) + (int)(accel * 1000000);
+    }
+    int frames(void) {
+      float a[4];
+      int i;
+      for (i = 0; i < 4; i++) a[i] = i * 0.5f;
+      return (int)((a[1] + a[3]) * 10);
+    }
+    void setF(float *p) { *p = 1.25f; }
+    int byAddr(void) { float v = 0; setF(&v); return (int)(v * 4); }
+    int counter(void) { static float s = 0.5f; s = s * 2; return (int)s; }
+    unsigned bitsOf(float x) { return *(unsigned *)&x; }
+  '';
+  floatRun = loadData Cc.load floatRunSrc;
+  floatSyms = floatRun.f.__data.symbols;
+  # The results of the calls ([ fn arg ... ]) of floatRunSrc made in order on one memory,
+  # from the initialized data -> { mem; rets; }.
+  floatCalls =
+    calls:
+    foldl'
+      (
+        st: c:
+        let
+          r = foldl' (g: a: g a) (floatRun.f.${head c} st.mem) (builtins.tail c);
+        in
+        {
+          inherit (r) mem;
+          rets = st.rets ++ [ r.ret ];
+        }
+      )
+      {
+        inherit (floatRun) mem;
+        rets = [ ];
+      }
+      calls;
+  floatRet = fn: args: (floatCalls [ ([ fn ] ++ args) ]).rets;
 
   attrSrc = ''
     static inline int add1(register int x) { register int y = x + 1; return y; }
@@ -8009,7 +8084,7 @@ in
     compileThrows
     [
       "int g(int (*p)(int, ...)) { return p(1); }"
-      "int g(double (*p)(int)) { p(1); return 0; }"
+      "int g(double (*p)(int)) { return (int *)p(1) != 0; }"
       "struct s { int a; }; int g(struct s (*p)(void)) { p(); return 0; }"
       "void a(void) { } void f(void) { a = 0; }"
       "static void s(void); void (*p)(void) = s;"
@@ -8277,23 +8352,217 @@ in
       24
     ]
   )
-  (t "cc compile: floating-point values, variables and functions throw" (map compileThrows [
-    "int f(void) { return 1.5; }"
-    "float x;"
-    "double a[2];"
-    "int f(void) { float y; return 0; }"
-    "extern float x; float x;"
-    "struct f1 { char c; double d; } s; int f(void) { return s.d + 1; }"
-    "struct f1 { char c; double d; } s; int f(void) { return s.d; }"
-    "struct f1 { char c; double d; } s; void f(void) { s.d = 1; }"
-    "int ff(float); int g(void) { return ff(1); }"
-    "int f(void) { return (float)1; }"
-    "float h(void) { return 0; }"
-    "int k(double x) { return 0; }"
-    "struct f1 { double d; int i; } s = { 1, 2 };"
-    "int f(float *p) { return *p; }"
-    "long double x;"
-  ]) (genList (_: true) 15))
+  (t "cc run: floating-point constant expressions fold to the integers of clang"
+    [
+      (floatRet "zoomIn" [ ])
+      (floatRet "zoomOut" [ ])
+      (floatRet "corner" [ ])
+      (M.loadWord floatRun.mem floatSyms.scaled)
+    ]
+    [
+      [ 66846 ]
+      [ 64250 ]
+      [ (-56819) ]
+      45875
+    ]
+  )
+  (t "cc run: float and double initializers are stored in IEEE single and double precision"
+    (map (a: M.loadWord floatRun.mem a) [
+      floatSyms.accel
+      floatSyms.offset
+      (floatSyms.offset + 4)
+      (floatSyms.rs + 8)
+      (floatSyms.rs + 12)
+      (floatSyms.rs + 16)
+      (floatSyms.table + 4)
+    ])
+    [
+      1073741824 # 2.0f = 0x40000000
+      0
+      3221487616 # -2.5
+      2576980378 # 0.1 (low word)
+      1069128089
+      1036831949 # 0.1f
+      3196059648 # -0.25f
+    ]
+  )
+  (t "cc run: float arithmetic rounds to single precision, double does not"
+    [
+      (floatRet "sumF" [ ])
+      (floatRet "sumD" [ ])
+    ]
+    [
+      [ 16777216 ]
+      [ 16777217 ]
+    ]
+  )
+  (t "cc run: floating-point values convert to integers toward zero"
+    [
+      (floatRet "toInt" [ (-2.75) ])
+      (floatRet "toInt" [ 2.75 ])
+      (floatRet "negs" [ ])
+      (tryEval (builtins.deepSeq (floatRet "toInt" [ 3.0e9 ]) null)).success
+    ]
+    [
+      [ (-2) ]
+      [ 2 ]
+      [ (-21) ]
+      false
+    ]
+  )
+  (t "cc run: float parameters and results in direct calls and through function pointers"
+    (floatCalls [
+      [
+        "viaPtr"
+        1
+      ]
+      [
+        "viaPtr"
+        0
+      ]
+      [ "viaGlobal" ]
+      [
+        "viaPtr"
+        1
+      ]
+    ]).rets
+    [
+      90
+      88
+      1.5
+      27
+    ]
+  )
+  (t "cc run: compound assignment, ++, --, comparisons, !, &&, || and ?: on floating-point values"
+    (map (k: head (floatRet "ops" [ k ])) [
+      5
+      0
+      (-8)
+      9
+    ])
+    [
+      11124
+      6000
+      25802
+      43222
+    ]
+  )
+  (t "cc run: float and double objects in memory: members, arrays, a static local, & of a local"
+    (
+      let
+        st = floatCalls [ [ "memOps" ] ];
+      in
+      [
+        st.rets
+        (map (a: M.loadWord st.mem a) [
+          floatSyms.accel
+          (floatSyms.rs + 8)
+          (floatSyms.rs + 12)
+          (floatSyms.rs + 16)
+          (floatSyms.table + 8)
+        ])
+        (floatCalls [
+          [ "frames" ]
+          [ "byAddr" ]
+          [ "counter" ]
+          [ "counter" ]
+          [ "counter" ]
+        ]).rets
+        (floatRet "bitsOf" [ (-0.15625) ])
+      ]
+    )
+    [
+      [ 1698700 ]
+      [
+        1073741824
+        2576980378
+        1070176665
+        3189348762
+        3225419776
+      ]
+      [
+        20
+        5
+        1
+        2
+        4
+      ]
+      [ 3189768192 ]
+    ]
+  )
+  (t "cc compile: float constants are Nix literals with a dot, negations and exact subnormals"
+    (
+      let
+        src = ''
+          double big(void) { return 1e22; }
+          double small(void) { return 1e-5; }
+          double halve(double x) { return x / -0.5; }
+          double tiny(double x) { return x * 5e-324; }
+          float third(void) { return 1.0f / 3; }
+        '';
+        code = Cc.compile src;
+        f = Cc.load src;
+        R = import ../cc/runtime.nix;
+      in
+      [
+        (contains "ret = 1.0e+22;" code)
+        (contains "ret = 1.0e-05;" code)
+        (contains "x_0 / -0.5" code)
+        (contains "(2.220446049250313e-16 * 2.2250738585072014e-308)" code)
+        (f.big M.empty).ret
+        (f.halve M.empty 3.0).ret
+        (R.f64Words (f.tiny M.empty 1.0).ret)
+        (R.f32Bits (f.third M.empty).ret)
+      ]
+    )
+    [
+      true
+      true
+      true
+      true
+      1.0e22
+      (-6.0)
+      {
+        lo = 1;
+        hi = 0;
+      }
+      1051372203
+    ]
+  )
+  (t "cc compile: invalid floating-point operations and the unsupported forms throw" (map
+    compileThrows
+    [
+      "int f(double x) { return x % 2; }"
+      "int f(double x) { return x << 1; }"
+      "int f(double x) { return x & 1; }"
+      "int f(double x) { return ~x; }"
+      "int *f(double x) { return (int *)x; }"
+      "double f(int *p) { return (double)p; }"
+      "double f(int *p) { return p; }"
+      "int f(double x) { switch (x) { default: return 0; } }"
+      "int f(void) { return (int)1e10; }"
+      "double x = 0x1p3;"
+      "double x = 1e400;"
+      "int f(double x) { return x[0]; }"
+      "int f(float x) { +x = 1; return 0; }"
+      "double d = 1.0 / 0.0;"
+      "int f(int k) { return *(k ? 1.5 : (int *)0); }"
+    ]
+  ) (genList (_: true) 15))
+  (t "cc run: unary + promotes and is no lvalue"
+    [
+      (ret "int f(char c) { return +c; } int g(void) { float x = 1.5f; return (int)(+x * 2); }" "f" [
+        200
+      ])
+      (ret "int f(char c) { return +c; } int g(void) { float x = 1.5f; return (int)(+x * 2); }" "g" [ ])
+      (compileThrows "int g; int *f(void) { return &+g; }")
+    ]
+    [
+      200
+      3
+      true
+    ]
+  )
 
   # Qualifiers, register, inline and attributes
   (t "cc run: register, inline, volatile, restrict and ignored attributes" (dret attrSrc "useAll" [
@@ -8967,13 +9236,89 @@ in
       true
     ]
   )
+  (t "cc lex: floating-point literals: values, suffixes and the forms that throw"
+    [
+      (map (k: [
+        k.value
+        k.single
+      ]) (filter (k: k.kind == "float") (toks "1.02 .867 1e5 1.5e+2f 08.5L 2. 0001.25e-1F 1.0e-400")))
+      (map lexThrows [
+        "x = 0x1.8p3;"
+        "x = 1e400;"
+        "x = 1.5e;"
+        "x = 1.2.3;"
+        "x = 1.5q;"
+      ])
+    ]
+    [
+      [
+        [
+          1.02
+          false
+        ]
+        [
+          0.867
+          false
+        ]
+        [
+          100000.0
+          false
+        ]
+        [
+          150.0
+          true
+        ]
+        [
+          8.5
+          false
+        ]
+        [
+          2.0
+          false
+        ]
+        [
+          0.125
+          true
+        ]
+        [
+          0.0
+          false
+        ]
+      ]
+      [
+        true
+        true
+        true
+        true
+        true
+      ]
+    ]
+  )
+  (t "cc parse: floating-point literals, long double and unary +"
+    [
+      (parsed "a + 1.5f * -.5")
+      (parsed "+a")
+      (showType (head (items "long double x;")).type)
+    ]
+    [
+      "(+ a (* (float 1.5f) (- (float .5))))"
+      "(+ a)"
+      "double"
+    ]
+  )
   (t "cc lex: .5 is a floating-point literal, s.x a member access"
     [
-      (lexThrows "x = .5;")
+      (map (k: k.kind) (toks "x = .5;"))
       (texts "s.x")
     ]
     [
-      true
+      [
+        "ident"
+        "punct"
+        "float"
+        "punct"
+        "eof"
+      ]
       [
         "s"
         "."

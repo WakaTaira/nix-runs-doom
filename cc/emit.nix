@@ -190,9 +190,19 @@
 #     first. Every other use of a value (bindings, conditions, comparisons, / and %, >>,
 #     bitwise operators, conversions, pointer arithmetic and indices, arguments, return
 #     values, stores) takes it wrapped. long long does not wrap.
+#   - float and double values are Nix floats: + - * / are Nix float operations (a
+#     division by zero throws), a float result is rounded to single precision with
+#     R.toF32, a conversion to an integer type truncates with R.fToInt (which throws
+#     outside the range of the type), and an integer becomes a float by `+ 0.0` (R.toF32
+#     for float from 4 bytes on). A conversion between integer types left to the store
+#     (see assignMem) is never one to or from a floating-point type.
 # Value representation: signed char, int, long and long long are signed Nix integers;
 # plain char (unsigned, see cc/check.nix), the unsigned types and pointers are
-# non-negative. Memory words are stored in the unsigned form.
+# non-negative. Memory words are stored in the unsigned form. float and double are Nix
+# floats, written as float literals (floatNum); in memory a float is its IEEE single
+# precision bits (R.f32Bits, R.loadF32) and a double its IEEE double precision bits in two
+# words, the low one first (R.storeF64, R.loadF64). An uninitialized float or double
+# variable is 0.0.
 #
 # Generated names are `<C name>_<n>` (parameters `<C name>_0`) with n unique within a
 # function, and `<C name>_fn` for functions, so they collide neither with each other nor
@@ -207,6 +217,7 @@ let
   Ch = import ./check.nix;
   T = Ch.types;
   B = import ../lib/bits.nix;
+  R = import ./runtime.nix;
   inherit (builtins)
     all
     any
@@ -248,10 +259,38 @@ let
   llongMin = -9223372036854775807 - 1;
   num =
     n:
-    if n == llongMin then
+    if builtins.isFloat n then
+      floatNum n
+    else if n == llongMin then
       sub (cv 2 "-9223372036854775807") (num 1)
     else
       cv (if n < 0 then 2 else 0) (toString n);
+  # A Nix float as Nix source that reads back as the same value: the shortest digits of
+  # toJSON, always with a `.` (Nix reads `1e5` as an application and needs a `.` in a
+  # float), the exponent as toJSON writes it (`1.0e+22`, `1.0e-05`), a negative value as a
+  # negation, and a subnormal value (which Nix does not read as a literal) as a normal
+  # literal times 2^-1022, which is exact.
+  floatNum =
+    x:
+    let
+      ax = if x < 0 then 0.0 - x else x;
+      lit =
+        y:
+        let
+          m = builtins.match "([0-9]+)([.][0-9]+)?(e.*)?" (builtins.toJSON y);
+        in
+        head m
+        + (if elemAt m 1 == null then ".0" else elemAt m 1)
+        + (if elemAt m 2 == null then "" else elemAt m 2);
+      pos =
+        if ax != 0 && ax < 2.2250738585072014e-308 then
+          mul (atom (lit (ax * R.pow2f 1022))) (atom "2.2250738585072014e-308")
+        else
+          atom (lit ax);
+    in
+    if x < 0 then neg pos else pos;
+  # The zero of the type t as code: 0.0 for float and double, whose values are Nix floats.
+  zeroOf = t: if T.isFloat t then floatNum 0.0 else num 0;
   wrap = max: c: if c.prec <= max then c.code else "(${c.code})";
   app = f: args: cv 1 (concatStringsSep " " ([ f ] ++ map (wrap 0) args));
   # Left-associative and non-associative infix operators of strength p.
@@ -401,10 +440,26 @@ let
 
   # ---- Types to code ----
 
-  # Conversion of a value of type from to type to.
+  # Conversion of a value of type from to type to. An integer becomes a Nix float by adding
+  # 0.0 (exact up to 2^53, rounded to nearest beyond), and a float rounds the result to
+  # single precision (R.toF32) unless from is narrower than 4 bytes (always exact); a
+  # floating-point value becomes an integer by R.fToInt with the range of to.
   convert =
     from: to: c:
-    if T.fits from to then
+    if T.isFloat to then
+      if T.isFloat from then
+        (if to.tag == "float" && from.tag == "double" then app "R.toF32" [ c ] else c)
+      else if to.tag == "float" && T.sizeOf from >= 4 then
+        app "R.toF32" [ c ]
+      else
+        add c (floatNum 0.0)
+    else if T.isFloat from then
+      app "R.fToInt" [
+        (num (T.rangeOf to).lo)
+        (num (T.rangeOf to).hi)
+        c
+      ]
+    else if T.fits from to then
       c
     else if T.isS32 to then
       app "B.toSigned" [ (if T.isU32 from then c else app "B.u32" [ c ]) ]
@@ -441,7 +496,17 @@ let
         a
       ];
     in
-    if T.isU8 t then
+    if t.tag == "float" then
+      app "R.loadF32" [
+        (atom mem)
+        a
+      ]
+    else if t.tag == "double" then
+      app "R.loadF64" [
+        (atom mem)
+        a
+      ]
+    else if T.isU8 t then
       byte
     else if T.isS8 t then
       app "R.toS8" [ byte ]
@@ -459,7 +524,9 @@ let
     let
       size = T.sizeOf t;
     in
-    if size == 1 then
+    if t.tag == "double" then
+      "R.storeF64"
+    else if size == 1 then
       "M.storeByte"
     else if size == 2 then
       "M.storeHalf"
@@ -469,13 +536,18 @@ let
   # A value of type from stored as type t: storeByte keeps the low bits itself, a signed
   # value is cut to 16 bits for storeHalf (which takes the high byte of a half at an
   # address 3 mod 4 by division, so it needs a non-negative value), and a word is stored
-  # in its unsigned form.
+  # in its unsigned form. A float (from is then float too) is stored as its bits, and a
+  # double as it is (R.storeF64 encodes it).
   encode =
     t: from: c:
     let
       size = T.sizeOf t;
     in
-    if size == 1 || T.isUnsigned from then
+    if t.tag == "float" then
+      app "R.f32Bits" [ c ]
+    else if t.tag == "double" then
+      c
+    else if size == 1 || T.isUnsigned from then
       c
     else if size == 2 then
       app "bitAnd" [
@@ -745,7 +817,35 @@ let
     in
     if r.kind == "lit" && r.value >= 0 && r.value < limit then r.value else null;
 
-  binop =
+  binop = s: e: if T.isFloat e.type then floatBinop s e else intBinop s e;
+
+  # + - * / on floating-point operands of the result type: in double precision, rounded to
+  # single precision for float (exact for these operations). A division by zero throws
+  # (Nix).
+  floatBinop =
+    s: e:
+    combine s [ e.lhs e.rhs ] (
+      s: cs:
+      let
+        a = head cs;
+        b = elemAt cs 1;
+        r =
+          if e.op == "+" then
+            add a b
+          else if e.op == "-" then
+            sub a b
+          else if e.op == "*" then
+            mul a b
+          else
+            infixL 3 "/" a b;
+      in
+      {
+        inherit s;
+        c = if e.type.tag == "float" then app "R.toF32" [ r ] else r;
+      }
+    );
+
+  intBinop =
     s: e:
     let
       t = e.type;
@@ -984,8 +1084,13 @@ let
       t = e.target.type;
       # The expression yields the new value (needed besides the store).
       newUsed = want && !e.post;
-      # Unless the new value is used, the conversion to the target type is left to encode.
-      node = if !newUsed && e.value.kind == "cast" then e.value.expr else e.value;
+      # Unless the new value is used, the conversion between integer types to the target
+      # type is left to encode.
+      node =
+        if !newUsed && e.value.kind == "cast" && T.isScalar t && T.isScalar e.value.expr.type then
+          e.value.expr
+        else
+          e.value;
       v = expr (s // { old = oldC; }) node;
       a = expr (v.s // { inherit (s) old; }) e.target.expr;
       # The address is used twice when the value reads the target, or when the store is
@@ -1633,7 +1738,8 @@ let
     in
     l // { binds = i.binds ++ l.binds; };
 
-  # An uninitialized variable reads as 0, also inside its own initializer.
+  # An uninitialized variable reads as 0 (0.0 for float and double), also inside its own
+  # initializer.
   declVar =
     s: d:
     let
@@ -1642,14 +1748,14 @@ let
           ${d.var.key} = d.var.name;
         };
         vars = s.vars // {
-          ${d.var.key} = "0";
+          ${d.var.key} = (zeroOf d.var.type).code;
         };
       };
       v = expr s1 d.init;
       b = setVar v.s d.var v.c;
     in
     if d.init == null then
-      setVar s1 d.var (num 0)
+      setVar s1 d.var (zeroOf d.var.type)
     else
       {
         inherit (b) s;
@@ -3364,7 +3470,7 @@ let
         n.skipped ++ concatLists sections
       );
       s0 = ps.s // {
-        vars = ps.s.vars // listToAttrs (map (var: nameValue var.key "0") declared);
+        vars = ps.s.vars // listToAttrs (map (var: nameValue var.key (zeroOf var.type).code) declared);
         names = ps.s.names // listToAttrs (map (var: nameValue var.key var.name) declared);
       };
       assigned = assignedKeys sections;
@@ -3503,7 +3609,7 @@ let
         break = unexpected "break";
         continue = unexpected "continue";
       };
-      body = stmtK handlers s0 f.body (st: end st (num 0));
+      body = stmtK handlers s0 f.body (st: end st (zeroOf f.ret));
       signature = concatStringsSep " " ([ "mem:" ] ++ map (v: "${v.name}_0:") params);
     in
     "  ${f.name}_fn =\n    ${indent (indent "${signature}\nbuiltins.seq mem (\n${renderLet body.binds body.code}\n)")};\n";
@@ -3624,7 +3730,7 @@ let
         let
           p = elemAt f.params i;
         in
-        if i < n then convert (T.classTypes.${elemAt wantParams i}) p (atom "a${toString i}") else num 0
+        if i < n then convert (T.classTypes.${elemAt wantParams i}) p (atom "a${toString i}") else zeroOf p
       ) (length f.params);
       call = app f.ref ([ (atom "mem") ] ++ args);
       result =

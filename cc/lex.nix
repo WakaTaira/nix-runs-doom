@@ -6,6 +6,10 @@
 #   "keyword"  C keyword (text is the keyword)
 #   "int"      integer literal; also has value (a non-negative Nix integer),
 #              unsigned (bool, a u/U suffix) and long (0, 1 or 2: none, l/L, ll/LL)
+#   "float"    floating-point literal (decimal: digits with a `.` or an exponent, and an
+#              optional f, F, l or L suffix); also has value (a Nix float, the double
+#              nearest to the number) and single (bool, an f/F suffix), and unsigned,
+#              which throws (for the #if expressions of cc/pp.nix)
 #   "char"     character literal; also has value (the byte value 0..255 of its one
 #              character: plain char is unsigned, so '\377' is 255)
 #   "string"   string literal; also has bytes (the byte values 0..255 of its contents,
@@ -24,7 +28,9 @@
 # shallow.
 #
 # An integer literal is decimal, hexadecimal (0x) or octal (a leading 0; `08` and `09` are
-# errors).
+# errors). A literal is one preprocessing number, which may contain `e+`, `e-`, `p+` and
+# `p-` (as in cc/pp.nix). A hexadecimal floating-point literal and a decimal one from 1e308
+# on (whose value fromJSON cannot read) are unsupported.
 #
 # Character and string literals hold ASCII characters (0x01..0x7F; a raw byte from 0x80
 # up is unsupported) and the escapes \n \t \r \b \a \f \v \\ \' \" \?, octal escapes of
@@ -35,7 +41,7 @@
 #
 # Rejected here: preprocessor directives, multi-character character literals, character
 # and string literals with a prefix (L, u, U, and u8 for strings, which are recognized
-# with the literal), floating-point literals, and characters that start no C token.
+# with the literal), and characters that start no C token.
 # Errors are thrown as "cc: <line>:<col>: <message>" ("unsupported: ..." for valid C
 # outside the subset). lexNamed name src is lex for the source of a unit named name (of
 # a link, see cc/parse.nix parseNamed): its tokens also have file = name, and its errors
@@ -90,8 +96,7 @@ let
     # repetition, which keeps the regex engine's recursion shallow on long literals.
     + "|\"${stringBody}\""
     + "|(u8|[LuU])\"${stringBody}\""
-    + "|[0-9][0-9A-Za-z_.]*" # preprocessing number
-    + "|[.][0-9][0-9A-Za-z_.]*" # preprocessing number starting with a dot
+    + "|[.]?[0-9]([0-9A-Za-z_.]|[eEpP][-+])*" # preprocessing number
     + "|[A-Za-z_][0-9A-Za-z_]*" # identifier or keyword
     + "|>>=|<<=|\\.\\.\\.|->|\\+\\+|--|<<|>>|&&|\\|\\||[-*/%+&^|<>=!]="
     + "|[^${ws}]" # any other single character
@@ -260,7 +265,7 @@ let
         || (hex != null && match "0[xX][0-9A-Fa-f]*[pP].*" text != null);
     in
     if isFloat then
-      unsupported pos "floating-point literal '${text}'"
+      floatToken pos text
     else if hex == null && match "0[0-7]*[89].*" text != null then
       fail pos "invalid digit in octal literal '${text}'"
     else if parts == null || suffix == null then
@@ -274,6 +279,60 @@ let
         inherit text value;
         inherit (suffix) unsigned long;
       };
+
+  # A preprocessing number that is a floating-point literal as a token (see the header).
+  # Its value is the double nearest to the decimal number (fromJSON of the number in JSON
+  # form, which rounds correctly); the f and F suffixes only set single.
+  floatToken =
+    pos: text:
+    let
+      m = match "(([0-9]*)[.]([0-9]*)|([0-9]+))(([eE])([-+]?[0-9]+))?([fFlL]?)" text;
+      intDigits = if elemAt m 1 != null then elemAt m 1 else elemAt m 3;
+      fracDigits = if elemAt m 2 != null then elemAt m 2 else "";
+      intPart = stripDecimalZeros intDigits;
+      json =
+        intPart
+        + (if fracDigits == "" then "" else ".${fracDigits}")
+        + (if elemAt m 4 == null then "" else "e${elemAt m 6}");
+      value = fromJSON json + 0.0;
+      suffix = elemAt m 7;
+      # Whether the value reaches 10^308 (fromJSON fails from about 1.8 * 10^308 on): the
+      # position of the first nonzero digit (the number of integer digits, or minus the
+      # zeros that start the fraction) plus the exponent.
+      expText = if elemAt m 4 == null then "0" else elemAt m 6;
+      expDigits = stripDecimalZeros (head (match "[-+]?([0-9]+)" expText));
+      fracZeros = stringLength (head (match "(0*).*" fracDigits));
+      lead = if intPart != "0" then stringLength intPart else 0 - fracZeros;
+      nonzero = intPart != "0" || fracZeros < stringLength fracDigits;
+      tooLarge =
+        nonzero
+        && substring 0 1 expText != "-"
+        && (stringLength expDigits > 5 || fromJSON expDigits + lead > 308);
+    in
+    if match "0[xX].*" text != null then
+      unsupported pos "hexadecimal floating-point literal '${text}'"
+    else if m == null || (intDigits == "" && fracDigits == "") then
+      fail pos "invalid floating-point literal '${text}'"
+    else if tooLarge then
+      unsupported pos "floating-point literal of 1e308 or more '${text}'"
+    else
+      pos
+      // {
+        kind = "float";
+        inherit text value;
+        single = suffix == "f" || suffix == "F";
+        # The #if expressions of cc/pp.nix read `unsigned` of every number (fromPpToken):
+        # for a floating-point literal, that is the error of C.
+        unsigned = fail pos "floating constant in preprocessor expression";
+      };
+
+  # The decimal digits s without leading zeros, "0" when nothing is left.
+  stripDecimalZeros =
+    s:
+    let
+      r = head (match "0*([0-9]*)" s);
+    in
+    if r == "" then "0" else r;
 
   # Simple escape sequences: the character after the backslash -> character code.
   escapes = {
@@ -393,7 +452,7 @@ let
     if hasAttr c digits then
       intToken pos text
     else if match "[.][0-9].*" text != null then
-      unsupported pos "floating-point literal '${text}'"
+      floatToken pos text
     else if match "[LuU]'.*" text != null then
       unsupported pos "prefixed character literal ${text}"
     else if match "(u8|[LuU])\".*" text != null then

@@ -1679,11 +1679,10 @@ in
       "1"
     ]
   )
-  (t "cc link 29: variadic calls that stop: too few fixed arguments, floating-point, va_list" (
+  (t "cc link 29: variadic calls that stop: too few fixed arguments, struct, va_list" (
     map (s: throws (withStdWith { allowUndefined = true; } { "a.c" = printfSrc s; })) [
       "void run(void) { printf(); }"
       "int sn(char *b) { return snprintf(b, 4); }"
-      "extern double d; void run(void) { printf(\"%f\", d); }"
       "struct s { int a; } g; void run(void) { printf(\"%d\", g); }"
       "void run(void) { vprintf(\"x\", (va_list)0); }"
       "void run(va_list ap) { vprintf(\"x\", ap); }"
@@ -1697,7 +1696,7 @@ in
         }
       ))
     ]
-  ) (genList (_: true) 9))
+  ) (genList (_: true) 8))
   (t "cc link 34: a host function declared with an 8-byte result or parameter"
     [
       (throws (lk [
@@ -1859,8 +1858,8 @@ in
       in
       [
         (Lx.lexNamed "a" src == map (k: k // { file = "a"; }) (Lx.lex src))
-        (throws (Lx.lexNamed "a" "int f(void) { return 1.5; }"))
-        (throws (lk [ (u "a" "int f(void) { return 1.5; }") ]))
+        (throws (Lx.lexNamed "a" "int f(void) { return 0x1p3; }"))
+        (throws (lk [ (u "a" "int f(void) { return 0x1p3; }") ]))
       ]
     )
     [

@@ -25,7 +25,8 @@
 # qualifiers `const`, `volatile`, `restrict` and `__restrict` are dropped:
 #   { tag = <base>; }                one of "void", "char", "schar" (signed char),
 #                                    "uchar", "short", "ushort", "int", "uint", "long",
-#                                    "ulong", "llong", "float", "double"
+#                                    "ulong", "llong", "float", "double" (`long double`
+#                                    is "double")
 #   { tag = "ptr"; to = <type>; }    pointer
 #   { tag = "array"; of = <type>; len = <expression or null>; }
 #                                    array; len is null for `[]`. `int m[2][3]` is an
@@ -138,6 +139,9 @@
 #   { kind = "intlit"; value; unsigned; long; text; }     literal; position: the literal
 #       value is a non-negative integer, unsigned a bool (u/U suffix), long 0, 1 or 2
 #       (no suffix, l/L, ll/LL), text the literal as written. `-1` is a "unary" node.
+#   { kind = "floatlit"; value; text; single; }           floating-point literal; value is
+#       a Nix float, single tells an f/F suffix (type float, otherwise double); position:
+#       the literal
 #   { kind = "charlit"; value; text; }                     character literal (type int);
 #       value is the character code, text the literal as written; position: the literal
 #   { kind = "strlit"; bytes; }                            string literal (adjacent ones
@@ -149,7 +153,8 @@
 #   { kind = "call"; callee; args = [ <expression> ]; }    call of any other expression
 #       (`(*fp)(x)`, `s->f(x)`, `a[i](x)`); position: that of callee
 #   { kind = "cast"; type; expr; }                         position: the `(`
-#   { kind = "unary"; op; expr; }                          op: "-" "~" "!"; position: op
+#   { kind = "unary"; op; expr; }                          op: "-" "+" "~" "!"; position:
+#                                                          op
 #   { kind = "deref"; expr; }                              `*e`; position: the `*`
 #   { kind = "addr"; expr; }                               `&e`; position: the `&`
 #   { kind = "sizeof"; expr; }                             `sizeof e`; position: `sizeof`
@@ -1101,12 +1106,7 @@ let
             else if a.float > 0 then
               if total == 1 then { tag = "float"; } else invalid
             else if a.double > 0 then
-              if a.double == 1 && a.long == 1 && total == 2 then
-                unsupported first "long double"
-              else if total == 1 then
-                { tag = "double"; }
-              else
-                invalid
+              if a.double == 1 && (total == 1 || a.long == 1 && total == 2) then { tag = "double"; } else invalid
             else if a.short > 0 then
               if a.short > 1 || a.char > 0 || a.int > 1 || a.long > 0 || sign > 1 then
                 invalid
@@ -2147,14 +2147,12 @@ let
         if t.kind == "punct" then
           if x == "++" || x == "--" then
             withOperand "prefix" { op = x; }
-          else if x == "-" || x == "~" || x == "!" then
+          else if x == "-" || x == "+" || x == "~" || x == "!" then
             withOperand "unary" { op = x; }
           else if x == "*" then
             withOperand "deref" { }
           else if x == "&" then
             withOperand "addr" { }
-          else if x == "+" then
-            unsupported t "unary '+'"
           else if x == "(" && startsType tn (i + 1) then
             castExpr tn i
           else
@@ -2332,6 +2330,11 @@ let
         else if t.kind == "char" then
           {
             node = mk t "charlit" { inherit (t) value text; };
+            i = i + 1;
+          }
+        else if t.kind == "float" then
+          {
+            node = mk t "floatlit" { inherit (t) value text single; };
             i = i + 1;
           }
         else if t.kind == "string" then

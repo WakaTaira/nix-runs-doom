@@ -73,17 +73,32 @@
 # pointers are assigned, cast, compared and joined by ?:. A direct call with arguments to
 # a function whose signature in scope has no prototype is unsupported ("call with
 # arguments to the function '<name>' declared without a prototype"); one without arguments
-# is checked against the signature at the end of the unit. float and double are known
-# types with their size and alignment, but every floating-point value (and variable, and
-# the definition of or a call to a function with such a parameter or return value) is
-# unsupported, as are calls to a variadic function outside link mode (in link mode a call
-# gives at least the fixed arguments, and each variable argument is passed after the
-# default argument promotions; one of floating-point, struct or union type is
-# unsupported). __builtin_va_list (the va_list of stdarg.h, see cc/parse.nix) may only be
-# named in a typedef and in the parameters of a function declaration: a variable, member,
-# return type, cast or sizeof of a type with it (hasVaList: through pointers, arrays and
-# the return types of function types, not their parameters), the definition of a function
-# with such a parameter and a call to one are unsupported ('va_list').
+# is checked against the signature at the end of the unit. Calls to a variadic function
+# are unsupported outside link mode (in link mode a call gives at least the fixed
+# arguments, and each variable argument is passed after the default argument promotions
+# (argPromote: char and short types to int, float to double); one of struct or union type
+# is unsupported). __builtin_va_list (the va_list of stdarg.h, see cc/parse.nix) may only
+# be named in a typedef and in the parameters of a function declaration: a variable,
+# member, return type, cast or sizeof of a type with it (hasVaList: through pointers,
+# arrays and the return types of function types, not their parameters), the definition of
+# a function with such a parameter and a call to one are unsupported ('va_list').
+#
+# Floating point: float and double (long double is double, see cc/parse.nix) are
+# arithmetic types. Their values are Nix floats, a float value always one that IEEE single
+# precision represents (cc/runtime.nix toF32); in memory a float is its 4 bytes of IEEE
+# single precision and a double its 8 bytes of IEEE double precision (the low word first),
+# also in the initializers of the data. The usual arithmetic conversions give double when
+# an operand is double, otherwise float when one is float (usualArith). Floating-point
+# operands take + - * / (also in compound assignment, ++ and --), the comparisons, !, &&,
+# || and ?:, unary - and +, and the conversions to and from the integer types (toward zero,
+# an out-of-range value an error in a constant and a throw at run time) and between float
+# and double; %, the bitwise operators and shifts are errors, and so are conversions
+# between floating-point and pointer types. A floating-point constant (an f or F suffix
+# gives float) folds like an integer one, rounded to single precision for float, so an
+# integer constant expression may contain one (`(int)(1.02 * 65536)` is 66846); a
+# division by zero is not folded. Floating-point variables, parameters, return values,
+# members and array elements are supported where the integer ones are, but a split array
+# (see "Locals in memory"): a local float array is kept in memory.
 #
 # Typed syntax tree
 # -----------------
@@ -92,20 +107,22 @@
 # conversion of an integer constant is folded into the constant. Operators on integer
 # constants (unary, binary, comparisons, !, &&, || and ?:) are folded into a "lit" with
 # the value the generated code would compute (signed int and long wrap to 32 bits), except
-# a division by zero. A constant shift of a 32-bit value by a negative amount or by 32 or
-# more, and of a long long by a negative amount, by 64 or more, or left by 63, is
-# unsupported. The address of a file-scope variable (or of a static local, a local in
-# memory or a string literal) is a pointer "lit", and so is a constant pointer plus or
-# minus a constant (member offsets and constant indices). The operand of sizeof, and the
-# condition of a switch for the shape of its node, are also typed without the addresses
+# a division by zero; so are operators on floating-point constants (see "Floating
+# point"). A constant shift of a 32-bit value by a negative amount or by 32 or more, and
+# of a long long by a negative amount, by 64 or more, or left by 63, is unsupported. The
+# address of a file-scope variable (or of a static local, a local in memory or a string
+# literal) is a pointer "lit", and so is a constant pointer plus or minus a constant
+# (member offsets and constant indices). The operand of sizeof, and the condition of a
+# switch for the shape of its node, are also typed without the addresses
 # (typeOnlyEnv), so the placement of the data never waits on an address folded there. An
 # address is then a constant of unknown value, which folds to a known constant where the
 # result does not depend on it (`(unsigned)&g & 0` is 0, see isSymbol). Any other value
 # computed from an address stays unknown there, so a 0 that only the address or an identity
 # gives (`(unsigned)&g & 3` for an aligned g, `(unsigned)&g - (unsigned)&g`) is no null
 # pointer constant in those operands, and a shift by such a value is not checked there.
-#   { kind = "lit"; value; }                     integer constant in the range of type, or
-#                                                a constant address (pointer type)
+#   { kind = "lit"; value; }                     integer constant in the range of type, a
+#                                                constant address (pointer type), or a
+#                                                floating-point constant (a Nix float)
 #   { kind = "var"; var; }                       local variable or parameter, or element
 #                                                of a split array (see "Locals in
 #                                                memory"); var = { key; name; type; };
@@ -121,17 +138,20 @@
 #   { kind = "call"; name; args; va; }           a call to a variadic function (link
 #                                                mode): va the variable arguments after
 #                                                the default argument promotions (char
-#                                                and short types to int)
+#                                                and short types to int, float to
+#                                                double)
 #   { kind = "cast"; expr; }                     conversion of expr to type (void: discard)
 #   { kind = "neg" | "bnot"; expr; }             unary - and ~ (expr has the result type)
 #   { kind = "not"; expr; }                      !; expr is any scalar; type int
 #   { kind = "deref"; expr; }                    memory read at the address expr; type is
-#                                                the scalar read (1, 2 or 4 bytes). The
+#                                                the scalar read (1, 2 or 4 bytes), or
+#                                                float (4) or double (8 bytes). The
 #                                                read of a bit-field also has
 #                                                bitfield = true (only for & and sizeof)
-#   { kind = "binop"; op; lhs; rhs; }            op: * / % + - << >> & | ^ on integers; both
-#                                                operands have the result type, except the
-#                                                rhs of << and >> (its own promoted type)
+#   { kind = "binop"; op; lhs; rhs; }            op: * / % + - << >> & | ^ on integers, and
+#                                                * / + - on float or double; both operands
+#                                                have the result type, except the rhs of
+#                                                << and >> (its own promoted type)
 #   { kind = "ptradd"; op; ptr; index; size; }   pointer +/- integer; index is not scaled
 #                                                by size (bytes per unit of index); type is
 #                                                the result pointer type
@@ -263,11 +283,11 @@
 # type, or, for a type without a prototype, applies the default argument promotions and
 # takes any number. Its shape is the class of the return type ("v" for void) followed by
 # that of each converted argument, the class of a type being "s" (signed 32-bit: signed
-# char, short, int, long), "u" (unsigned 32-bit: char, unsigned types, pointers) or "l"
-# (long long), with the class types int, unsigned int and long long (shapeOf). A call to
-# a name that is a function stays a direct call. A call through a pointer to a variadic
-# function type, or to one with a floating-point, va_list, struct or union parameter or
-# return value, is unsupported.
+# char, short, int, long), "u" (unsigned 32-bit: char, unsigned types, pointers), "l"
+# (long long), "f" (float) or "d" (double), with the class types int, unsigned int, long
+# long, float and double (shapeOf). A call to a name that is a function stays a direct
+# call. A call through a pointer to a variadic function type, or to one with a va_list,
+# struct or union parameter or return value, is unsupported.
 #
 # Struct and union assignment
 # ---------------------------
@@ -289,6 +309,7 @@
 # assignment, and passing, returning and comparing a struct or union stay unsupported.
 let
   B = import ../lib/bits.nix;
+  R = import ./runtime.nix;
   inherit (builtins)
     all
     any
@@ -406,6 +427,8 @@ let
   tLong = ty "long";
   tULong = ty "ulong";
   tLLong = ty "llong";
+  tFloat = ty "float";
+  tDouble = ty "double";
   ptrTo = t: {
     tag = "ptr";
     to = t;
@@ -488,7 +511,7 @@ let
       1
     else if isS16 t || isU16 t then
       2
-    else if t.tag == "llong" then
+    else if t.tag == "llong" || t.tag == "double" then
       8
     else
       4;
@@ -503,6 +526,9 @@ let
 
   # Integer promotion (char and short types to int).
   promote = t: if isInteger t && sizeOf t < 4 then tInt else t;
+  # The default argument promotions (C99 6.5.2.2p6): integer promotion, and float to
+  # double.
+  argPromote = t: if t.tag == "float" then tDouble else promote t;
 
   rank =
     t:
@@ -514,6 +540,17 @@ let
       llong = 3;
     }
     .${t.tag};
+
+  # Usual arithmetic conversions of two arithmetic types (C99 6.3.1.8): double when either
+  # is double, otherwise float when either is float, otherwise those of integer types.
+  usualArith =
+    a: b:
+    if a.tag == "double" || b.tag == "double" then
+      tDouble
+    else if a.tag == "float" || b.tag == "float" then
+      tFloat
+    else
+      usual a b;
 
   # Usual arithmetic conversions of two integer types.
   usual =
@@ -607,6 +644,8 @@ let
   types = {
     inherit
       showType
+      isFloat
+      rangeOf
       isScalar
       isPtr
       isInteger
@@ -639,8 +678,8 @@ let
   isRecord = t: t.tag == "struct" || t.tag == "union";
   isAggregate = t: isArray t || isRecord t;
   isFloat = t: t.tag == "float" || t.tag == "double";
-  # A floating-point object: a float or double, or an array of them.
-  hasFloat = t: isFloat t || isArray t && hasFloat t.of;
+  # Integer and floating-point types (pointers excluded).
+  isArith = t: isInteger t || isFloat t;
   isFnPtr = t: isPtr t && t.to.tag == "fn";
   isVoidPtr = t: isPtr t && isVoid t.to;
   # Two resolved types of one unit agree: they are equal, but that a function type without
@@ -704,7 +743,7 @@ let
       hasVaList t.ret
     else
       false;
-  # Sizes (and alignments) of the floating-point types; they are never read or written.
+  # Sizes (and alignments) of the floating-point types.
   floatSizes = {
     float = 4;
     double = 8;
@@ -841,16 +880,39 @@ let
     t: x:
     if x.type == t then
       x
-    else if x.kind == "lit" && isScalar t then
+    else if x.kind == "lit" && (isScalar t || isFloat t) then
       x
       // {
         type = t;
-        value = wrapTo t x.value;
+        value = convValue t x;
       }
     else if isSymbol x && isScalar t then
       x // { type = t; }
     else
       node x "cast" t { expr = x; };
+
+  # The value of the constant x (a "lit" node of an integer, pointer or floating-point
+  # type) converted to the integer, pointer or floating-point type t, as the generated
+  # code converts it (cc/runtime.nix): integers wrap, a float rounds to single precision,
+  # and a floating-point value truncates toward zero to an integer, which must lie in the
+  # range of t (an error otherwise, where the generated code throws).
+  convValue =
+    t: x:
+    let
+      v = x.value;
+      r = rangeOf t;
+      truncated = if v < 0 then builtins.ceil v else builtins.floor v;
+    in
+    if t.tag == "float" then
+      R.toF32 v
+    else if t.tag == "double" then
+      v + 0.0
+    else if !isFloat x.type then
+      wrapTo t v
+    else if v <= r.lo - 1.0 || v >= r.hi + 1.0 then
+      fail x "floating-point constant out of the range of '${showType t}'"
+    else
+      truncated;
 
   # The type is tested before the value, so the address of a constant pointer is not read.
   isNullConst = x: x.kind == "lit" && isInteger x.type && x.value == 0;
@@ -863,6 +925,8 @@ let
   # the evaluation like in the generated code).
 
   isIntLit = x: x.kind == "lit" && isInteger x.type;
+  # An integer or floating-point constant.
+  isNumLit = x: x.kind == "lit" && isArith x.type;
 
   litAt =
     at: t: value:
@@ -936,13 +1000,43 @@ let
     else
       foldShr t a b;
 
+  # Value of `a op b` (+ - * /) for the floating-point constants a and b of type t, the
+  # result rounded to single precision for float, or null when it is not folded (a
+  # division by zero, which the generated code throws, and a result beyond the range of
+  # double).
+  foldFloat =
+    t: op: a: b:
+    let
+      r =
+        if op == "+" then
+          a + b
+        else if op == "-" then
+          a - b
+        else if op == "*" then
+          a * b
+        else
+          a / b;
+    in
+    if op == "/" && b == 0 then
+      null
+    else if r > maxDouble || r < 0.0 - maxDouble then
+      null
+    else if t.tag == "float" then
+      R.toF32 r
+    else
+      r;
+  maxDouble = 1.7976931348623157e308;
+
   # The "binop" node n folded to a constant when both operands are constants.
   foldBinop =
     n:
     let
       v = foldBinary n.type n.op n.lhs.value n.rhs.value;
+      fv = foldFloat n.type n.op n.lhs.value n.rhs.value;
     in
-    if isIntLit n.lhs && isIntLit n.rhs && v != null then
+    if isFloat n.type then
+      (if isNumLit n.lhs && isNumLit n.rhs && fv != null then litAt n n.type fv else n)
+    else if isIntLit n.lhs && isIntLit n.rhs && v != null then
       litAt n n.type v
     else if symbolPair n.lhs n.rhs then
       foldSymbolBinop n
@@ -973,29 +1067,30 @@ let
   };
   boolValue = b: if b then 1 else 0;
 
-  # The "cmp" node n folded when both operands are integer constants.
+  # The "cmp" node n folded when both operands are integer or floating-point constants.
   foldCmp =
     n:
-    if isIntLit n.lhs && isIntLit n.rhs then
+    if isNumLit n.lhs && isNumLit n.rhs then
       litAt n tInt (boolValue (cmpOps.${n.op} n.lhs.value n.rhs.value))
     else if symbolPair n.lhs n.rhs then
       symbolAt n tInt
     else
       n;
 
-  # The "not", "logand" and "logor" node n folded when its operands are integer constants.
+  # The "not", "logand" and "logor" node n folded when its operands are integer or
+  # floating-point constants.
   foldLogic =
     n:
     if n.kind == "not" then
       (
-        if isIntLit n.expr then
+        if isNumLit n.expr then
           litAt n tInt (boolValue (n.expr.value == 0))
         else if isSymbol n.expr && isInteger n.expr.type then
           symbolAt n tInt
         else
           n
       )
-    else if isIntLit n.lhs && isIntLit n.rhs then
+    else if isNumLit n.lhs && isNumLit n.rhs then
       litAt n tInt (
         boolValue (
           if n.kind == "logand" then
@@ -1036,7 +1131,7 @@ let
           unsupported at "conversion from '${showType x.type}' to '${showType t}'"
       )
     else if
-      (isInteger t && isInteger x.type) || (isPtr t && isPtr x.type) || (isPtr t && isNullConst x)
+      (isArith t && isArith x.type) || (isPtr t && isPtr x.type) || (isPtr t && isNullConst x)
     then
       mkCast t x
     else
@@ -1076,6 +1171,8 @@ let
       node e "lit" (litType e) { inherit (e) value; }
     else if k == "charlit" then
       litAt e tInt e.value
+    else if k == "floatlit" then
+      floatLit e
     else if k == "strlit" then
       stringObject env.ctx e
     else if k == "ident" then
@@ -1111,8 +1208,12 @@ let
     else
       fail e "unexpected expression '${k}'";
 
+  # The constant of the "floatlit" node e: float (rounded to single precision) for an f or
+  # F suffix, double otherwise (also for l and L: long double is double).
+  floatLit = e: if e.single then litAt e tFloat (R.toF32 e.value) else litAt e tDouble e.value;
+
   # Expression used for its value (void included): an array decays to a pointer to its
-  # first element, and struct, union and floating-point values are unsupported.
+  # first element, and struct and union values are unsupported.
   valueOf =
     env: e:
     let
@@ -1124,8 +1225,6 @@ let
       x.expr
     else if isRecord x.type then
       unsupported e "${x.type.tag} value"
-    else if isFloat x.type then
-      unsupported e "floating-point value"
     else
       x;
 
@@ -1394,8 +1493,6 @@ let
         expr = if env.ctx.typeOnly then symbolAt e p else litAt e p (env.ctx.fnNum name);
       };
 
-  # Whether the signature f has a floating-point parameter or return value.
-  sigHasFloat = f: isFloat f.ret || any isFloat f.params;
   # Whether the signature f has a parameter or return value of a va_list type (hasVaList).
   sigHasVaList = f: hasVaList f.ret || any hasVaList f.params;
 
@@ -1420,7 +1517,7 @@ let
         let
           x = rv env (elemAt e.args (n + i));
         in
-        mkCast (promote x.type) x;
+        mkCast (argPromote x.type) x;
       objType = env.vars.${e.name}.type or env.ctx.globals.${e.name}.type or null;
     in
     if hasAttr e.name env.vars || hasAttr e.name env.ctx.globals || hasAttr e.name env.ctx.consts then
@@ -1442,8 +1539,6 @@ let
       unsupported e "call to the variadic function '${e.name}'"
     else if sigHasVaList f then
       unsupported e "'va_list'"
-    else if sigHasFloat f then
-      unsupported e "call to the function '${e.name}' with a floating-point parameter or return value"
     else if f.unspecified && m > 0 then
       unsupported e "call with arguments to the function '${e.name}' declared without a prototype"
     else if (if f.variadic then m < n else n != m) then
@@ -1472,7 +1567,7 @@ let
           a = elemAt e.args i;
           x = rv env a;
         in
-        if ft.unspecified then mkCast (promote x.type) x else assignConv a (elemAt ft.params i) x;
+        if ft.unspecified then mkCast (argPromote x.type) x else assignConv a (elemAt ft.params i) x;
       args = genList arg m;
       shape = shapeOf ft.ret (map (a: a.type) args);
       # A narrower return value comes in its class and is converted at the call.
@@ -1488,8 +1583,6 @@ let
       unsupported e "call through a pointer to the variadic function type '${showType ft}'"
     else if sigHasVaList ft then
       unsupported e "'va_list'"
-    else if sigHasFloat ft then
-      unsupported e "call through a function pointer with a floating-point parameter or return value"
     else if isRecord ft.ret || any isRecord ft.params then
       unsupported e "call through a function pointer with a struct or union parameter or return value"
     else if !ft.unspecified && n != m then
@@ -1499,22 +1592,30 @@ let
     else
       mkCast ft.ret call;
 
-  # The class of the representation of a value of the scalar type t in an indirect call:
-  # "s" signed 32-bit, "u" unsigned 32-bit (pointers included), "l" long long.
+  # The class of the representation of a value of the scalar or floating-point type t in an
+  # indirect call: "s" signed 32-bit, "u" unsigned 32-bit (pointers included), "l" long
+  # long, "f" float, "d" double.
   classOf =
     t:
     if t.tag == "llong" then
       "l"
+    else if t.tag == "float" then
+      "f"
+    else if t.tag == "double" then
+      "d"
     else if isPtr t || isUnsigned t then
       "u"
     else
       "s";
-  # The type that holds every value of the class of t: int, unsigned int or long long.
+  # The type that holds every value of the class of t: int, unsigned int, long long, float
+  # or double.
   classType = t: classTypes.${classOf t};
   classTypes = {
     s = tInt;
     u = tUInt;
     l = tLLong;
+    f = tFloat;
+    d = tDouble;
   };
   # The shape of an indirect call (see "Function pointers") returning ret with arguments of
   # the types params: the class of ret ("v" for void) and of each parameter.
@@ -1535,8 +1636,10 @@ let
       fail e.expr "void value used"
     else if hasVaList t then
       unsupported e "'va_list'"
-    else if isFloat t then
-      unsupported e "conversion to '${showType t}'"
+    else if isFloat t && isPtr x.type then
+      fail e "pointer cannot be cast to type '${showType t}'"
+    else if isPtr t && isFloat x.type then
+      fail e "operand of type '${showType x.type}' cannot be cast to a pointer type"
     else
       mkCast t x;
 
@@ -1552,8 +1655,14 @@ let
     in
     if op == "!" then
       foldLogic (node at "not" tInt { expr = x; })
+    else if isFloat x.type && op == "+" then
+      x
+    else if isFloat x.type && op == "-" then
+      (if x.kind == "lit" then x // { value = 0.0 - x.value; } else node at "neg" x.type { expr = x; })
     else if !isInteger x.type then
       fail at "invalid argument type '${showType x.type}' to unary '${op}'"
+    else if op == "+" then
+      v
     else if v.kind == "lit" then
       folded (if op == "-" then (n: -n) else (n: -n - 1))
     else if isSymbol v then
@@ -1700,6 +1809,8 @@ let
     in
     if x ? bitfield then
       fail e "address of a bit-field requested"
+    else if e.expr.kind == "unary" then
+      fail e "cannot take the address of an rvalue of type '${showType x.type}'"
     else if x.kind == "deref" && inFrameObject env e.expr then
       unsupported e "address of a local variable"
     else if x.kind == "deref" then
@@ -1764,8 +1875,8 @@ let
       ta = a.type;
       tb = b.type;
       t =
-        if isInteger ta && isInteger tb then
-          usual ta tb
+        if isArith ta && isArith tb then
+          usualArith ta tb
         else if isPtr ta && typesAgree ta tb then
           preferSpecified ta tb
         else if isFnPtr ta && isFnPtr tb && typesAgree ta tb then
@@ -1789,7 +1900,7 @@ let
     in
     if hasSideEffects e.thenExpr || hasSideEffects e.elseExpr then
       unsupported e "side effect in a branch of '?:'"
-    else if isIntLit c && isIntLit x && isIntLit y then
+    else if isNumLit c && isNumLit x && isNumLit y then
       (if c.value != 0 then x else y) // posOf e
     else if isIntConst c && isIntConst x && isIntConst y then
       foldSymbolCond e t c x y
@@ -1820,6 +1931,8 @@ let
       ta = a.type;
       tb = b.type;
       ints = isInteger ta && isInteger tb;
+      # Arithmetic operands of which one at least is floating-point.
+      floats = isArith ta && isArith tb && !ints;
       invalid = fail at "invalid operands to binary '${op}' ('${showType ta}' and '${showType tb}')";
       arith =
         t:
@@ -1870,10 +1983,17 @@ let
         "^"
       ]
     then
-      if ints then arith (usual ta tb) else invalid
+      if ints then
+        arith (usual ta tb)
+      else if floats && (op == "*" || op == "/") then
+        arith (usualArith ta tb)
+      else
+        invalid
     else if op == "+" then
       if ints then
         arith (usual ta tb)
+      else if floats then
+        arith (usualArith ta tb)
       else if isPtr ta && isInteger tb then
         ptrAdd ctx at "+" a b
       else if isInteger ta && isPtr tb then
@@ -1883,6 +2003,8 @@ let
     else if op == "-" then
       if ints then
         arith (usual ta tb)
+      else if floats then
+        arith (usualArith ta tb)
       else if isPtr ta && isInteger tb then
         ptrAdd ctx at "-" a b
       else if isPtr ta && typesAgree ta tb && isComplete ctx ta.to then
@@ -1897,9 +2019,9 @@ let
       if ints then shift else invalid
     else if isFnPtr ta || isFnPtr tb then
       fnPtrCmp at op a b
-    else if ints then
+    else if ints || floats then
       let
-        t = usual ta tb;
+        t = usualArith ta tb;
       in
       cmp (mkCast t a) (mkCast t b)
     else if isPtr ta && isPtr tb then
@@ -2003,6 +2125,8 @@ let
       litAt e (litType e) e.value
     else if k == "charlit" then
       litAt e tInt e.value
+    else if k == "floatlit" then
+      floatLit e
     else if k == "ident" then
       constIdent hooks e
     else if k == "sizeof" || k == "sizeoftype" then
@@ -2039,7 +2163,7 @@ let
 
   constCast =
     e: t: x:
-    if !isInteger t || !isIntLit x then
+    if !isArith t || !isNumLit x then
       fail e "expression is not an integer constant expression"
     else
       mkCast t x;
@@ -2064,11 +2188,9 @@ let
       fail e "array type '${showType x.type}' is not assignable"
     else if isRecord x.type then
       unsupported e "${x.type.tag} assignment"
-    else if isFloat x.type then
-      unsupported e "floating-point value"
     else if x.type.tag == "fn" then
       fail e "non-object type '${showType x.type}' is not assignable"
-    else if x.kind == "var" || x.kind == "deref" then
+    else if (x.kind == "var" || x.kind == "deref") && e.kind != "unary" then
       x
     else
       fail e "expression is not assignable";
@@ -2317,8 +2439,6 @@ let
           in
           if hasVaList t then
             unsupported d "'va_list'"
-          else if hasFloat t then
-            unsupported d "floating-point variable"
           else if isArray t || isRecord t || how == "frame" then
             frameLocal acc d t how
           else if d.init != null && d.init.kind == "initlist" then
@@ -2674,8 +2794,6 @@ let
         unsupported d "'va_list'"
       else if hasLLong t0 then
         unsupported d "8-byte integer in a static variable"
-      else if hasFloat t0 then
-        unsupported d "floating-point variable"
       else if isArray t && t.len == null then
         unsupported d "array '${name}' without a length"
       else if !isComplete env.ctx t then
@@ -2964,7 +3082,7 @@ let
         "frame"
     else if isRecord t then
       "frame"
-    else if isScalar t && any (u: u.use == "addr") uses then
+    else if (isScalar t || isFloat t) && any (u: u.use == "addr") uses then
       "frame"
     else
       "bind";
@@ -3655,8 +3773,6 @@ let
     in
     if sigHasVaList sig then
       unsupported f "'va_list'"
-    else if sigHasFloat sig then
-      unsupported f "definition of a function with a floating-point parameter or return value"
     else if llongFrame != [ ] then
       unsupported (head llongFrame).p "8-byte integer in a local variable in memory"
     else
@@ -4258,8 +4374,6 @@ let
         unsupported g "'va_list'"
       else if hasLLong t then
         unsupported g "8-byte integer in a global variable"
-      else if isDef && hasFloat t then
-        unsupported g "floating-point variable"
       else if prev != null && !compatible prev.type t then
         fail g "redeclaration of '${name}' with a different type"
       else if !isDef then
@@ -4530,12 +4644,21 @@ let
 
   # An integer scalar takes an integer constant expression; a pointer the null pointer
   # constant or an address constant (a constant address, such as &g, &a[1], &s.m or an
-  # array name, plus or minus constants).
+  # array name, plus or minus constants); a float or double an arithmetic constant
+  # expression (floatConst), stored in IEEE single or double precision. A double is
+  # stored as two words, the low one first, in words (see objectInits).
   scalarInit =
     env: t: a: x:
     let
       size = sizeOf t;
-      v = if isInteger t then (mkCast t (constExpr (hooksOf env) x)).value else constAddress env t x;
+      v =
+        if isInteger t then
+          (mkCast t (constExpr (hooksOf env) x)).value
+        else if isFloat t then
+          floatConst env t x
+        else
+          constAddress env t x;
+      w = R.f64Words v;
     in
     {
       addr = a;
@@ -4543,10 +4666,47 @@ let
       # The check sits on the value, so that walking the stores for their string literals
       # (stringUses) raises no error before the values are read in order.
       value =
-        if isFloat t then unsupported x "floating-point initializer" else bitAnd v (B.pow2 (8 * size) - 1);
+        if t.tag == "float" then
+          R.f32Bits v
+        else if t.tag == "double" then
+          w.lo
+        else
+          bitAnd v (B.pow2 (8 * size) - 1);
       # The initializer, whose string literals need storage (see stringUses).
       expr = x;
-    };
+    }
+    // (
+      if t.tag == "double" then
+        {
+          words = [
+            {
+              addr = a;
+              size = 4;
+              value = w.lo;
+            }
+            {
+              addr = a + 4;
+              size = 4;
+              value = w.hi;
+            }
+          ];
+        }
+      else
+        { }
+    );
+
+  # The value of the initializer x of the floating-point type t: an arithmetic constant
+  # expression, typed and folded like an integer constant expression (constTyped) with
+  # floating-point constants, converted to t.
+  floatConst =
+    env: t: x:
+    let
+      y = constTyped (hooksOf env) x;
+    in
+    if isNumLit y then
+      (mkCast t y).value
+    else
+      fail x "initializer element is not a compile-time constant";
 
   constAddress =
     env: t: x:
@@ -5065,7 +5225,9 @@ let
       stringOverflows = filter (s: s.addr + s.size > B.mask32 + 1) r.strings.list;
       stringOverflowFail = fail (head stringOverflows).at "the data does not fit below 2^32 from dataBase (string literal)";
       extern = r.ctx.globals.${head externs};
-      objectInits = map (w: { inherit (w) addr size value; }) (concatMap (o: o.writes) r.objects);
+      objectInits = concatMap (w: w.words or [ { inherit (w) addr size value; } ]) (
+        concatMap (o: o.writes) r.objects
+      );
       stringInits = concatMap (s: byteWrites s.addr s.bytes) r.strings.list;
       size = if r.strings.list == [ ] then r.size else r.strings.end;
       layout = {
