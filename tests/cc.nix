@@ -1907,7 +1907,7 @@ let
     enum { K = 2 };
     int byEnum(void) { int a[3]; a[K] = 5; a[K - 1] = a[K] + 1; return a[1]; }
   '';
-  # The data symbols of frameSrc and their order: static locals first, then the frames in
+  # The data symbols of frameOrderSrc and their order: static locals first, then the frames in
   # function order, the parameters of a function before its locals.
   frameOrderSrc = ''
     int one(int v) { static int s1; char a[3]; int *p = &v; a[v & 1] = 1; return *p + a[0] + s1; }
@@ -9833,6 +9833,91 @@ in
       "void f(void) { int y = { 1, 2 }; int *q = &y; }"
     ]
   ) (genList (_: true) 5))
+
+  # Empty string initializers fill the whole object with 0 each time the declaration runs.
+  (t "cc run: an empty string initializer zeroes a local again at every call"
+    (
+      let
+        src = ''
+          void spoil(unsigned char *p, int n) { int i; for (i = 0; i < n; i++) p[i] = 255; }
+          int f(int i) { char b[8] = ""; int v = b[i & 7]; spoil((unsigned char*)b, 8); return v; }
+          struct N { char s[4]; int k; };
+          int g(int i) { struct N b = { "" }; int v = b.k + b.s[i & 3]; spoil((unsigned char*)&b, 8); return v; }
+          int h(void) { char b[3] = ""; int v = b[1] + b[2]; b[1] = 7; b[2] = 9; return v; }
+        '';
+        d = loadData Cc.load src;
+        twice =
+          fn: arg:
+          let
+            r1 = d.f.${fn} d.mem arg;
+            r2 = d.f.${fn} r1.mem arg;
+          in
+          [
+            r1.ret
+            r2.ret
+          ];
+        twice0 =
+          fn:
+          let
+            r1 = d.f.${fn} d.mem;
+            r2 = d.f.${fn} r1.mem;
+          in
+          [
+            r1.ret
+            r2.ret
+          ];
+      in
+      [
+        (twice "f" 5)
+        (twice "g" 1)
+        (twice0 "h")
+      ]
+    )
+    [
+      [
+        0
+        0
+      ]
+      [
+        0
+        0
+      ]
+      [
+        0
+        0
+      ]
+    ]
+  )
+  # Positions that the scan of uses does not look at: a split array indexed by a variable
+  # there is only typed.
+  (t "cc run: a split array indexed by a variable in a static initializer or a type"
+    [
+      (dret "int f(int i) { int a[3]; a[0] = i; { static int n = sizeof a[i]; return n; } }" "f" [ 2 ])
+      (ret "int f(int i) { int a[3]; a[0] = i; return (int)sizeof(char[sizeof a[i]]); }" "f" [ 2 ])
+    ]
+    [
+      4
+      4
+    ]
+  )
+  (t "cc compile: the address of a local in memory in a static initializer is unsupported"
+    (map compileThrows [
+      "int f(void) { int x; int *q = &x; static int *p = &x; return *p + *q; }"
+      "int f(void) { int a[4]; int *q = &a[1]; static int *p = &a[2]; return *p + *q; }"
+      "struct S { int a, b; }; int f(void) { struct S s; int *q = &s.b; static int *p = &s.b; return *p + *q; }"
+    ])
+    [
+      true
+      true
+      true
+    ]
+  )
+  (t "cc run: the address of a static local or a global is still constant in a static initializer" (
+    dret
+      "int g; int f(void) { static int x; int *q = &x; static int *p = &x; static int *r = &g; return (p == q) + (r == &g); }"
+      "f"
+      [ ]
+  ) 2)
 
   # Struct and union assignments
   (t "cc run: a local struct assigned to a global copies its members"

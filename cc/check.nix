@@ -95,15 +95,15 @@
 # a division by zero. A constant shift of a 32-bit value by a negative amount or by 32 or
 # more, and of a long long by a negative amount, by 64 or more, or left by 63, is
 # unsupported. The address of a file-scope variable (or of a static local, a local in
-# memory or a string literal) is a pointer "lit", and so is a constant pointer plus or minus a constant
-# (member offsets and constant indices). The operand of sizeof, and the condition of a
-# switch for the shape of its node, are also typed without the addresses (typeOnlyEnv),
-# so the placement of the data never waits on an address folded there. An address is
-# then a constant of unknown value, which folds to a known constant where the result does
-# not depend on it (`(unsigned)&g & 0` is 0, see isSymbol). Any other value computed from
-# an address stays unknown there, so a 0 that only the address or an identity gives
-# (`(unsigned)&g & 3` for an aligned g, `(unsigned)&g - (unsigned)&g`) is no null pointer
-# constant in those operands, and a shift by such a value is not checked there.
+# memory or a string literal) is a pointer "lit", and so is a constant pointer plus or
+# minus a constant (member offsets and constant indices). The operand of sizeof, and the
+# condition of a switch for the shape of its node, are also typed without the addresses
+# (typeOnlyEnv), so the placement of the data never waits on an address folded there. An
+# address is then a constant of unknown value, which folds to a known constant where the
+# result does not depend on it (`(unsigned)&g & 0` is 0, see isSymbol). Any other value
+# computed from an address stays unknown there, so a 0 that only the address or an identity
+# gives (`(unsigned)&g & 3` for an aligned g, `(unsigned)&g - (unsigned)&g`) is no null
+# pointer constant in those operands, and a shift by such a value is not checked there.
 #   { kind = "lit"; value; }                     integer constant in the range of type, or
 #                                                a constant address (pointer type)
 #   { kind = "var"; var; }                       local variable or parameter, or element
@@ -1629,7 +1629,9 @@ let
     let
       i = rv env e.index;
     in
-    if i.kind == "lit" && isInteger i.type && i.value >= 0 && i.value < length v.elems then
+    if env.ctx.typeOnly then
+      node e "var" v.type.of { var = elemAt v.elems 0; }
+    else if i.kind == "lit" && isInteger i.type && i.value >= 0 && i.value < length v.elems then
       node e "var" v.type.of { var = elemAt v.elems i.value; }
     else
       throw "cc: internal error: split array '${v.name}' indexed by a value that is not a constant in range";
@@ -1692,12 +1694,33 @@ let
     in
     if x ? bitfield then
       fail e "address of a bit-field requested"
+    else if x.kind == "deref" && inFrameObject env e.expr then
+      unsupported e "address of a local variable"
     else if x.kind == "deref" then
       mkCast (ptrTo x.type) x.expr
     else if x.kind == "var" then
       unsupported e "address of a local variable"
     else
       fail e "cannot take the address of an rvalue of type '${showType x.type}'";
+
+  # Whether the operand x of & names part of a local kept in memory (see "Locals in
+  # memory") in the initializer of a static local, where it is no constant.
+  inFrameObject =
+    env: x:
+    let
+      k = kindOf x;
+      v = if k == "ident" then env.vars.${x.name} or null else null;
+    in
+    if k == "dot" then
+      inFrameObject env x.expr
+    else if k == "index" then
+      inFrameObject env x.base
+    else
+      (env.staticInit or false)
+      && v != null
+      && v ? object
+      && builtins.match ".*'frame" v.object != null
+      && !isPtr v.type;
 
   # sizeof of the type or expression of the "sizeof" or "sizeoftype" node n (the
   # expression is typed, without reading an address, and not evaluated).
@@ -2418,7 +2441,7 @@ let
               if copied then
                 [ { stmt = recordFrom env.ctx d (objectAt env.ctx d t sym) (ex env' d.init); } ]
               else
-                map (w: { stmt = frameInitStore env' d sym w; }) (fillZeros env.ctx t writes)
+                map (w: { stmt = frameInitStore env' d sym w; }) (fillZeros env.ctx t (d.init != null) writes)
             );
           inherit strings;
           uses = acc.uses ++ usesOf env' d.init;
@@ -2442,16 +2465,16 @@ let
     if x == null then [ ] else initWritesWith localScalar env t 0 x;
 
   # The writes of a local in memory of type t: writes (see localWrites) with the stores of 0
-  # that fill the bytes between them and after the last (see zeroWrites), when there are
-  # any writes.
+  # that fill the bytes between them and after the last (see zeroWrites), when it has an
+  # initializer (hasInit), even if that gives no writes (such as "").
   fillZeros =
-    ctx: t: writes:
+    ctx: t: hasInit: writes:
     let
       n = length writes;
       endOf = i: if i == 0 then 0 else (elemAt writes (i - 1)).addr + (elemAt writes (i - 1)).size;
       align = alignOfT ctx t;
     in
-    if writes == [ ] then
+    if !hasInit then
       [ ]
     else
       concatLists (
@@ -2658,7 +2681,8 @@ let
             inherit sym;
             size = sizeOfT env.ctx t;
             align = alignOfT env.ctx t;
-            writesAt = addr: if d.init == null then [ ] else initWrites env' t addr d.init;
+            writesAt =
+              addr: if d.init == null then [ ] else initWrites (env' // { staticInit = true; }) t addr d.init;
           };
         }
     );

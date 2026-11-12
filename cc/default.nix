@@ -37,9 +37,10 @@
 # `__data.strings`); apply it to the memory first. Local arrays (but those indexed by
 # constants only, which become one variable per element), structs and unions, and locals
 # whose address is taken live at fixed addresses in the data (one place per declaration,
-# shared by every call of the function, see cc/check.nix). A function pointer holds the number of a function, and a call through one
-# picks the function from a table (see cc/check.nix and cc/emit.nix); a single file
-# numbers its functions as a link of it alone does.
+# shared by every call of the function, see cc/check.nix). A function pointer holds the
+# number of a function, and a call through one picks the function from a table (see
+# cc/check.nix and cc/emit.nix); a single file numbers its functions as a link of it
+# alone does.
 let
   Pp = import ./pp.nix;
   L = import ./lex.nix;
