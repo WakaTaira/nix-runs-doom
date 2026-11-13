@@ -277,7 +277,8 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   `tics >= 1` Doom takes events at each of the tics of a tick, so the queue is empty
   after a tick unless more releases were queued than tics, and the file is read before
   nearly every tick.
-- **Releases are made up.** A terminal never reports that a key was released, and holding
+- **Releases are made up.** A terminal in its usual mode never reports that a key was
+  released (see the kitty keyboard protocol below for one that does), and holding
   a key repeats its bytes. A key is therefore pressed from the read that
   finds its bytes until the next read. `poll` gives the presses of the keys decoded now, then
   a release for each key that was pressed at the previous read and is not decoded now.
@@ -290,6 +291,39 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   sequences (`ESC [ A`, `ESC O A`), so an `ESC` at the end of the text, or any cut-off
   sequence, is not decoded at once. If nothing more has arrived at the next read, it is
   read as complete (`ESC` is `KEY_ESCAPE`); otherwise it is decoded with the new bytes.
+- **With the kitty keyboard protocol, releases are real.** Made-up releases fail in two
+  ways a player meets at once: a terminal auto-repeats only the key pressed last, so
+  holding up and then pressing right stops the bytes of up and the driver releases it
+  (two keys cannot be held at once), and a modifier key alone sends nothing, so Doom's
+  Ctrl (fire), Shift (run) and Alt (strafe) cannot be used. A terminal that implements
+  the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+  reports, with the progressive enhancement flags 11 (disambiguate, report event types,
+  report all keys as escape codes), every press, repeat and release of every key as an
+  escape sequence, modifier keys alone included. `nix run .#play` asks the terminal for
+  the protocol, switches it to these flags when it can, and runs `doom.play` with
+  `DOOM_KEYS_PROTO=kitty`; `pollKitty` of `doom/keys.nix` then passes on the presses and
+  releases as reported, drops the repeats of a key already down, and maps left or right
+  Ctrl to fire, Shift to `KEY_RSHIFT` (run) and Alt to `KEY_RALT` (strafe); a character
+  typed with a modifier is the character. Nothing is made up, so a held key stays down
+  with no more bytes while others are pressed and released.
+- **A tap is held for one read.** When a key is pressed and released between two reads,
+  both events would reach Doom in the same tic: `I_GetEvent` takes events up to and
+  including the first release, and the press and the release would cancel out in
+  `gamekeydown` (a tap of Ctrl would not fire). The release of such a key is therefore
+  put off to the next read, so that the key is down for at least one tick (the
+  `DOOM_TICS` tics of it).
+- **In the kitty protocol, Ctrl-C belongs to the launcher.** Ctrl-C is then a key
+  sequence and no longer an interrupt. The launcher watches the key file for a press of
+  c with the ctrl bit in its modifiers (whatever caps lock or num lock add), then stops
+  the evaluation, pops the flags and restores the terminal; this also works while the
+  evaluation is still starting and reads no keys. It is the only look the launcher takes
+  into the keys, which it otherwise never decodes.
+- **The usual mode is the fallback.** The terminal stays in its usual mode, and
+  `doom.play` makes up releases as described above (`DOOM_KEYS_PROTO=legacy`, the
+  default), when the terminal does not answer the query (it replies only to the device
+  attributes asked for after it, or not at all within 2 s), when it does not report the
+  flags 11 after they are pushed, or when the launcher is given `DOOM_KEYS_PROTO=legacy`.
+  The commands typed by hand use the usual mode.
 - **Limits of the file.** A NUL byte (Ctrl-Space) in the key file makes `readFile` abort
   the whole evaluation, because a Nix string cannot hold NUL; it cannot be prevented. If
   the file becomes shorter than what was consumed, `poll` starts again from the front, so
