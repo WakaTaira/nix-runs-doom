@@ -824,6 +824,22 @@ let
     int preDec(int n) { int k = 0; while (--n) k += 2; return k; }
     int whileLess(int n) { int i = 0, s = 0; while (i < n) { s += i; i++; } return s; }
   '';
+  # Iteration counts around the ends of the loop chunks (4, 4 + 16, then every 64).
+  chunkCounts = [
+    0
+    1
+    3
+    4
+    5
+    19
+    20
+    21
+    83
+    84
+    85
+    148
+    149
+  ];
 
   # Globals at base + 0 (g), 4 (h), 8 (hs), 10 (hc), 12 (arr), 24 (limit), 28 (a2), 32 (b2).
   cacheSrc = ''
@@ -4848,6 +4864,20 @@ in
       6
       10
     ]
+  )
+  # The chunks of R.loop and R.loopDo hold 4, 16, then 64 iterations: counts around
+  # their ends.
+  (t "cc run: loops ending around the ends of the chunks"
+    (map (n: [
+      (ret loopDoSrc "whileLess" [ n ])
+      (ret loopDoSrc "forEver" [ n ])
+    ]) chunkCounts)
+    (
+      map (n: [
+        (builtins.div (n * (n - 1)) 2)
+        n
+      ]) chunkCounts
+    )
   )
   (t "cc emit: do/while, for (;;), while (1) and a condition with side effects use R.loopDo"
     (map

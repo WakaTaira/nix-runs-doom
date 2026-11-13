@@ -71,26 +71,43 @@ let
   # Loop driver, shaped like `run` in lib/cpu.nix. `vars` holds every variable the
   # loop carries (always including mem). Each iteration runs `body` while `cond`
   # holds; `body` may set `exit = true` to leave after the current iteration.
-  # Iterations are folded 64 at a time, every carried variable is forced after each
-  # chunk to keep thunk chains short, and the recursion is per chunk. The mem of every
-  # iteration is forced as well: an inner loop leaves its memory as one thunk, and a
-  # chain of them across the iterations of an outer loop would nest as deep as their
-  # number when demanded.
-  chunkLen = 64;
+  # Iterations are folded in chunks of 4, then 16, then 64 at a time: a chunk costs its
+  # full length even when the loop ends in its first iteration, so short loops stop after
+  # a short chunk. Every carried variable is forced after each chunk to keep thunk chains
+  # short, and the recursion is per chunk. The mem of every iteration is forced as well:
+  # an inner loop leaves its memory as one thunk, and a chain of them across the
+  # iterations of an outer loop would nest as deep as their number when demanded.
   forceMem = r: seq r.mem r;
-  chunkTicks = genList (_: null) chunkLen;
+  chunkTicks = n: genList (_: null) n;
+  firstTicks = chunkTicks 4;
+  secondTicks = chunkTicks 16;
+  restTicks = chunkTicks 64;
   forceVars = v: foldl' (acc: x: seq x acc) v (attrValues v);
+  # One chunk: the iterations of ticks from the carried variables v, then forced.
+  runChunk =
+    tick: ticks: v:
+    forceVars (foldl' tick v ticks);
   runLoop =
     tick: vars:
     let
+      chunk = runChunk tick;
       go =
         v:
         let
-          e = forceVars (foldl' tick v chunkTicks);
+          e = chunk restTicks v;
         in
         if e.exit then e else go e;
+      first = chunk firstTicks (vars // { exit = false; });
+      second = chunk secondTicks first;
     in
-    removeAttrs (go (vars // { exit = false; })) [ "exit" ];
+    removeAttrs (
+      if first.exit then
+        first
+      else if second.exit then
+        second
+      else
+        go second
+    ) [ "exit" ];
   loop =
     cond: body:
     runLoop (
