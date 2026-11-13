@@ -14,7 +14,8 @@
 #          entry), each byte as two hex digits, as in scaffold.boot.report
 # play     streams, at each tick, the guest output added in it (if any) and the last
 #          frame drawn in it (if any) with builtins.trace, the frame under a status
-#          line (the tick and the key events sent at it, + a press, - a release);
+#          line (the tick and the key events sent at it, + a press, - a release); each
+#          tick runs DOOM_TICS tics of the game and draws once (doom/run.nix tics);
 #          the value is
 #          "ticks: <n>, frames: <m>\n"
 #
@@ -23,6 +24,9 @@
 #   DOOM_WAD_HEX  path of the hex text of doom1.wad (as for scaffold/); required
 #   DOOM_ARGS     more arguments after `doom -iwad doom1.wad`, separated by white space
 #   DOOM_TICKS    calls of doomgeneric_Tick; 2 for title and report, 1000000 for play
+#   DOOM_TICS     tics of the game per tick, run by moving the virtual clock (doom/run.nix
+#                 tics); 0 for title and report (the clock is left to Doom, as in the
+#                 scaffold), 18 for play
 #   DOOM_KEYS     path of the key file, read again before every tick at which no key
 #                 event is pending (doom/run.nix, doom/keys.nix poll); no input
 #                 without it
@@ -107,13 +111,16 @@ let
 
   ticksOr = numberOr "DOOM_TICKS";
 
+  ticsOr = numberOr "DOOM_TICS";
+
   run =
-    ticks: onTick: init:
+    ticks: tics: onTick: init:
     import ./run.nix {
       inherit
         linked
         args
         ticks
+        tics
         readKeys
         onTick
         init
@@ -207,14 +214,14 @@ let
     in
     if out == "" then withFrame else trace out withFrame;
 
-  titleRun = run (ticksOr 2) (_: acc: acc) null;
+  titleRun = run (ticksOr 2) (ticsOr 0) (_: acc: acc) null;
   playTicks = ticksOr 1000000;
-  playRun = run playTicks stream null;
+  playRun = run playTicks (ticsOr 18) stream null;
 in
 {
   title = if titleRun.last == null then throw "doom: no frame was drawn" else image titleRun.last;
 
-  report = (run (ticksOr 2) hashEntries [ ]).acc;
+  report = (run (ticksOr 2) (ticsOr 0) hashEntries [ ]).acc;
 
   play = builtins.seq playRun.acc "ticks: ${toString playTicks}, frames: ${toString playRun.frameCount}\n";
 }

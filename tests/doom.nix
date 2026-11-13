@@ -21,6 +21,7 @@ let
     foldl'
     fromJSON
     genList
+    head
     length
     split
     stringLength
@@ -288,6 +289,146 @@ let
     onTick = info: acc: if info.tick == 0 then throw "tick 0" else acc;
     init = null;
   };
+
+  # A guest that counts tics from the clock as doomgeneric does: TryRunTics reads the tic
+  # count ms * 35 / 1000 and runs one tic per tic passed since its last call, at most 5
+  # (the rest are lost, as in BuildNewTic). Each tic takes key events until none is left
+  # or after the first release and keeps the state of each key. Create sleeps 7 ms and
+  # draws nothing; doomgeneric_Tick runs TryRunTics, sleeps nap ms and draws one frame:
+  # screen byte 0 is the count of all tics, byte 1 the tics of this tick, then the state
+  # of key a (97) after each of them. calls counts the calls of TryRunTics.
+  clockGuest = Cc.linkSources {
+    units = [
+      {
+        name = "clock";
+        src = ''
+          int DG_GetKey(int *pressed, unsigned char *key);
+          void DG_DrawFrame(void);
+          int DG_GetTicksMs(void);
+          void DG_SleepMs(int ms);
+          unsigned char *DG_ScreenBuffer;
+          unsigned colors[256];
+          unsigned char screen[64000];
+          unsigned char down[256];
+          int seen;
+          int total;
+          int now;
+          int calls;
+          int nap = 3;
+          void doomgeneric_Create(int argc, char **argv) {
+            DG_ScreenBuffer = screen;
+            DG_SleepMs(7);
+            seen = DG_GetTicksMs() * 35 / 1000;
+          }
+          void TryRunTics(void) {
+            int pressed;
+            unsigned char key;
+            int t = DG_GetTicksMs() * 35 / 1000;
+            int n = t - seen;
+            calls++;
+            seen = t;
+            if (n > 5) n = 5;
+            while (n > 0) {
+              while (DG_GetKey(&pressed, &key)) {
+                down[key] = pressed;
+                if (!pressed) break;
+              }
+              total++;
+              screen[2 + now] = down[97];
+              now++;
+              n--;
+            }
+          }
+          void doomgeneric_Tick(void) {
+            TryRunTics();
+            DG_SleepMs(nap);
+            screen[0] = total;
+            screen[1] = now;
+            now = 0;
+            DG_DrawFrame();
+          }
+        '';
+      }
+    ];
+  };
+
+  # The driver over a clock guest with tics per tick and the key texts of ticks 1, 2, ...;
+  # acc lists per tick the key events sent and, per frame, screen bytes 1 .. 1 + byte 1
+  # (the tics of the tick and the state of key a after each).
+  runClockOf =
+    linked: tics: texts:
+    import ../doom/run.nix {
+      inherit linked tics;
+      args = [ "doom" ];
+      ticks = length texts;
+      readKeys = tick: elemAt texts (tick - 1);
+      onTick =
+        info: acc:
+        acc
+        ++ [
+          {
+            inherit (info) events;
+            frames = map (f: genList (i: elemAt f.screen (1 + i)) (1 + elemAt f.screen 1)) info.frames;
+          }
+        ];
+      init = [ ];
+    };
+  runClock = runClockOf clockGuest;
+
+  # The value of the global variable name of a clock run.
+  globalOf = r: name: M.loadWord r.mem clockGuest.__data.symbols.${name};
+
+  # The tics of each tick (tick 0 included), the count of all tics, the calls of
+  # TryRunTics and the clock after three ticks without input.
+  clockSummary =
+    tics:
+    let
+      r = runClock tics [
+        null
+        null
+        null
+      ];
+    in
+    {
+      perTick = map (e: map head e.frames) r.acc;
+      total = globalOf r "total";
+      calls = globalOf r "calls";
+      ms = r.mem.host.ms;
+    };
+
+  # The clock guest with nap set to 60 ms by __init: more than a tic passes in each tick.
+  nappingGuest = clockGuest // {
+    __init = m: M.storeWord (clockGuest.__init m) clockGuest.__data.symbols.nap 60;
+  };
+
+  # The tic count of the formula of I_GetTime.
+  ticAt = ms: (ms * 35) / 1000;
+  inherit (runGuest [ "doom" ] [ ]) msOfTic;
+  ticKs = [
+    0
+    1
+    2
+    35
+    36
+    70
+    1000
+  ];
+
+  # The pending key events after each tick of a clock run with tics over texts that
+  # release two keys at once at tick 2.
+  pendingClock =
+    tics:
+    genList (
+      n:
+      length
+        (runClock tics (
+          genList (elemAt [
+            "ab"
+            "abc"
+            "abcd"
+          ]) (n + 1)
+        )).mem.host.keys
+    ) 3;
 
   throws = x: !(builtins.tryEval (builtins.deepSeq x x)).success;
 in
@@ -940,6 +1081,248 @@ in
     [
       "libc: exit: 3\nbye\n"
       "libc: exit: 1"
+    ]
+  )
+  (t "doom run: msOfTic of tic counts" (map msOfTic ticKs) [
+    0
+    29
+    58
+    1000
+    1029
+    2000
+    28572
+  ])
+  (t "doom run: msOfTic is the least ms of its tic count"
+    (map (k: [
+      (ticAt (msOfTic k))
+      (ticAt (msOfTic k - 1))
+    ]) (builtins.tail ticKs))
+    [
+      [
+        1
+        0
+      ]
+      [
+        2
+        1
+      ]
+      [
+        35
+        34
+      ]
+      [
+        36
+        35
+      ]
+      [
+        70
+        69
+      ]
+      [
+        1000
+        999
+      ]
+    ]
+  )
+  (t "doom run: tics 0 leaves the clock to the guest's sleeps" (clockSummary 0) {
+    perTick = [
+      [ ]
+      [ 0 ]
+      [ 0 ]
+      [ 0 ]
+    ];
+    total = 0;
+    calls = 3;
+    ms = 16;
+  })
+  (t "doom run: tics 0 runs the tics the guest's own sleeps passed"
+    (
+      let
+        r = runClockOf nappingGuest 0 [
+          null
+          null
+          null
+        ];
+      in
+      [
+        (map (e: map head e.frames) r.acc)
+        r.mem.host.ms
+      ]
+    )
+    [
+      [
+        [ ]
+        [ 0 ]
+        [ 2 ]
+        [ 2 ]
+      ]
+      187
+    ]
+  )
+  (t "doom run: tics 1 runs one tic and draws once per tick" (clockSummary 1) {
+    perTick = [
+      [ ]
+      [ 1 ]
+      [ 1 ]
+      [ 1 ]
+    ];
+    total = 3;
+    calls = 3;
+    ms = 89;
+  })
+  (t "doom run: tics 5 runs five tics in doomgeneric_Tick alone" (clockSummary 5) {
+    perTick = [
+      [ ]
+      [ 5 ]
+      [ 5 ]
+      [ 5 ]
+    ];
+    total = 15;
+    calls = 3;
+    ms = 432;
+  })
+  (t "doom run: tics 6 runs five tics in TryRunTics and one in doomgeneric_Tick" (clockSummary 6) {
+    perTick = [
+      [ ]
+      [ 6 ]
+      [ 6 ]
+      [ 6 ]
+    ];
+    total = 18;
+    calls = 6;
+    ms = 518;
+  })
+  (t "doom run: tics 18 runs 5, 5, 5 and 3 tics per tick" (clockSummary 18) {
+    perTick = [
+      [ ]
+      [ 18 ]
+      [ 18 ]
+      [ 18 ]
+    ];
+    total = 54;
+    calls = 12;
+    ms = 1546;
+  })
+  (t "doom run: tics counts from the current clock, which the guest also advances"
+    (
+      let
+        r = runClockOf nappingGuest 2 [
+          null
+          null
+          null
+        ];
+      in
+      [
+        (map (e: map head e.frames) r.acc)
+        r.mem.host.ms
+      ]
+    )
+    [
+      [
+        [ ]
+        [ 2 ]
+        [ 4 ]
+        [ 4 ]
+      ]
+      346
+    ]
+  )
+  (t "doom run: tics 3 holds a single press for its tick and releases it at the next"
+    (runClock 3 [
+      "a"
+      "a"
+      "a"
+    ]).acc
+    [
+      {
+        events = [ ];
+        frames = [ ];
+      }
+      {
+        events = [ (press 97) ];
+        frames = [
+          [
+            3
+            1
+            1
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (release 97) ];
+        frames = [
+          [
+            3
+            0
+            0
+            0
+          ]
+        ];
+      }
+      {
+        events = [ ];
+        frames = [
+          [
+            3
+            0
+            0
+            0
+          ]
+        ];
+      }
+    ]
+  )
+  (t "doom run: tics 3 keeps a held key down with no release"
+    (map (e: e.frames) (
+      builtins.tail
+        (runClock 3 [
+          "a"
+          "aa"
+          "aaa"
+        ]).acc
+    ))
+    (
+      genList (_: [
+        [
+          3
+          1
+          1
+          1
+        ]
+      ]) 3
+    )
+  )
+  (t "doom run: pending key events after each tick with tics 1 and 2"
+    [
+      (pendingClock 1)
+      (pendingClock 2)
+    ]
+    [
+      [
+        0
+        1
+        0
+      ]
+      [
+        0
+        0
+        0
+      ]
+    ]
+  )
+  (t "doom run: tics above 5 needs TryRunTics, and tics must be a non-negative integer"
+    [
+      (throws (runClockOf guest 6 [ null ]).frameCount)
+      (runClockOf guest 5 [ null ]).frameCount
+      (throws (runClockOf guest 6 [ ]).frameCount)
+      (throws (runClock (-1) [ ]).frameCount)
+    ]
+    [
+      true
+      2
+      true
+      true
     ]
   )
 ]

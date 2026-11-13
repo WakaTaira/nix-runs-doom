@@ -1,30 +1,48 @@
 # The driver of a linked doomgeneric (doom/link.nix), or of any linked program with the
 # same entry points, on the host of cc/host.nix.
 #
-#   import ./run.nix { linked; args; ticks; readKeys; onTick; init; }
-#     -> { mem; last; frameCount; acc; }
+#   import ./run.nix { linked; args; ticks; readKeys; onTick; init; tics ? 0; }
+#     -> { mem; last; frameCount; acc; msOfTic; }
 #
 # linked    the result of a link with doomgeneric_Create (argc, argv), doomgeneric_Tick
-#           (no arguments), both returning void, and __init
+#           (no arguments), both returning void, and __init; with tics > 5 also
+#           TryRunTics (no arguments, returning void), else a throw
 # args      the argv strings; the strings go from 0x00100000, each ended by NUL (at
 #           most 4096 bytes in all, NULs included, else a throw), and the array of
 #           their addresses, ended by 0, to 0x00101000, below the data area
-# ticks     the number of calls of doomgeneric_Tick
+# ticks     the number of calls of doomgeneric_Tick (the ticks)
+# tics      the tics of Doom to run per tick, a non-negative integer (else a throw).
+#           With 0 the driver never touches the virtual clock mem.host.ms, which only
+#           doomgeneric's DG_SleepMs advances: TryRunTics of d_loop.c then sleeps until a
+#           tic has passed and builds it at one tick and runs it at the next, so a tic
+#           runs at every other tick. With N >= 1, at each tick, after the key events are
+#           put in mem.host.keys, the driver moves the clock forward to tic boundaries
+#           (see advance below) so that Doom runs exactly N tics and then draws once.
+#           Tics that Doom's own DG_SleepMs crossed since the previous tick (the screen
+#           wipe sleeps until each tic) have passed too, and the first call of the tick
+#           runs them as well, up to 5 tics in that call. -timedemo (singletics) ignores
+#           the clock and runs one tic per call of TryRunTics: one per tick with N <= 5,
+#           and ceil(N / 5) per tick above
 # readKeys  tick -> the whole text of the key file just before that tick, or null for
 #           no input; before a tick at which no key event is pending (mem.host.keys is
 #           empty) the text is polled with doom/keys.nix and the events are put in
 #           mem.host.keys; while events are pending, readKeys is not called and the key
 #           state is kept, so the bytes not read are decoded together at the next poll.
-#           Under the virtual clock doomgeneric takes key events only at every other
-#           tick: polling at every tick would queue the release of a single press with
-#           the press itself, and the two would cancel out in one take
+#           With tics = 0 doomgeneric takes key events only at every other tick:
+#           polling at every tick would queue the release of a single press with the
+#           press itself, and the two would cancel out in one take. With tics >= 1 Doom
+#           takes key events at each of the N tics of a tick (I_GetEvent, up to and
+#           including the first release), so the queue is empty after a tick unless more
+#           releases were queued than N, and the file is read before nearly every tick;
+#           a single press stays held for the N tics of its tick and its release, made up
+#           by the next poll, comes at the first tic of the next tick
 # onTick    { tick; frames; out; events; } -> acc -> acc, called after
 #           doomgeneric_Create (tick 0) and after each tick with the frame records drawn
 #           in it (scaffold/platform.nix), the guest output added in it and the key
 #           events put in mem.host.keys before it ([ ] at tick 0 and at a tick without a
 #           poll); init is the first acc
 #
-# After each call the host fields frames and out are emptied, so no frame record is kept
+# After each tick the host fields frames and out are emptied, so no frame record is kept
 # from one tick to the next. The state carried over (the memory, the key state, acc and
 # the last frame record) is forced at every tick, acc and the last frame record to weak
 # head normal form: an onTick that keeps values computed from the frames forces them
@@ -33,7 +51,8 @@
 #
 # mem is the final memory, last the last frame record drawn (tick 0 included) or null,
 # frameCount the number of frames drawn (tick 0 included) and acc the final acc. With
-# ticks = 0 only doomgeneric_Create runs.
+# ticks = 0 only doomgeneric_Create runs. msOfTic k is the least ms at which the tic
+# count of I_GetTime is k (see below), exposed for the tests.
 {
   linked,
   args,
@@ -41,6 +60,7 @@
   readKeys,
   onTick,
   init,
+  tics ? 0,
 }:
 let
   M = import ../lib/mem.nix;
@@ -49,9 +69,11 @@ let
   inherit (builtins)
     concatLists
     deepSeq
+    div
     elemAt
     foldl'
     genList
+    isInt
     length
     seq
     ;
@@ -146,12 +168,74 @@ let
       inherit (polled) events;
     };
 
+  # The tic count of I_GetTime of i_timer.c at ms milliseconds: ms * 35 / 1000.
+  ticAt = ms: div (ms * 35) 1000;
+
+  # The least ms at which ticAt is k: the k-th tic boundary, computed from k alone so
+  # that no rounding of 1000 / 35 ms per tic adds up.
+  msOfTic = k: div (1000 * k + 34) 35;
+
+  # The tics one call of TryRunTics of d_loop.c runs for sure when the clock has moved
+  # that many tics past the last call. doomgeneric syncs as vanilla Doom does (new_sync
+  # is 0, in the branch of D_StartNetGame without ORIGCODE) with ticdup 1. NetUpdate
+  # builds one tic per tic passed, but BuildNewTic refuses once maketic is 5 ahead of
+  # gametic, and the tics refused are lost because lasttime has already moved. From the
+  # state a call leaves (no built tic waiting, or one, as after a waiting call), k <= 5
+  # passed tics make realtics k and availabletics k, or k + 1 when k < 5, so counts is k
+  # and the k tics run with no wait. A sixth passed tic would be refused and lost.
+  ticsPerCall = 5;
+
+  # The sizes of the runs of one tick: full runs of ticsPerCall, then the rest.
+  runSizes =
+    let
+      n = div (tics + ticsPerCall - 1) ticsPerCall;
+    in
+    genList (i: if i < n - 1 then ticsPerCall else tics - ticsPerCall * (n - 1)) n;
+
+  # mem with the clock at the boundary k tics past the tic count of its clock. The count
+  # is read from the clock itself, which Doom also advances (DG_SleepMs), so the clock
+  # never moves back.
+  advance =
+    k: mem:
+    mem
+    // {
+      host = mem.host // {
+        ms = msOfTic (ticAt mem.host.ms + k);
+      };
+    };
+
+  tryRunTics =
+    linked.TryRunTics
+      or (throw "doom: run: tics = ${toString tics} needs TryRunTics in the link, to run more than ${toString ticsPerCall} tics in a tick");
+
+  checkedTics =
+    if !(isInt tics) || tics < 0 then
+      throw "doom: run: tics is not a non-negative integer: ${builtins.toJSON tics}"
+    else if tics > ticsPerCall then
+      seq tryRunTics tics
+    else
+      tics;
+
+  # The memory after one tick: with tics >= 1, every run but the last advances the clock
+  # and calls TryRunTics, and the last advances it and calls doomgeneric_Tick, which
+  # runs its tics and draws. Frame records drawn by any call stay in mem.host.frames.
+  runTick =
+    mem:
+    if tics == 0 then
+      linked.doomgeneric_Tick mem
+    else
+      let
+        last = length runSizes - 1;
+        before = foldl' (m: i: tryRunTics (advance (elemAt runSizes i) m)) mem (genList (i: i) last);
+      in
+      linked.doomgeneric_Tick (advance (elemAt runSizes last) before);
+
   step =
     st: tick:
     let
       d = deliver st tick;
     in
-    drain tick d.events (st // { inherit (d) keyState; }) (linked.doomgeneric_Tick d.mem);
+    drain tick d.events (st // { inherit (d) keyState; }) (runTick d.mem);
 
   created = linked.doomgeneric_Create (placeArgs (linked.__init M.empty)) (length args) argvAddr;
 
@@ -166,10 +250,11 @@ let
   } created;
 
   # foldl' does not force its initial value, so start (doomgeneric_Create and the onTick of
-  # tick 0) is forced here, before the key file is read for tick 1.
-  final = seq start (foldl' step start (genList (i: i + 1) ticks));
+  # tick 0) is forced here, before the key file is read for tick 1. tics is checked first.
+  final = seq checkedTics (seq start (foldl' step start (genList (i: i + 1) ticks)));
 in
 {
   inherit (final) mem last acc;
+  inherit msOfTic;
   frameCount = final.mem.host.frameCount;
 }
