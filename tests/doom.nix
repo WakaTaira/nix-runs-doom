@@ -290,11 +290,12 @@ let
     init = null;
   };
 
-  # A guest that counts tics from the clock as doomgeneric does: TryRunTics reads the tic
-  # count ms * 35 / 1000 and runs one tic per tic passed since its last call, at most 5
-  # (the rest are lost, as in BuildNewTic). Each tic takes key events until none is left
-  # or after the first release and keeps the state of each key. Create sleeps 7 ms and
-  # draws nothing; doomgeneric_Tick runs TryRunTics, sleeps nap ms and draws one frame:
+  # A guest that counts tics from the clock as doomgeneric does: getTime is I_GetTime of
+  # i_timer.c, (ms - basetime) * 35 / 1000 with basetime the first nonzero ms read, and
+  # TryRunTics runs one tic per tic passed since its last call, at most 5 (the rest are
+  # lost, as in BuildNewTic). Each tic takes key events until none is left or after the
+  # first release and keeps the state of each key. Create sleeps 1 ms at a time until the
+  # first tic has passed, as the first TryRunTics of D_DoomLoop does, and draws nothing; doomgeneric_Tick runs TryRunTics, sleeps nap ms and draws one frame:
   # screen byte 0 is the count of all tics, byte 1 the tics of this tick, then the state
   # of key a (97) after each of them. calls counts the calls of TryRunTics.
   clockGuest = Cc.linkSources {
@@ -310,20 +311,27 @@ let
           unsigned colors[256];
           unsigned char screen[64000];
           unsigned char down[256];
+          unsigned basetime;
           int seen;
           int total;
           int now;
           int calls;
           int nap = 3;
+          int getTime(void) {
+            unsigned t = DG_GetTicksMs();
+            if (basetime == 0) basetime = t;
+            return ((t - basetime) * 35) / 1000;
+          }
           void doomgeneric_Create(int argc, char **argv) {
             DG_ScreenBuffer = screen;
-            DG_SleepMs(7);
-            seen = DG_GetTicksMs() * 35 / 1000;
+            seen = getTime();
+            while (getTime() - seen <= 0) DG_SleepMs(1);
+            seen = getTime();
           }
           void TryRunTics(void) {
             int pressed;
             unsigned char key;
-            int t = DG_GetTicksMs() * 35 / 1000;
+            int t = getTime();
             int n = t - seen;
             calls++;
             seen = t;
@@ -401,8 +409,8 @@ let
     __init = m: M.storeWord (clockGuest.__init m) clockGuest.__data.symbols.nap 60;
   };
 
-  # The tic count of the formula of I_GetTime.
-  ticAt = ms: (ms * 35) / 1000;
+  # The tic count of the formula of I_GetTime, with the basetime 1 of the driver.
+  ticAt = ms: ((ms - 1) * 35) / 1000;
   inherit (runGuest [ "doom" ] [ ]) msOfTic;
   ticKs = [
     0
@@ -1084,13 +1092,13 @@ in
     ]
   )
   (t "doom run: msOfTic of tic counts" (map msOfTic ticKs) [
-    0
-    29
-    58
-    1000
-    1029
-    2000
-    28572
+    1
+    30
+    59
+    1001
+    1030
+    2001
+    28573
   ])
   (t "doom run: msOfTic is the least ms of its tic count"
     (map (k: [
@@ -1133,7 +1141,7 @@ in
     ];
     total = 0;
     calls = 3;
-    ms = 16;
+    ms = 39;
   })
   (t "doom run: tics 0 runs the tics the guest's own sleeps passed"
     (
@@ -1156,7 +1164,7 @@ in
         [ 2 ]
         [ 2 ]
       ]
-      187
+      210
     ]
   )
   (t "doom run: tics 1 runs one tic and draws once per tick" (clockSummary 1) {
@@ -1168,7 +1176,7 @@ in
     ];
     total = 3;
     calls = 3;
-    ms = 89;
+    ms = 119;
   })
   (t "doom run: tics 5 runs five tics in doomgeneric_Tick alone" (clockSummary 5) {
     perTick = [
@@ -1179,7 +1187,7 @@ in
     ];
     total = 15;
     calls = 3;
-    ms = 432;
+    ms = 462;
   })
   (t "doom run: tics 6 runs five tics in TryRunTics and one in doomgeneric_Tick" (clockSummary 6) {
     perTick = [
@@ -1190,7 +1198,7 @@ in
     ];
     total = 18;
     calls = 6;
-    ms = 518;
+    ms = 547;
   })
   (t "doom run: tics 18 runs 5, 5, 5 and 3 tics per tick" (clockSummary 18) {
     perTick = [
@@ -1201,7 +1209,7 @@ in
     ];
     total = 54;
     calls = 12;
-    ms = 1546;
+    ms = 1576;
   })
   (t "doom run: tics counts from the current clock, which the guest also advances"
     (
@@ -1224,7 +1232,7 @@ in
         [ 4 ]
         [ 4 ]
       ]
-      346
+      376
     ]
   )
   (t "doom run: tics 3 holds a single press for its tick and releases it at the next"

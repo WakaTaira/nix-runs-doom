@@ -306,7 +306,9 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   as the mirror of the scaffold, whose frame hashes it matches. With `tics = N >= 1`
   (`DOOM_TICS`, 18 for `doom.play`) the driver moves the clock at each tick, after the
   key events are queued, to the boundary N tics past the tic count of the current clock
-  (the least `ms` at which `ms * 35 / 1000`, the formula of `I_GetTime`, reaches it), so
+  (the least `ms` at which `(ms - basetime) * 35 / 1000`, the formula of `I_GetTime`, reaches it;
+  `basetime` is the first nonzero clock value Doom reads, 1 here because the clock starts at 0
+  and Doom reads it first right after a sleep of 1 ms in startup), so
   that Doom runs N tics and then draws once. One call runs at most 5 tics, because
   `BuildNewTic` refuses to build more than 5 tics ahead of the game; a larger N is split
   into calls of `TryRunTics` followed by one `doomgeneric_Tick`. The clock is read back
@@ -315,7 +317,10 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   call. A key read before a tick stays pressed for its N tics, and its release, made up
   by the next read, comes at the first tic of the next tick. `-timedemo` (`singletics`)
   ignores the clock and runs one tic per call of `TryRunTics`, so `tics` affects it only
-  above 5 (one tic per call, `ceil(N / 5)` per tick).
+  above 5 (one tic per call, `ceil(N / 5)` per tick). `GetAdjustedTime` of `d_loop.c`
+  multiplies the `int` `time_ms` by 35, so once the virtual clock passes 61,356,676 ms it
+  overflows and no more tics are made (an upstream limit; with `DOOM_TICS=18` that is about
+  119,000 ticks, over 30 hours of real time).
 
 ### Implementation-defined choices
 

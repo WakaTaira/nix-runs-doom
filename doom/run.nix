@@ -52,7 +52,7 @@
 # mem is the final memory, last the last frame record drawn (tick 0 included) or null,
 # frameCount the number of frames drawn (tick 0 included) and acc the final acc. With
 # ticks = 0 only doomgeneric_Create runs. msOfTic k is the least ms at which the tic
-# count of I_GetTime is k (see below), exposed for the tests.
+# count of I_GetTime is k, basetime included (see below), exposed for the tests.
 {
   linked,
   args,
@@ -168,12 +168,19 @@ let
       inherit (polled) events;
     };
 
-  # The tic count of I_GetTime of i_timer.c at ms milliseconds: ms * 35 / 1000.
-  ticAt = ms: div (ms * 35) 1000;
+  # The first nonzero value Doom reads from the clock, which I_GetTime of i_timer.c
+  # subtracts from every reading. The virtual clock starts at 0 and Doom reads it first
+  # right after its first sleep of 1 ms during startup, so the value is 1. If that no longer
+  # holds, only the tick after doomgeneric_Create runs one tic more or less than the
+  # others; the later ticks are right, since the driver reads the clock back.
+  basetime = 1;
+
+  # The tic count of I_GetTime of i_timer.c at ms milliseconds: (ms - basetime) * 35 / 1000.
+  ticAt = ms: div ((ms - basetime) * 35) 1000;
 
   # The least ms at which ticAt is k: the k-th tic boundary, computed from k alone so
   # that no rounding of 1000 / 35 ms per tic adds up.
-  msOfTic = k: div (1000 * k + 34) 35;
+  msOfTic = k: basetime + div (1000 * k + 34) 35;
 
   # The tics one call of TryRunTics of d_loop.c runs for sure when the clock has moved
   # that many tics past the last call. doomgeneric syncs as vanilla Doom does (new_sync
