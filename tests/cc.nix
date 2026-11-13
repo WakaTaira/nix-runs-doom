@@ -1066,6 +1066,9 @@ let
     int castSpot(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; int s = 99; while (n--) { s = (u >> 29) | (u & 7); *d++ = t[s]; u++; } return s; }
     int xToUint(unsigned char *d, unsigned char *t, int n) { int k = 99; while (n--) { k = n - 2; *d++ = t[(unsigned)k]; } return k; }
     int xSpot(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; int s = 99; while (n--) { s = u & 0x80000007u; *d++ = t[s]; u++; } return s; }
+    int xShort(unsigned char *d, unsigned char *t, int n) { unsigned u = 0x7ffe; int s = 99; while (n--) { s = (short)(u & 0x8007); *d++ = t[s]; u++; } return s; }
+    int xSChar(unsigned char *d, unsigned char *t, int n) { unsigned u = 0x7e; int s = 99; while (n--) { s = (signed char)(u & 0x87); *d++ = t[s]; u++; } return s; }
+    int xLongLong(unsigned char *d, unsigned char *t, int n) { unsigned u = 0xfffffffcu; int s = 99; while (n--) { s = (int)((long long)(u >> 1) + (long long)(u >> 1)); *d++ = t[s]; u += 2; } return s; }
     int wordAt(unsigned char *d, unsigned char *s, int n) { int r = 0; while (n--) { r = *(int *)s; *d++ = (r >> 24) + 1; } return r; }
     int words(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = (((int *)t)[i & 3] >> 24) + 1; i++; } return 0; }
     int xTmp(unsigned char *d, int n) { int t = -1; while (n--) { if (n & 1) t = n; *d++ = t; } return t; }
@@ -1224,6 +1227,9 @@ let
     "xDown"
     "xToUint"
     "xSpot"
+    "xShort"
+    "xSChar"
+    "xLongLong"
   ];
   # The return values of steps for n = 3 iterations with the step c: a, b, x, y, z, u, q
   # and m.
@@ -6708,6 +6714,43 @@ in
           10
           20
           30
+        ]
+        false
+      ]
+    ]
+  )
+  (t
+    "cc bulk: a conversion that changes the value through short, signed char or long long has no range"
+    [
+      (bulkTabled "xShort" [ buf tab 3 ] buf 3)
+      (bulkTabled "xSChar" [ buf tab 3 ] buf 3)
+      (bulkTabled "xLongLong" [ buf tab 3 ] buf 3)
+    ]
+    [
+      [
+        (-32768)
+        [
+          70
+          80
+          0
+        ]
+        false
+      ]
+      [
+        (-128)
+        [
+          70
+          80
+          0
+        ]
+        false
+      ]
+      [
+        0
+        [
+          0
+          0
+          10
         ]
         false
       ]
