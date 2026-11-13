@@ -39,8 +39,10 @@
 # noticed and the first bytes are skipped.
 let
   inherit (builtins)
+    concatMap
     elemAt
     foldl'
+    genericClosure
     genList
     length
     listToAttrs
@@ -98,51 +100,57 @@ let
 
   keyList = k: if k == null then [ ] else [ k ];
 
+  # The items of a chain of integers from start, each the next of the one before, until
+  # next gives null. genericClosure builds the list iteratively, so neither the depth of
+  # the evaluation stack nor the copying grows with its length.
+  chain =
+    start: next:
+    genericClosure {
+      startSet = [ { key = start; } ];
+      operator =
+        item:
+        let
+          j = next item.key;
+        in
+        if j == null then [ ] else [ { key = j; } ];
+    };
+
+  lastOf = l: elemAt l (length l - 1);
+
   # The index of the first byte at or after i that is not in lo..hi.
   skipRange =
     bytes: lo: hi: i:
-    if i < length bytes && elemAt bytes i >= lo && elemAt bytes i <= hi then
-      skipRange bytes lo hi (i + 1)
-    else
-      i;
+    let
+      inRange = j: j < length bytes && elemAt bytes j >= lo && elemAt bytes j <= hi;
+    in
+    if inRange i then (lastOf (chain i (j: if inRange (j + 1) then j + 1 else null))).key + 1 else i;
 
+  # decode reads the input as a chain of tokens, each found from its first byte alone:
+  # token i is { keys; next; } with next the index of the following token (n at the end),
+  # or null for a sequence cut off by the end of the input.
   decode =
     bytes:
     let
       n = length bytes;
 
-      go =
+      token =
         i:
-        if i >= n then
-          {
-            keys = [ ];
-            rest = 0;
-          }
-        else
-          let
-            b = elemAt bytes i;
-          in
-          if b == 27 then escape i else more (keyList (plainKey b)) (i + 1);
-
-      more =
-        ks: next:
         let
-          r = go next;
+          b = elemAt bytes i;
         in
-        {
-          keys = ks ++ r.keys;
-          inherit (r) rest;
-        };
+        if b == 27 then escape i else emit (keyList (plainKey b)) (i + 1);
 
-      truncated = i: {
+      emit = keys: next: { inherit keys next; };
+
+      truncated = {
         keys = [ ];
-        rest = n - i;
+        next = null;
       };
 
       escape =
         i:
         if i + 1 >= n then
-          truncated i
+          truncated
         else
           let
             c = elemAt bytes (i + 1);
@@ -152,10 +160,9 @@ let
           else if c == 79 then
             ss3 i
           else
-            more [ keyEscape ] (i + 1);
+            emit [ keyEscape ] (i + 1);
 
-      ss3 =
-        i: if i + 2 >= n then truncated i else more (keyList (arrowKey (elemAt bytes (i + 2)))) (i + 3);
+      ss3 = i: if i + 2 >= n then truncated else emit (keyList (arrowKey (elemAt bytes (i + 2)))) (i + 3);
 
       csi =
         i:
@@ -165,16 +172,34 @@ let
           f = elemAt bytes k;
         in
         if k >= n then
-          truncated i
+          truncated
         else if f >= 64 && f <= 126 then
-          more (if k == i + 2 then keyList (arrowKey f) else [ ]) (k + 1)
+          emit (if k == i + 2 then keyList (arrowKey f) else [ ]) (k + 1)
         else
-          more [ ] k;
-    in
-    go 0;
+          emit [ ] k;
 
-  decodeFinal =
-    bytes: foldl' (acc: b: acc ++ keyList (if b == 27 then keyEscape else plainKey b)) [ ] bytes;
+      # The tokens by their first byte, each computed once.
+      tokens = genList token n;
+      tokenAt = elemAt tokens;
+
+      # The start of the token after the one at i, or null after the last one.
+      nextStart =
+        i:
+        let
+          j = (tokenAt i).next;
+        in
+        if j == null || j >= n then null else j;
+
+      starts = if n == 0 then [ ] else map (item: item.key) (chain 0 nextStart);
+
+      last = lastOf starts;
+    in
+    {
+      keys = concatMap (i: (tokenAt i).keys) starts;
+      rest = if starts == [ ] || (tokenAt last).next != null then 0 else n - last;
+    };
+
+  decodeFinal = concatMap (b: keyList (if b == 27 then keyEscape else plainKey b));
 
   # Duplicates removed, first appearance first.
   unique = foldl' (acc: k: if builtins.elem k acc then acc else acc ++ [ k ]) [ ];

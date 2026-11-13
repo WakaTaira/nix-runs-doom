@@ -72,6 +72,14 @@ let
   eventsOf = texts: map (r: r.events) (pollAll texts);
   stateAfter = texts: (elemAt (pollAll texts) (length texts - 1)).state;
 
+  # Long texts, which overflowed the evaluation stack of a recursive decoder: 200,000
+  # single bytes (a, b, c, a, ...), ESC [ A repeated and cut to 200,000 bytes (66,666
+  # arrows and a cut-off ESC [), and one CSI with 100,000 parameter bytes.
+  repeat = s: n: concatStringsSep "" (genList (_: s) n);
+  longPlain = concatStringsSep "" (genList (i: elemAt [ "a" "b" "c" ] (i - (i / 3) * 3)) 200000);
+  longArrows = substring 0 200000 (repeat "${esc}[A" 66667);
+  longParams = "${esc}[${repeat "1" 100000}Ab";
+
   # An artificial screen: pixel (x, y) has palette index (x + 2y) & 255, and palette entry
   # i is { r = i; g = 2i & 255; b = 3i & 255; }.
   screen = genList (i: bitAnd (i - (i / 320) * 320 + 2 * (i / 320)) 255) 64000;
@@ -468,6 +476,49 @@ in
       held = [ 98 ];
     }
   )
+  (t "doom keys: poll of 200,000 single bytes" (K.poll initial longPlain) {
+    events = [
+      (press 97)
+      (press 98)
+      (press 99)
+    ];
+    state = {
+      consumed = 200000;
+      stalled = 0;
+      held = [
+        97
+        98
+        99
+      ];
+    };
+  })
+  (t "doom keys: poll of ESC [ A repeated over 200,000 bytes" (K.poll initial longArrows) {
+    events = [ (press 173) ];
+    state = {
+      consumed = 199998;
+      stalled = 2;
+      held = [ 173 ];
+    };
+  })
+  (t "doom keys: decode of ESC [ A repeated over 200,000 bytes"
+    (
+      let
+        d = K.decode (bytesOf longArrows);
+      in
+      [
+        (d.keys == genList (_: 173) 66666)
+        d.rest
+      ]
+    )
+    [
+      true
+      2
+    ]
+  )
+  (t "doom keys: decode of a CSI with 100,000 parameter bytes" (K.decode (bytesOf longParams)) {
+    keys = [ 98 ];
+    rest = 0;
+  })
   (t "doom render: fit 160x52"
     (R.fit {
       columns = 160;
