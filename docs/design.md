@@ -264,15 +264,19 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   (`doom/run.nix`; see the next item for which ticks). `doom/keys.nix` `poll` keeps how much of the text it has consumed and
   decodes only the new part into the key numbers of `doomkeys.h`; the events go to the end
   of the queue `keys` of the host state, from which `DG_GetKey` takes them one by one.
-- **The file is read only at a tick with no pending key event.** Under the virtual clock
-  doomgeneric takes key events only at every other tick: at one call `TryRunTics` in
+- **The file is read only at a tick with no pending key event.** When the driver leaves
+  the clock to Doom (`tics = 0`, see the last item), doomgeneric takes key events only at
+  every other tick: at one call `TryRunTics` in
   `d_loop.c` sleeps until a tic has passed, builds the new tic (taking the events) and
   returns, and at the next, with the clock not advanced, it runs that tic without taking
   events. If the file were polled at every tick, the release of a single press would be
   queued behind the press before Doom took either, the two would be taken together and
   cancel out, and a key changed at every tick would make the queue grow without end. So
   while the queue is not empty the driver does not read the file and keeps the key
-  state; the bytes that arrive meanwhile are decoded together at the next read.
+  state; the bytes that arrive meanwhile are decoded together at the next read. With
+  `tics >= 1` Doom takes events at each of the tics of a tick, so the queue is empty
+  after a tick unless more releases were queued than tics, and the file is read before
+  nearly every tick.
 - **Releases are made up.** A terminal never reports that a key was released, and holding
   a key repeats its bytes. A key is therefore pressed from the read that
   finds its bytes until the next read. `poll` gives the presses of the keys decoded now, then
@@ -292,10 +296,26 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   the file can be emptied and written anew; but if it is emptied and then written past
   its former length before the next read, the shortening goes unnoticed and the beginning
   is skipped.
-- **The clock is virtual.** Only `DG_SleepMs` advances it, so Doom never waits for a tic
-  to pass. The game runs as fast as the evaluation does, not at 35 tics per second, and
-  keys arrive per tick of evaluation, not per tic of time. Following a real clock is not
-  done.
+- **The clock is virtual, and the driver sets the pace.** The clock `ms` of the host
+  state never follows real time, so Doom never waits for a tic to pass, and keys arrive
+  per tick of evaluation, not per tic of time. With `tics = 0` (`doom.report` and
+  `doom.title` by default) the driver does not touch it and only `DG_SleepMs` advances
+  it: as described above, `TryRunTics` then sleeps through one tick and runs one tic at
+  the next, and since both ticks draw a frame (`D_Display`), which costs far more than a
+  tic in 3D, the game runs at a small fraction of its speed (about 1/55). This mode stays
+  as the mirror of the scaffold, whose frame hashes it matches. With `tics = N >= 1`
+  (`DOOM_TICS`, 18 for `doom.play`) the driver moves the clock at each tick, after the
+  key events are queued, to the boundary N tics past the tic count of the current clock
+  (the least `ms` at which `ms * 35 / 1000`, the formula of `I_GetTime`, reaches it), so
+  that Doom runs N tics and then draws once. One call runs at most 5 tics, because
+  `BuildNewTic` refuses to build more than 5 tics ahead of the game; a larger N is split
+  into calls of `TryRunTics` followed by one `doomgeneric_Tick`. The clock is read back
+  rather than counted by the driver because Doom also sleeps (the screen wipe sleeps
+  until each tic), and those tics are run at the next tick as well, up to 5 in its first
+  call. A key read before a tick stays pressed for its N tics, and its release, made up
+  by the next read, comes at the first tic of the next tick. `-timedemo` (`singletics`)
+  ignores the clock and runs one tic per call of `TryRunTics`, so `tics` affects it only
+  above 5 (one tic per call, `ceil(N / 5)` per tick).
 
 ### Implementation-defined choices
 
