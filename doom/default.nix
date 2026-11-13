@@ -21,8 +21,9 @@
 #   DOOM_WAD_HEX  path of the hex text of doom1.wad (as for scaffold/); required
 #   DOOM_ARGS     more arguments after `doom -iwad doom1.wad`, separated by white space
 #   DOOM_TICKS    calls of doomgeneric_Tick; 2 for title and report, 1000000 for play
-#   DOOM_KEYS     path of the key file, read again before every tick (doom/keys.nix
-#                 poll); no input without it
+#   DOOM_KEYS     path of the key file, read again before every tick at which no key
+#                 event is pending (doom/run.nix, doom/keys.nix poll); no input
+#                 without it
 #   COLUMNS, LINES  the terminal size; 160 and 52 without them
 let
   R = import ./render.nix;

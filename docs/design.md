@@ -255,13 +255,13 @@ These are limitations of the default host (`cc/host.nix` over `lib/libc.nix` and
 
 How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
 
-- **Input is a regular file that is read at every tick.** Nix cannot wait for input: in
+- **Input is a regular file that is read again during the run.** Nix cannot wait for input: in
   the version used (2.34.9), `builtins.readFile` of a FIFO returns `""` the first time and
   never returns the second time, and a `/proc` file reads as `""`. A regular file, on the
   other hand, is read again at every `readFile`, even with the same path, so a program
   outside the evaluation appends to a file (for example `cat > /tmp/doom.keys` in a raw
-  terminal) and the driver reads its whole text before each `doomgeneric_Tick`
-  (`doom/run.nix`). `doom/keys.nix` `poll` keeps how much of the text it has consumed and
+  terminal) and the driver reads its whole text before a `doomgeneric_Tick`
+  (`doom/run.nix`; see the next item for which ticks). `doom/keys.nix` `poll` keeps how much of the text it has consumed and
   decodes only the new part into the key numbers of `doomkeys.h`; the events go to the end
   of the queue `keys` of the host state, from which `DG_GetKey` takes them one by one.
 - **The file is read only at a tick with no pending key event.** Under the virtual clock
@@ -272,13 +272,12 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   queued behind the press before Doom took either, the two would be taken together and
   cancel out, and a key changed at every tick would make the queue grow without end. So
   while the queue is not empty the driver does not read the file and keeps the key
-  state; the bytes that arrive meanwhile are decoded together at the next read. "Every
-  tick" and "one tick" in the other items mean every such read.
+  state; the bytes that arrive meanwhile are decoded together at the next read.
 - **Releases are made up.** A terminal never reports that a key was released, and holding
-  a key repeats its bytes. A key is therefore pressed for exactly one tick: the tick that
-  follows the arrival of its bytes. `poll` gives the presses of the keys decoded now, then
-  a release for each key that was pressed at the previous tick and is not decoded now.
-  A key that stays down gets a new press at every tick and no release. Presses come before
+  a key repeats its bytes. A key is therefore pressed from the read that
+  finds its bytes until the next read. `poll` gives the presses of the keys decoded now, then
+  a release for each key that was pressed at the previous read and is not decoded now.
+  A key that stays down gets a new press at every read and no release. Presses come before
   releases because `I_GetEvent` in `i_input.c` stops at the first key release it hands
   over: a release placed first would be taken together with the press of a key that is
   held, in one call, and cancel it, and movement would not work. Repeating a press only
