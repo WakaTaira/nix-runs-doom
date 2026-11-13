@@ -304,7 +304,7 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   the next, and since both ticks draw a frame (`D_Display`), which costs far more than a
   tic in 3D, the game runs at a small fraction of its speed (about 1/55). This mode stays
   as the mirror of the scaffold, whose frame hashes it matches. With `tics = N >= 1`
-  (`DOOM_TICS`, 18 for `doom.play`) the driver moves the clock at each tick, after the
+  (`DOOM_TICS`, 5 for `doom.play`) the driver moves the clock at each tick, after the
   key events are queued, to the boundary N tics past the tic count of the current clock
   (the least `ms` at which `(ms - basetime) * 35 / 1000`, the formula of `I_GetTime`, reaches it;
   `basetime` is the first nonzero clock value Doom reads, 1 here because the clock starts at 0
@@ -319,8 +319,44 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   ignores the clock and runs one tic per call of `TryRunTics`, so `tics` affects it only
   above 5 (one tic per call, `ceil(N / 5)` per tick). `GetAdjustedTime` of `d_loop.c`
   multiplies the `int` `time_ms` by 35, so once the virtual clock passes 61,356,676 ms it
-  overflows and no more tics are made (an upstream limit; with `DOOM_TICS=18` that is about
-  119,000 ticks, over 30 hours of real time).
+  overflows and no more tics are made (an upstream limit; with `DOOM_TICS=5` that is about
+  430,000 ticks, about 20 hours of real time at 6 ticks a second).
+
+### The view window fits the terminal
+
+How `doom.play` draws a frame (`doom/picture.nix`, `doom/run.nix` `view`, `DOOM_VIEW`).
+
+- **Why it is faster.** A full-screen picture of 160 columns averages the 320 columns of
+  Doom's screen two by two, so half of what Doom draws in 3D is thrown away. Doom draws
+  walls, floors and sprites column by column, and its cost in 3D grows with the number
+  of columns of the view window, not with the number of pixels (measured on E1M1: about
+  0.9 ms per column). So `doom.play` sets Doom's screen size (`screenblocks`) to the
+  least one whose window, `32 * blocks` pixels wide, is at least as wide as the picture
+  (5, a 160x80 window, at 160 columns), and draws that window 1:1, one pixel per half
+  cell, with the status bar under it, averaged as before. Measured on E1M1 at 160
+  columns with 5 tics per tick, a tick takes about 0.17 s instead of 0.34 s.
+- **How it is set.** After `doomgeneric_Create` the driver writes `screenblocks` (and the
+  menu's `screenSize`) and calls `R_SetViewSize`, as the `-` and `=` keys do; the next
+  `D_Display` resizes the window. Nothing in Doom sets it again afterwards, and the
+  player can still change it with `-` and `=`: the picture reads the window's position
+  and size from Doom's variables at every frame.
+- **When the whole screen comes back.** The window alone is drawn only while the 3D view
+  is on: a level is running (`gamestate` is `GS_LEVEL` and `gametic` is not 0), the
+  automap is off (`automapactive`) and no menu is open (`menuactive`, which also covers
+  the help screens and the questions of the menus). The title, the demos' pages, the
+  intermissions, the finale, the automap and the menus are drawn on the whole screen, as
+  is everything with `DOOM_VIEW=full` (the default of `doom.title` and `doom.report`,
+  which stay the mirror of the scaffold). The pause picture lies inside the window.
+- **The messages of the heads-up display are not shown** with a window smaller than
+  screen size 10: Doom draws them at the top left of the screen, outside the window, and
+  whether one is up is `message_on`, a `static` variable of `hu_stuff.c`, which is not
+  among the variables with external linkage (`__data.symbols`) that the picture reads.
+- **The screen is not copied.** `I_FinishUpdate` of doomgeneric copies the screen Doom
+  draws on, `I_VideoBuffer`, to `DG_ScreenBuffer` row by row. The driver sets the pointer
+  `DG_ScreenBuffer` to `I_VideoBuffer` after `doomgeneric_Create` (only when `fb_scaling`
+  is 1, the case of a 1:1 copy), so every copy has the same source and destination and
+  returns at once (`copyMem` of `lib/libc.nix`), and the picture reads the pixels
+  straight from the memory of the frame, only the rows and columns it shows.
 
 ### Implementation-defined choices
 

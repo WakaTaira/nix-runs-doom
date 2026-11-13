@@ -26,7 +26,7 @@
 #
 # Messages of the heads-up display (the line at the top left, y 0 .. 7, which lies
 # outside a window smaller than screen size 10) are not drawn: whether one is shown is
-# message_on of hu_stuff.c, which is static and so not among the symbols.
+# message_on of hu_stuff.c, which is static and so not in __data.symbols.
 let
   R = import ./render.nix;
   M = import ../lib/mem.nix;
