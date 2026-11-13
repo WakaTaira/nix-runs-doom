@@ -18,10 +18,11 @@
 #           Under the virtual clock doomgeneric takes key events only at every other
 #           tick: polling at every tick would queue the release of a single press with
 #           the press itself, and the two would cancel out in one take
-# onTick    { tick; frames; out; } -> acc -> acc, called after doomgeneric_Create
-#           (tick 0) and after each tick with the frame records drawn in it
-#           (scaffold/platform.nix) and the guest output added in it; init is the first
-#           acc
+# onTick    { tick; frames; out; events; } -> acc -> acc, called after
+#           doomgeneric_Create (tick 0) and after each tick with the frame records drawn
+#           in it (scaffold/platform.nix), the guest output added in it and the key
+#           events put in mem.host.keys before it ([ ] at tick 0 and at a tick without a
+#           poll); init is the first acc
 #
 # After each call the host fields frames and out are emptied, so no frame record is kept
 # from one tick to the next. The state carried over (the memory, the key state, acc and
@@ -99,7 +100,7 @@ let
   # The state after handing the frames and output in the host state of mem to onTick and
   # emptying them; st holds the key state, acc and the last frame record before.
   drain =
-    tick: st: mem:
+    tick: events: st: mem:
     let
       host = mem.host;
       inherit (host) frames;
@@ -114,7 +115,7 @@ let
       inherit (st) keyState;
       last = if frames == [ ] then st.last else elemAt frames (length frames - 1);
       acc = onTick {
-        inherit tick frames;
+        inherit tick frames events;
         inherit (host) out;
       } st.acc;
     };
@@ -142,6 +143,7 @@ let
         };
       };
       keyState = polled.state;
+      inherit (polled) events;
     };
 
   step =
@@ -149,11 +151,11 @@ let
     let
       d = deliver st tick;
     in
-    drain tick (st // { inherit (d) keyState; }) (linked.doomgeneric_Tick d.mem);
+    drain tick d.events (st // { inherit (d) keyState; }) (linked.doomgeneric_Tick d.mem);
 
   created = linked.doomgeneric_Create (placeArgs (linked.__init M.empty)) (length args) argvAddr;
 
-  start = drain 0 {
+  start = drain 0 [ ] {
     keyState = {
       consumed = 0;
       stalled = 0;

@@ -13,7 +13,9 @@
 #          hash is the sha256 of the screen bytes followed by the palette (r, g, b per
 #          entry), each byte as two hex digits, as in scaffold.boot.report
 # play     streams, at each tick, the guest output added in it (if any) and the last
-#          frame drawn in it (if any) with builtins.trace; the value is
+#          frame drawn in it (if any) with builtins.trace, the frame under a status
+#          line (the tick and the key events sent at it, + a press, - a release);
+#          the value is
 #          "ticks: <n>, frames: <m>\n"
 #
 # Environment (read with builtins.getEnv):
@@ -166,12 +168,34 @@ let
     in
     builtins.deepSeq new (acc ++ new);
 
-  # Traces the output, then the last frame, of one call.
+  keyNames = {
+    "173" = "Up";
+    "175" = "Down";
+    "174" = "Right";
+    "172" = "Left";
+    "27" = "Esc";
+    "13" = "Enter";
+    "127" = "Backspace";
+    "9" = "Tab";
+    "162" = "Use";
+    "163" = "Fire";
+  };
+
+  # The name of a doomkeys.h number: a word for the special keys, else the character.
+  keyName = k: keyNames.${toString k} or ((import ../lib/ascii.nix).chr k);
+
+  eventName = e: (if e.pressed == 1 then "+" else "-") + keyName e.key;
+
+  # The status line of a tick: its number and the key events sent at it.
+  status = tick: events: concatStringsSep " " ([ "tick ${toString tick}" ] ++ map eventName events);
+
+  # Traces the output, then the last frame under its status line, of one call.
   stream =
     {
+      tick,
       frames,
       out,
-      ...
+      events,
     }:
     acc:
     let
@@ -179,7 +203,7 @@ let
         if frames == [ ] then
           acc
         else
-          trace ("\n" + traced (elemAt frames (builtins.length frames - 1))) acc;
+          trace (status tick events + "\n" + traced (elemAt frames (builtins.length frames - 1))) acc;
     in
     if out == "" then withFrame else trace out withFrame;
 
