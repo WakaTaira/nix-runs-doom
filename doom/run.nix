@@ -11,8 +11,13 @@
 #           their addresses, ended by 0, to 0x00101000, below the data area
 # ticks     the number of calls of doomgeneric_Tick
 # readKeys  tick -> the whole text of the key file just before that tick, or null for
-#           no input; the text is polled with doom/keys.nix and the events are put at
-#           the end of the pending key events (mem.host.keys) before the tick
+#           no input; before a tick at which no key event is pending (mem.host.keys is
+#           empty) the text is polled with doom/keys.nix and the events are put in
+#           mem.host.keys; while events are pending, readKeys is not called and the key
+#           state is kept, so the bytes not read are decoded together at the next poll.
+#           Under the virtual clock doomgeneric takes key events only at every other
+#           tick: polling at every tick would queue the release of a single press with
+#           the press itself, and the two would cancel out in one take
 # onTick    { tick; frames; out; } -> acc -> acc, called after doomgeneric_Create
 #           (tick 0) and after each tick with the frame records drawn in it
 #           (scaffold/platform.nix) and the guest output added in it; init is the first
@@ -114,12 +119,12 @@ let
       } st.acc;
     };
 
-  # The memory and key state after polling the key file before tick; the text is read
-  # before either is used.
+  # The memory and key state after polling the key file before tick, when no key event is
+  # pending (see the header); the text is read before either is used.
   deliver =
     st: tick:
     let
-      text = readKeys tick;
+      text = if st.mem.host.keys == [ ] then readKeys tick else null;
       polled =
         if text == null then
           {

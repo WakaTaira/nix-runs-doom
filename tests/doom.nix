@@ -206,6 +206,67 @@ let
     "ababab"
   ];
   pendingAfter = n: length (runGuest [ "doom" ] (genList (elemAt heldTexts) n)).mem.host.keys;
+
+  # A guest that takes key events only at odd ticks (1, 3, ...), as doomgeneric does under
+  # the virtual clock, until none is left or after the first release, and keeps the state
+  # of each key as gamekeydown does. Each tick draws one frame: screen byte 0 is the state
+  # of key a (97), byte 1 the count of events taken, then pressed and key of each.
+  oddGuest = Cc.linkSources {
+    units = [
+      {
+        name = "odd";
+        src = ''
+          int DG_GetKey(int *pressed, unsigned char *key);
+          void DG_DrawFrame(void);
+          unsigned char *DG_ScreenBuffer;
+          unsigned colors[256];
+          unsigned char screen[64000];
+          unsigned char down[256];
+          int ticks;
+          void doomgeneric_Create(int argc, char **argv) { DG_ScreenBuffer = screen; }
+          void doomgeneric_Tick(void) {
+            int pressed;
+            unsigned char key;
+            int n = 0;
+            ticks++;
+            if (ticks % 2 == 1) {
+              while (DG_GetKey(&pressed, &key)) {
+                down[key] = pressed;
+                screen[2 + 2 * n] = pressed;
+                screen[3 + 2 * n] = key;
+                n++;
+                if (!pressed) break;
+              }
+            }
+            screen[0] = down[97];
+            screen[1] = n;
+            DG_DrawFrame();
+          }
+        '';
+      }
+    ];
+  };
+
+  # The driver over oddGuest with the key texts of ticks 1, 2, ...; acc lists per tick
+  # the state of key a, the count of events taken and the events.
+  runOdd =
+    texts:
+    import ../doom/run.nix {
+      linked = oddGuest;
+      args = [ "doom" ];
+      ticks = length texts;
+      readKeys = tick: elemAt texts (tick - 1);
+      onTick =
+        info: acc: acc ++ map (f: genList (elemAt f.screen) (2 + 2 * elemAt f.screen 1)) info.frames;
+      init = [ ];
+    };
+
+  # The texts of a key changed at every tick: a, ab, aba, abab, ...
+  alternating = genList (
+    i: concatStringsSep "" (genList (j: if bitAnd j 1 == 0 then "a" else "b") (i + 1))
+  ) 42;
+  pendingOdd = n: length (runOdd (genList (elemAt alternating) n)).mem.host.keys;
+
   throws = x: !(builtins.tryEval (builtins.deepSeq x x)).success;
 in
 [
@@ -655,6 +716,121 @@ in
       1
       0
       0
+    ]
+  )
+  (t "doom run: a single press before an even tick is seen, then released"
+    (runOdd [
+      ""
+      "a"
+      "a"
+      "a"
+      "a"
+    ]).acc
+    [
+      [
+        0
+        0
+      ]
+      [
+        0
+        0
+      ]
+      [
+        1
+        1
+        1
+        97
+      ]
+      [
+        1
+        0
+      ]
+      [
+        0
+        1
+        0
+        97
+      ]
+    ]
+  )
+  (t "doom run: a single press before an odd tick is seen, then released"
+    (runOdd [
+      "a"
+      "a"
+      "a"
+      "a"
+      "a"
+    ]).acc
+    [
+      [
+        1
+        1
+        1
+        97
+      ]
+      [
+        1
+        0
+      ]
+      [
+        0
+        1
+        0
+        97
+      ]
+      [
+        0
+        0
+      ]
+      [
+        0
+        0
+      ]
+    ]
+  )
+  (t "doom run: pending key events stay at most 2 when the key changes at every tick" (genList (
+    i: pendingOdd (i + 1)
+  ) 42) (genList (i: if bitAnd i 1 == 0 then 0 else 2) 42))
+  (t "doom run: a held key gives presses only at every take"
+    (runOdd [
+      "a"
+      "aa"
+      "aaa"
+      "aaaa"
+      "aaaaa"
+      "aaaaaa"
+    ]).acc
+    [
+      [
+        1
+        1
+        1
+        97
+      ]
+      [
+        1
+        0
+      ]
+      [
+        1
+        1
+        1
+        97
+      ]
+      [
+        1
+        0
+      ]
+      [
+        1
+        1
+        1
+        97
+      ]
+      [
+        1
+        0
+      ]
     ]
   )
   (t "doom run: argument strings up to 4096 bytes"

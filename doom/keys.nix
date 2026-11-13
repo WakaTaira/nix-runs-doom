@@ -25,8 +25,9 @@
 # decodeFinal reads an unfinished sequence as complete: ESC is KEY_ESCAPE and the other
 # bytes follow the rules above, except for ESC.
 #
-# poll takes the whole text of the key file. A key is held for exactly the one tick after
-# the bytes that mean it arrive, because a terminal never reports a release. events are
+# poll takes the whole text of the key file. A key is held from the poll that decodes the
+# bytes that mean it until the next poll, because a terminal never reports a release (the
+# driver, doom/run.nix, decides when to poll). events are
 # the presses of the keys decoded now (duplicates removed, first appearance first), then
 # the releases of the keys held before and not decoded now. A key held on purpose
 # (repeated bytes) gets a press again each time and no release: i_input.c hands out one
