@@ -40,13 +40,14 @@ let
   restOf = s: (K.decode (bytesOf s)).rest;
 
   # The events and states of successive polls over the given texts.
-  pollAll =
-    texts:
+  pollAll = pollAllWith K.poll initial;
+  pollAllWith =
+    poll: start: texts:
     (foldl'
       (
         acc: text:
         let
-          r = K.poll acc.state text;
+          r = poll acc.state text;
         in
         {
           state = r.state;
@@ -54,7 +55,7 @@ let
         }
       )
       {
-        state = initial;
+        state = start;
         out = [ ];
       }
       texts
@@ -75,6 +76,23 @@ let
   eventsOf = texts: map (r: r.events) (pollAll texts);
   stateAfter = texts: (elemAt (pollAll texts) (length texts - 1)).state;
 
+  # The kitty keyboard protocol: CSI sequences, decoded events, and polls of pollKitty.
+  csi = s: "${esc}[${s}";
+  kittyOf = s: (K.decodeKitty (bytesOf s)).keys;
+  kittyRestOf = s: (K.decodeKitty (bytesOf s)).rest;
+  ev = key: type: { inherit key type; };
+  kittyInitial = {
+    consumed = 0;
+    held = [ ];
+    carried = [ ];
+  };
+  kittyEventsOf = texts: map (r: r.events) (pollAllWith K.pollKitty kittyInitial texts);
+  kittyStateAfter =
+    texts: (elemAt (pollAllWith K.pollKitty kittyInitial texts) (length texts - 1)).state;
+  # The texts of successive polls of a file to which each of parts is appended in turn.
+  growing = parts: genList (i: concatStringsSep "" (genList (elemAt parts) (i + 1))) (length parts);
+  ctrlTap = csi "57442;5u" + csi "57442;1:3u";
+
   # Long texts, which overflowed the evaluation stack of a recursive decoder: 200,000
   # single bytes (a, b, c, a, ...), ESC [ A repeated and cut to 200,000 bytes (66,666
   # arrows and a cut-off ESC [), and one CSI with 100,000 parameter bytes.
@@ -82,6 +100,10 @@ let
   longPlain = concatStringsSep "" (genList (i: elemAt [ "a" "b" "c" ] (i - (i / 3) * 3)) 200000);
   longArrows = substring 0 200000 (repeat "${esc}[A" 66667);
   longParams = "${esc}[${repeat "1" 100000}Ab";
+  # A press of a, 11,111 repeats and a release (100,013 bytes), and a CSI u with 100,000
+  # digits in its code.
+  longRepeats = csi "97u" + repeat (csi "97;1:2u") 11111 + csi "97;1:3u";
+  longCode = csi "${repeat "1" 100000}u" + csi "98u";
 
   # An artificial screen: pixel (x, y) has palette index (x + 2y) & 255, and palette entry
   # i is { r = i; g = 2i & 255; b = 3i & 255; }.
@@ -921,6 +943,384 @@ in
   (t "doom keys: decode of a CSI with 100,000 parameter bytes" (K.decode (bytesOf longParams)) {
     keys = [ 98 ];
     rest = 0;
+  })
+  (t "doom kitty: characters, space and x"
+    (kittyOf (csi "97u" + csi "120u" + csi "32u" + csi "49u" + csi "126u"))
+    [
+      (ev 97 1)
+      (ev 163 1)
+      (ev 162 1)
+      (ev 49 1)
+      (ev 126 1)
+    ]
+  )
+  (t "doom kitty: arrows, short and with mods and events"
+    (kittyOf (csi "A" + csi "1;1B" + csi "1;1:3C" + csi "1;5:2D"))
+    [
+      (ev 173 1)
+      (ev 175 1)
+      (ev 174 3)
+      (ev 172 2)
+    ]
+  )
+  (t "doom kitty: Enter, Esc, Tab and Backspace"
+    (kittyOf (csi "13u" + csi "27u" + csi "9u" + csi "127u"))
+    [
+      (ev 13 1)
+      (ev 27 1)
+      (ev 9 1)
+      (ev 127 1)
+    ]
+  )
+  (t "doom kitty: modifier keys alone are run, fire and strafe"
+    (kittyOf (
+      csi "57441;2u"
+      + csi "57447;2u"
+      + csi "57442;5u"
+      + csi "57448;5u"
+      + csi "57443;3u"
+      + csi "57449;3u"
+      + csi "57442;1:3u"
+    ))
+    [
+      (ev 182 1)
+      (ev 182 1)
+      (ev 163 1)
+      (ev 163 1)
+      (ev 184 1)
+      (ev 184 1)
+      (ev 163 3)
+    ]
+  )
+  (t "doom kitty: a character with modifiers is the character"
+    (kittyOf (csi "97;2u" + csi "99;5u" + csi "97;6:3u" + csi "97:65;2u" + csi "97;2;65u"))
+    [
+      (ev 97 1)
+      (ev 99 1)
+      (ev 97 3)
+      (ev 97 1)
+      (ev 97 1)
+    ]
+  )
+  (t "doom kitty: press, repeat and release" (kittyOf (csi "97;1:1u" + csi "97;1:2u" + csi "97;1:3u"))
+    [
+      (ev 97 1)
+      (ev 97 2)
+      (ev 97 3)
+    ]
+  )
+  (t "doom kitty: an omitted event or mods field is a press"
+    (kittyOf (csi "97u" + csi "97;1u" + csi "97;u" + csi "97;:3u" + csi "1A"))
+    [
+      (ev 97 1)
+      (ev 97 1)
+      (ev 97 1)
+      (ev 97 3)
+      (ev 173 1)
+    ]
+  )
+  (t "doom kitty: caps lock and num lock in mods change nothing"
+    (kittyOf (csi "97;65u" + csi "99;69u" + csi "1;129:3A" + csi "57442;197:3u"))
+    [
+      (ev 97 1)
+      (ev 99 1)
+      (ev 173 3)
+      (ev 163 3)
+    ]
+  )
+  (t "doom kitty: keys and sequences that are not supported are dropped" (map kittyOf [
+    (csi "57358u" + csi "98u")
+    (csi "233u" + csi "98u")
+    (csi "0u" + csi "98u")
+    (csi "3~" + csi "98u")
+    (csi "1;1H" + csi "98u")
+    (csi "2A" + csi "98u")
+    (csi "97;1:4u" + csi "98u")
+    (csi "?11u" + csi "98u")
+    (csi ">1u" + csi "98u")
+    (csi "?62;22c" + csi "98u")
+    (csi "97 u" + csi "98u")
+  ]) (genList (_: [ (ev 98 1) ]) 11))
+  (t "doom kitty: broken sequences resume at the byte that ends them"
+    [
+      (kittyOf (csi "97;" + csi "98u"))
+      (kittyOf "${esc}a")
+      (kittyOf "${esc}OA${esc}${esc}[98u")
+      (kittyOf (csi "97\n"))
+    ]
+    [
+      [ (ev 98 1) ]
+      [
+        (ev 97 1)
+        (ev 97 3)
+      ]
+      [ (ev 98 1) ]
+      [
+        (ev 13 1)
+        (ev 13 3)
+      ]
+    ]
+  )
+  (t "doom kitty: a byte outside a sequence is pressed and released at once" (kittyOf "aX\r${ctl 1}é")
+    [
+      (ev 97 1)
+      (ev 97 3)
+      (ev 163 1)
+      (ev 163 3)
+      (ev 13 1)
+      (ev 13 3)
+    ]
+  )
+  (t "doom kitty: rest of a sequence cut off at the end"
+    [
+      (kittyRestOf (csi "97;1:3"))
+      (kittyRestOf "a${esc}")
+      (kittyRestOf (csi "A" + "${esc}["))
+      (kittyRestOf (csi "A" + "${esc}O"))
+      (kittyRestOf (csi "A"))
+      (kittyOf (csi "97u" + csi "97;1:3"))
+    ]
+    [
+      8
+      1
+      2
+      2
+      0
+      [ (ev 97 1) ]
+    ]
+  )
+  (t "doom kitty: a code of 100,000 digits is dropped" (K.decodeKitty (bytesOf longCode)) {
+    keys = [ (ev 98 1) ];
+    rest = 0;
+  })
+  (t "doom kitty: decode of ESC [ A repeated over 200,000 bytes"
+    (
+      let
+        d = K.decodeKitty (bytesOf longArrows);
+      in
+      [
+        (d.keys == genList (_: ev 173 1) 66666)
+        d.rest
+      ]
+    )
+    [
+      true
+      2
+    ]
+  )
+  (t "doom kitty: poll keeps a key pressed with no more bytes"
+    (kittyEventsOf [
+      (csi "A")
+      (csi "A")
+      (csi "A")
+    ])
+    [
+      [ (press 173) ]
+      [ ]
+      [ ]
+    ]
+  )
+  (t "doom kitty: poll keeps up pressed while right is pressed and released"
+    (kittyEventsOf (growing [
+      (csi "A")
+      (csi "C")
+      (csi "1;1:3C")
+      ""
+    ]))
+    [
+      [ (press 173) ]
+      [ (press 174) ]
+      [ (release 174) ]
+      [ ]
+    ]
+  )
+  (t "doom kitty: poll state with up held after right was released"
+    (kittyStateAfter (growing [
+      (csi "A")
+      (csi "C")
+      (csi "1;1:3C")
+    ]))
+    {
+      consumed = 14;
+      held = [ 173 ];
+      carried = [ ];
+    }
+  )
+  (t "doom kitty: poll puts off the release of a press and release in one read"
+    (kittyEventsOf [
+      ctrlTap
+      ctrlTap
+      ctrlTap
+    ])
+    [
+      [ (press 163) ]
+      [ (release 163) ]
+      [ ]
+    ]
+  )
+  (t "doom kitty: poll state after a press and release in one read" (kittyStateAfter [ ctrlTap ]) {
+    consumed = 22;
+    held = [ 163 ];
+    carried = [ 163 ];
+  })
+  (t "doom kitty: poll releases a put-off key before the events of the next read"
+    (kittyEventsOf (growing [
+      (csi "97u" + csi "97;1:3u")
+      (csi "97u")
+    ]))
+    [
+      [ (press 97) ]
+      [
+        (release 97)
+        (press 97)
+      ]
+    ]
+  )
+  (t "doom kitty: poll of a held key released and pressed again in one read"
+    (kittyEventsOf (growing [
+      (csi "97u")
+      (csi "97;1:3u" + csi "97u")
+      (csi "97;1:3u")
+    ]))
+    [
+      [ (press 97) ]
+      [
+        (release 97)
+        (press 97)
+      ]
+      [ (release 97) ]
+    ]
+  )
+  (t "doom kitty: poll ignores repeats of a held key"
+    (kittyEventsOf (growing [
+      (csi "97u")
+      (csi "97;1:2u" + csi "97;1:2u")
+      (csi "97;1:3u")
+    ]))
+    [
+      [ (press 97) ]
+      [ ]
+      [ (release 97) ]
+    ]
+  )
+  (t "doom kitty: poll reads a repeat of a key not held as a press, and drops a release of it"
+    (kittyEventsOf (growing [
+      (csi "97;1:2u")
+      (csi "13;1:3u")
+    ]))
+    [
+      [ (press 97) ]
+      [ ]
+    ]
+  )
+  (t "doom kitty: poll takes both shift keys as one key"
+    (kittyEventsOf (growing [
+      (csi "57441;2u" + csi "57447;2u")
+      (csi "57441;2:3u")
+      (csi "57447;1:3u")
+    ]))
+    [
+      [ (press 182) ]
+      [ (release 182) ]
+      [ ]
+    ]
+  )
+  (t "doom kitty: poll holds a byte outside a sequence for one read"
+    (kittyEventsOf [
+      "a"
+      "a"
+    ])
+    [
+      [ (press 97) ]
+      [ (release 97) ]
+    ]
+  )
+  (t "doom kitty: poll completes a sequence cut off at the end at the next read"
+    (kittyEventsOf [
+      (csi "A" + csi "1;1:")
+      (csi "A" + csi "1;1:3A")
+    ])
+    [
+      [ (press 173) ]
+      [ (release 173) ]
+    ]
+  )
+  (t "doom kitty: poll state of a sequence cut off at the end"
+    (kittyStateAfter [ (csi "A" + csi "1;1:") ])
+    {
+      consumed = 3;
+      held = [ 173 ];
+      carried = [ ];
+    }
+  )
+  (t "doom kitty: poll starts over when the file got shorter"
+    [
+      (kittyEventsOf [
+        (csi "A" + csi "97u")
+        (csi "B")
+      ])
+      (kittyStateAfter [
+        (csi "A" + csi "97u")
+        (csi "B")
+      ])
+    ]
+    [
+      [
+        [
+          (press 173)
+          (press 97)
+        ]
+        [ (press 175) ]
+      ]
+      {
+        consumed = 3;
+        held = [
+          173
+          97
+          175
+        ];
+        carried = [ ];
+      }
+    ]
+  )
+  (t "doom kitty: poll of a press, 11,111 repeats and a release"
+    (K.pollKitty kittyInitial longRepeats)
+    {
+      events = [ (press 97) ];
+      state = {
+        consumed = 100013;
+        held = [ 97 ];
+        carried = [ 97 ];
+      };
+    }
+  )
+  (t "doom kitty: poll of 200,000 single bytes" (K.pollKitty kittyInitial longPlain) {
+    events = [
+      (press 97)
+      (press 98)
+      (press 99)
+    ];
+    state = {
+      consumed = 200000;
+      held = [
+        97
+        98
+        99
+      ];
+      carried = [
+        99
+        97
+        98
+      ];
+    };
+  })
+  (t "doom kitty: poll of ESC [ A repeated over 200,000 bytes" (K.pollKitty kittyInitial longArrows) {
+    events = [ (press 173) ];
+    state = {
+      consumed = 199998;
+      held = [ 173 ];
+      carried = [ ];
+    };
   })
   (t "doom render: fit 160x52"
     (R.fit {
