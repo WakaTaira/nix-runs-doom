@@ -95,6 +95,7 @@ let
     cols = 80;
     rows = 25;
   };
+  sha = size: builtins.hashString "sha256" (R.render ({ inherit screen palette; } // size));
   lineCount = s: (length (split "\n" s) - 1) / 2;
   firstCell = "${esc}[38;2;4;9;13m${esc}[48;2;12;25;37m▀";
 
@@ -599,6 +600,26 @@ in
       rows = 50;
     } == Scaffold { inherit screen palette; }
   ) true)
+  (t "doom render: 80x25 output hash" (sha {
+    cols = 80;
+    rows = 25;
+  }) "3fe5c87c909f0d2ce6882a845b15e9f2bd560d927eada702b2effe8a9de0d321")
+  (t "doom render: 320x100 (1x1 boxes) output hash" (sha {
+    cols = 320;
+    rows = 100;
+  }) "9aeaffc31d72dc7390cfa9042a771f12accc1e9a182931f1ca4ec5846245133e")
+  (t "doom render: 1x1 (boxes beyond 4096 pixels) output hash" (sha {
+    cols = 1;
+    rows = 1;
+  }) "b4404ad4868558ed9a6d6777d65a4a535e92ac4ff4f71b281068e66960e97438")
+  (t "doom render: 7x1 (boxes beyond 4096 pixels) output hash" (sha {
+    cols = 7;
+    rows = 1;
+  }) "1bc77daa4ca65d1be78010be4dda884027c47643dafbccbd415a45d959114bd5")
+  (t "doom render: 8x1 (boxes within 4096 pixels) output hash" (sha {
+    cols = 8;
+    rows = 1;
+  }) "8a24226574bad88d04089c1158329f7330a82daf36da548bcd2a5b3501cfcb98")
   (t "doom render: 80x25 has 25 lines" (lineCount image80) 25)
   (t "doom render: 80x25 first cell" (substring 0 (stringLength firstCell) image80) firstCell)
   (t "doom render: row ends with a reset and a newline" (substring (
