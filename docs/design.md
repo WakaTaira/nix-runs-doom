@@ -243,9 +243,11 @@ These are limitations of the default host (`cc/host.nix` over `lib/libc.nix` and
 `scaffold/platform.nix`), shared with the scaffold, rather than choices made for speed.
 
 - Output to `stdout` and `stderr` is appended to one string, `mem.host.out`, in call
-  order; it is not printed while the evaluation runs, and each write copies the string, so
-  a large amount of output costs quadratic time.
-- `DG_GetKey` always returns 0: there is no key input yet.
+  order; the host itself does not print it (`doom.play` streams what each tick added with
+  `builtins.trace`), and each write copies the string, so a large amount of output costs
+  quadratic time.
+- `DG_GetKey` takes the key events from the front of the queue `mem.host.keys`, which the
+  driver fills (see below), and returns 0 when it is empty.
 - `DG_DrawFrame` records `instrs = 0` in its frame records: compiled code counts no
   instructions (`count` of the host state stays 0).
 
@@ -262,6 +264,16 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   (`doom/run.nix`). `doom/keys.nix` `poll` keeps how much of the text it has consumed and
   decodes only the new part into the key numbers of `doomkeys.h`; the events go to the end
   of the queue `keys` of the host state, from which `DG_GetKey` takes them one by one.
+- **The file is read only at a tick with no pending key event.** Under the virtual clock
+  doomgeneric takes key events only at every other tick: at one call `TryRunTics` in
+  `d_loop.c` sleeps until a tic has passed, builds the new tic (taking the events) and
+  returns, and at the next, with the clock not advanced, it runs that tic without taking
+  events. If the file were polled at every tick, the release of a single press would be
+  queued behind the press before Doom took either, the two would be taken together and
+  cancel out, and a key changed at every tick would make the queue grow without end. So
+  while the queue is not empty the driver does not read the file and keeps the key
+  state; the bytes that arrive meanwhile are decoded together at the next read. "Every
+  tick" and "one tick" in the other items mean every such read.
 - **Releases are made up.** A terminal never reports that a key was released, and holding
   a key repeats its bytes. A key is therefore pressed for exactly one tick: the tick that
   follows the arrival of its bytes. `poll` gives the presses of the keys decoded now, then
