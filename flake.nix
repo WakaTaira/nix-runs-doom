@@ -1,17 +1,22 @@
 {
-  description = "An RV32I emulator written in pure Nix, aiming to run Doom in a terminal";
+  description = "Doom in a terminal by nix eval alone: a C compiler and an RV32IM emulator written in pure Nix";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  # Upstream Doom source (an external input, like a ROM). Used only by the
-  # doom-scaffold build; the emulator never reads it.
+  # Upstream Doom source (an external input, like a ROM). The evaluation takes its path
+  # from DOOM_SRC (see doom/default.nix); the launcher and the doom-scaffold build pass it.
   inputs.doomgeneric = {
     url = "github:ozkl/doomgeneric";
     flake = false;
   };
 
   outputs =
-    { nixpkgs, doomgeneric, ... }:
+    {
+      self,
+      nixpkgs,
+      doomgeneric,
+      ...
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -43,7 +48,26 @@
         # The clang-built doomgeneric scaffold; evaluation reads its doom.hex from
         # `nix build .#doom-scaffold -o result-doom`.
         doom-scaffold = import ./toolchain/doom.nix { inherit pkgs doomgeneric; };
+
+        # The launcher of `nix run .#play` (the app below).
+        play = import ./toolchain/play.nix { inherit pkgs doomgeneric self; };
       });
+
+      # The launcher of `nix run .#play -- /path/to/doom1.wad` (see toolchain/play.nix): it
+      # only connects the terminal to `nix eval -f . doom.play`.
+      apps = forAllSystems (
+        pkgs:
+        let
+          play = {
+            type = "app";
+            program = pkgs.lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.play;
+          };
+        in
+        {
+          inherit play;
+          default = play;
+        }
+      );
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
     };
