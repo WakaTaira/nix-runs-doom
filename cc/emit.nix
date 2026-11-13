@@ -185,6 +185,22 @@
 #     and the locals that cc/check.nix keeps in memory ("Locals in memory"), whose reads
 #     and stores are the same "deref" and "assign" nodes; the elements of a split array are
 #     plain variables.
+#   - Words at constant addresses: a load or store whose address is emitted as a decimal
+#     literal a, a multiple of 4 below 2^32, goes to the memory trie of lib/mem.nix by
+#     literal keys instead of through M.loadWord and M.storeWord, which compute the keys
+#     from the address at run time. The keys are bits 20..31, 14..19, 8..13 and 2..7 of a
+#     in decimal (k0 .. k3). A load of a word (an integer or pointer type; float and
+#     double still go through R.loadF32 and R.loadF64) is `<mem>."k0"."k1"."k2"."k3" or 0`,
+#     0 when any node on the path is missing, as M.loadWord reads it. A store that would
+#     be `M.storeWord <mem> a <v>` is `sw-<a> <mem> <v>`, with `sw-<a>` bound once in the
+#     unit's let, for each a that the source of the functions of the unit calls it with
+#     (found by searching it for `sw-<digits>`), to a function `m: v:` that copies the
+#     four nodes on the path with the literal keys and forces v and the new nodes, as
+#     M.storeWord does at an aligned address. Byte and half-word accesses and other
+#     addresses are emitted as before. The cached reads and the bulk forms are decided on
+#     the typed tree, not on the emitted text, so only their loads change: a cached read
+#     loads its word this way too. The memory has no other keys that are decimal numbers
+#     (the host state is under `host`), so the paths meet nothing else.
 #   - Unsigned and pointer arithmetic and conversions wrap modulo 2^32 as in C.
 #   - The results of +, -, *, unary - and << on int and long wrap to [-2^31, 2^31) with
 #     `wrapInt` (R.wrapInt, bound once at the top), and so does signed / and % unless the
@@ -214,7 +230,8 @@
 # function, and `<C name>_fn` for functions, so they collide neither with each other nor
 # with M, B, R, mem, wrapInt and the builtins the output uses. The attributes __data and
 # __static cannot clash with a C function, since identifiers starting with `__` are
-# reserved in C, and a table `tab'<shape>` contains a '.
+# reserved in C, and a table `tab'<shape>` contains a '. A word store function `sw-<address>`
+# contains a -, which no C name and no other generated name does.
 # In the loop, join and switch sets a variable is its C name, with ' appended to mem and
 # exit; the generated fields st', ret', done' and v' contain a ', so they cannot clash. A
 # variable declared in a switch body that hides one the sections assign is `<C name>'<n>`,
@@ -496,6 +513,60 @@ let
     else
       app "R.toS8" [ c ];
 
+  # ---- Words at constant addresses ----
+  # The address of the code value a when it is a decimal literal that is a multiple of 4
+  # below 2^32 (see "Words at constant addresses" in the header), else null.
+  constWordAddr =
+    a:
+    if builtins.match "[0-9]{1,10}" a.code == null then
+      null
+    else
+      let
+        v = builtins.fromJSON a.code;
+      in
+      if bitAnd v 3 == 0 && v < 4294967296 then v else null;
+
+  # The keys of the four levels of the memory trie of lib/mem.nix on the path to the word
+  # at the byte address a, as quoted attribute names: bits 20..31, 14..19, 8..13 and 2..7
+  # of a, in decimal.
+  trieKeys =
+    a:
+    map (k: "\"${toString k}\"") [
+      (div a 1048576)
+      (bitAnd (div a 16384) 63)
+      (bitAnd (div a 256) 63)
+      (bitAnd (div a 4) 63)
+    ];
+
+  # The word at the constant address a in mem as an attribute path, 0 when unwritten,
+  # as M.loadWord reads it.
+  wordAtConst = mem: a: cv 1 "${mem}.${concatStringsSep "." (trieKeys a)} or 0";
+
+  # The name of the function of the unit that stores a word at the constant address a.
+  wordStoreName = a: "sw-${toString a}";
+
+  # The binding of that function, `m: v: <memory>`, which copies the four nodes on the path
+  # and forces them, as M.storeWord does at an aligned address.
+  wordStoreBind =
+    a:
+    let
+      k = elemAt (trieKeys a);
+    in
+    "  ${wordStoreName a} = m: v: let n0 = m.${k 0} or { }; n1 = n0.${k 1} or { }; "
+    + "n2' = (n1.${k 2} or { }) // { ${k 3} = v; }; n1' = n1 // { ${k 2} = n2'; }; "
+    + "n0' = n0 // { ${k 1} = n1'; }; in builtins.seq v (builtins.seq n2' (builtins.seq n1' "
+    + "(builtins.seq n0' (m // { ${k 0} = n0'; }))));\n";
+
+  # The bindings of the word store functions that the source code calls, in the order of
+  # their names.
+  wordStoreBinds =
+    code:
+    let
+      used = filter builtins.isList (builtins.split "sw-([0-9]+)" code);
+      addrs = attrNames (listToAttrs (map (x: nameValue (head x) true) used));
+    in
+    concatStringsSep "" (map (a: wordStoreBind (builtins.fromJSON a)) addrs);
+
   load =
     mem: t: a:
     let
@@ -507,10 +578,15 @@ let
         (atom mem)
         a
       ];
-      word = app "M.loadWord" [
-        (atom mem)
-        a
-      ];
+      constWord = constWordAddr a;
+      word =
+        if constWord != null then
+          wordAtConst mem constWord
+        else
+          app "M.loadWord" [
+            (atom mem)
+            a
+          ];
     in
     if t.tag == "float" then
       app "R.loadF32" [
@@ -548,6 +624,26 @@ let
       "M.storeHalf"
     else
       "M.storeWord";
+
+  # The code that stores the encoded value v of type t at the address a in mem: a word at
+  # a constant address through the function of the unit for it (wordStoreBind).
+  storeCode =
+    t: mem: a: v:
+    let
+      fn = storeFn t;
+      constWord = constWordAddr a;
+    in
+    if fn == "M.storeWord" && constWord != null then
+      app (wordStoreName constWord) [
+        (atom mem)
+        v
+      ]
+    else
+      app fn [
+        (atom mem)
+        a
+        v
+      ];
 
   # A value of type from stored as type t: storeByte keeps the low bits itself, a signed
   # value is cut to 16 bits for storeHalf (which takes the high byte of a half at an
@@ -1144,11 +1240,7 @@ let
             binds = [ ];
           };
       m = fresh vb.s "mem";
-      store = app (storeFn t) [
-        (atom vb.s.mem)
-        ad.c
-        (encode t node.type vb.c)
-      ];
+      store = storeCode t vb.s.mem ad.c (encode t node.type vb.c);
       r = refreshCache (
         m.s
         // {
@@ -3674,6 +3766,7 @@ let
         if link == null then checked.funcs else filter (f: f.linkage == "external") checked.funcs;
       tables = checked.tables or [ ];
       statics = if link == null then [ ] else link.statics;
+      funcs = concatStringsSep "" (map func checked.funcs);
     in
     "{ M, B, R${
       if link == null then "" else ", X"
@@ -3681,7 +3774,8 @@ let
     + (if tables == [ ] then "" else "  inherit (builtins) elemAt seq;\n")
     + (if link == null then "" else importBinds link.funcs)
     + concatStringsSep "" (map (tableBind link checked) tables)
-    + concatStringsSep "" (map func checked.funcs)
+    + wordStoreBinds funcs
+    + funcs
     + "in\n{\n"
     + concatStringsSep "" (map (f: "  ${quoteAttr f.name} = ${f.name}_fn;\n") exported)
     + (

@@ -743,6 +743,85 @@ let
   # Number of occurrences of needle in s.
   countIn = needle: s: length (filter isList (builtins.split needle s));
 
+  # The attribute path that the generated code reads the word at the constant address a
+  # with (cc/emit.nix, "Words at constant addresses"): the keys of the four levels of
+  # lib/mem.nix, worked out by hand from its layout (12 + 6 + 6 + 6 bits of the word
+  # address). The tests below check that the path reads what M.loadWord reads.
+  wordPath =
+    a:
+    concatStringsSep "." (
+      map (k: ''"${toString k}"'') [
+        (a / 1048576)
+        (bitAnd (a / 16384) 63)
+        (bitAnd (a / 256) 63)
+        (bitAnd (a / 4) 63)
+      ]
+    );
+  # The read of the word at a from the memory mem as generated, and as a regular expression
+  # with the memory matched by memRe.
+  wordRead = mem: a: "${mem}.${wordPath a} or 0";
+  wordReadRe = memRe: a: "${memRe}\\.${builtins.replaceStrings [ "." ] [ "\\." ] (wordPath a)} or 0";
+
+  # Words at constant addresses on the edges of a leaf (256 B), of a 16 KiB node, of the
+  # 1 MiB regions of the root and of the address space; put stores at each of them, read
+  # reads the k-th, and the last store is of a negative int.
+  constAddrs = [
+    0
+    252
+    256
+    16380
+    16384
+    1048572
+    1048576
+    4194304
+    4294967292
+  ];
+  constWordSrc = ''
+    void put(unsigned x) {
+      *(unsigned *)0 = x;
+      *(unsigned *)252 = x + 1;
+      *(unsigned *)256 = x + 2;
+      *(unsigned *)16380 = x + 3;
+      *(unsigned *)16384 = x + 4;
+      *(unsigned *)1048572 = x + 5;
+      *(unsigned *)1048576 = x + 6;
+      *(unsigned *)4194304 = x + 7;
+      *(int *)4294967292u = -(int)x;
+    }
+    unsigned read(int k) {
+      switch (k) {
+      case 0: return *(unsigned *)0;
+      case 1: return *(unsigned *)252;
+      case 2: return *(unsigned *)256;
+      case 3: return *(unsigned *)16380;
+      case 4: return *(unsigned *)16384;
+      case 5: return *(unsigned *)1048572;
+      case 6: return *(unsigned *)1048576;
+      case 7: return *(unsigned *)4194304;
+      default: return *(unsigned *)4294967292u;
+      }
+    }
+  '';
+  constWordFns = Cc.load constWordSrc;
+  # The words at the addresses as the compiled read and as M.loadWord read them.
+  constReads = mem: genList (k: (constWordFns.read mem k).ret) (length constAddrs);
+  loadReads = mem: map (M.loadWord mem) constAddrs;
+  # Memories with words beside the addresses (in the same leaf, so that the paths exist
+  # but the words are unwritten), with the words themselves, and with a host state.
+  besideMem = foldl' (m: a: M.storeWord m (bitAnd (a + 8) 4294967295) (a + 11)) M.empty constAddrs;
+  filledMem = foldl' (m: a: M.storeWord m a (a + 3)) besideMem constAddrs // {
+    host = {
+      out = "kept";
+    };
+  };
+  # put x as the compiled code does it and as folding M.storeWord does it.
+  constPut = mem: x: constWordFns.put mem x;
+  foldPut =
+    mem: x:
+    foldl' (m: i: M.storeWord m (elemAt constAddrs i) (if i == 8 then B.u32 (-x) else x + i)) mem (
+      genList (i: i) (length constAddrs)
+    );
+
   # ---- Review fixes ----
 
   # Order of an assignment to memory: the value, then the target's address, then its old
@@ -978,16 +1057,17 @@ let
     fn: name:
     let
       code = fnCode Cc.examples.draw.src fn;
-      k = toString (Cc.load Cc.examples.draw.src).__data.symbols.${name};
+      a = (Cc.load Cc.examples.draw.src).__data.symbols.${name};
+      k = toString a;
     in
     t "cc cache: ${fn} reads ${name} through the cached value"
       [
-        (countIn "M\\.loadWord [A-Za-z0-9_.]+ ${k}([^0-9]|$)" code)
-        (contains "g'${k}'ptr = M.loadWord mem ${k};" code)
-        (countIn "// \\(if hit_[0-9]+ then \\{[^}]* g'${k}'ptr = M\\.loadWord mem_[0-9]+ ${k};[^}]*} else \\{ }\\)" code)
+        (countIn (wordReadRe "[A-Za-z0-9_]+" a) code)
+        (contains "g'${k}'ptr = ${wordRead "mem" a};" code)
+        (countIn "// \\(if hit_[0-9]+ then \\{[^}]* g'${k}'ptr = ${wordReadRe "mem_[0-9]+" a};[^}]*} else \\{ }\\)" code)
         (countIn "B\\.add [A-Za-z0-9_]+\\.g'${k}'ptr " code)
         (countIn "g_[0-9]+ = if" code)
-        (countIn "g_[0-9]+ = M\\.loadWord mem ${k};" code)
+        (countIn "g_[0-9]+ = ${wordReadRe "mem" a};" code)
       ]
       [
         3
@@ -3678,9 +3758,110 @@ in
       addrs = 325;
     }
   )
-  (t "cc data: a variable is read at its address literal" (contains "M.loadWord mem 4194304" (
+  (t "cc data: a variable is read at its address literal" (contains (wordRead "mem" 4194304) (
     Cc.compile "int g; int f(void) { return g; }"
   )) true)
+  (t "cc words: words at constant addresses are read by attribute paths and stored by sw-<a>"
+    (
+      let
+        code = Cc.compile constWordSrc;
+      in
+      [
+        (contains (wordRead "mem" 1048572) (fnCode constWordSrc "read"))
+        (contains "M.loadWord" code)
+        (contains "M.storeWord" code)
+        (contains ''
+          sw-16380 = m: v: let n0 = m."0" or { }; n1 = n0."0" or { }; n2' = (n1."63" or { }) // { "63" = v; }; n1' = n1 // { "63" = n2'; }; n0' = n0 // { "0" = n1'; }; in builtins.seq v (builtins.seq n2' (builtins.seq n1' (builtins.seq n0' (m // { "0" = n0'; }))));
+        '' code)
+        (countIn "mem_[0-9]+ = sw-[0-9]+ (mem|mem_[0-9]+) " (fnCode constWordSrc "put"))
+        (countIn "\n  sw-[0-9]+ = " code)
+      ]
+    )
+    [
+      true
+      false
+      false
+      true
+      9
+      9
+    ]
+  )
+  (t "cc words: a read at a constant address is M.loadWord, 0 where nothing was written"
+    [
+      (constReads M.empty)
+      (constReads besideMem == loadReads besideMem)
+      (constReads filledMem == loadReads filledMem)
+      (constReads filledMem)
+    ]
+    [
+      (genList (_: 0) 9)
+      true
+      true
+      (map (a: a + 3) constAddrs)
+    ]
+  )
+  (t "cc words: a store at a constant address gives the memory of M.storeWord"
+    [
+      (constPut M.empty 5 == foldPut M.empty 5)
+      (constPut besideMem 5 == foldPut besideMem 5)
+      (constPut filledMem 5 == foldPut filledMem 5)
+      (constReads (constPut filledMem 5))
+      # The words beside the stored ones and the host state are kept.
+      (map (a: M.loadWord (constPut filledMem 5) (bitAnd (a + 8) 4294967295)) constAddrs)
+      (constPut filledMem 5).host
+    ]
+    [
+      true
+      true
+      true
+      [
+        5
+        6
+        7
+        8
+        9
+        10
+        11
+        12
+        4294967291
+      ]
+      (map (a: a + 11) constAddrs)
+      { out = "kept"; }
+    ]
+  )
+  (t "cc words: bytes, halves, unaligned and computed addresses keep the M accessors"
+    (
+      let
+        code = Cc.compile ''
+          char c; short h; int *p;
+          int f(int i) {
+            c = 1; h = 2; *p = 3; *(int *)4194306 = 4; p[i] = 5;
+            return c + h + *p + *(int *)4194306 + p[i];
+          }
+        '';
+      in
+      map (n: countIn n code) [
+        "M\\.storeByte mem[_0-9]* 4194304 "
+        "M\\.storeHalf mem[_0-9]* 4194306 "
+        "M\\.storeWord mem[_0-9]* 4194306 "
+        "M\\.storeWord mem[_0-9]* \\("
+        "M\\.loadByte mem[_0-9]* 4194304 "
+        "M\\.loadHalf mem[_0-9]* 4194306\\)"
+        "M\\.loadWord mem[_0-9]* 4194306\\)"
+        "M\\.loadWord mem[_0-9]* \\("
+      ]
+    )
+    [
+      1
+      1
+      1
+      2
+      1
+      1
+      1
+      2
+    ]
+  )
   (t "cc data: init stores only the values that are not 0"
     (contains "init = mem: R.initData mem [\n      [ 4194308 4 5 ]\n    ];" (
       Cc.compile "int a[3] = { 0, 5, 0 };"
@@ -8209,7 +8390,7 @@ in
       in
       [
         (M.loadWord d.mem d.syms.fp)
-        (contains "(elemAt tab's (M.loadWord mem 4194304)) mem;" (Cc.compile src))
+        (contains "(elemAt tab's (${wordRead "mem" 4194304})) mem;" (Cc.compile src))
         (contains "tab's = [\n    (throw \"cc: call through a null function pointer\")\n  ];" (
           Cc.compile src
         ))
@@ -10851,7 +11032,8 @@ in
   (t "cc run: a struct initialized in a loop is read with its new values"
     [
       (dret frameInitSrc "rebuilt" [ 4 ])
-      (contains "M.loadWord" (fnCode frameInitSrc "rebuilt"))
+      # The words of v are read from the memory (cc/emit.nix, "Words at constant addresses").
+      (countIn ''mem_[0-9]+\.("[0-9]+"\.){3}"[0-9]+" or 0'' (fnCode frameInitSrc "rebuilt") > 0)
     ]
     [
       80
