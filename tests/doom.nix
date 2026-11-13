@@ -7,6 +7,7 @@
 let
   K = import ../doom/keys.nix;
   R = import ../doom/render.nix;
+  Pic = import ../doom/picture.nix;
   Scaffold = import ../scaffold/render.nix;
   Cc = import ../cc;
   M = import ../lib/mem.nix;
@@ -157,6 +158,46 @@ let
       avg = c: toString ((foldl' (a: p: a + p.${c}) 0 pixels) / n);
     in
     "${avg "r"};${avg "g"};${avg "b"}";
+
+  # Doom's variables of doom/picture.nix at made-up addresses, and frame records over the
+  # artificial screen with the variables set to the values in vars (missing ones are 0).
+  picSymbols = {
+    gamestate = 4096;
+    gametic = 4100;
+    automapactive = 4104;
+    menuactive = 4108;
+    viewwindowx = 4112;
+    viewwindowy = 4116;
+    scaledviewwidth = 4120;
+    viewheight = 4124;
+  };
+  picFrame = vars: {
+    mem = foldl' (m: n: M.storeWord m picSymbols.${n} vars.${n}) screenMem (builtins.attrNames vars);
+    inherit screenAddr palette;
+  };
+  # A level on screen with the 160x80 window of screen size 5.
+  levelVars = {
+    gametic = 5;
+    viewwindowx = 80;
+    viewwindowy = 44;
+    scaledviewwidth = 160;
+    viewheight = 80;
+  };
+  picOf =
+    windowed: vars:
+    Pic.picture {
+      symbols = picSymbols;
+      inherit windowed;
+      cols = 160;
+      rows = 50;
+    } (picFrame vars);
+  barRect = {
+    x = 0;
+    y = 168;
+    width = 320;
+    height = 32;
+  };
+  fullImage = memImage fullRect 160 50;
 
   # The 160x80 window drawn 1:1 as 160x40 cells, worked out from the artificial screen:
   # cell (c, r) shows pixels (80 + c, 44 + 2r) and (80 + c, 45 + 2r).
@@ -1061,6 +1102,125 @@ in
       in
       line 7 10 14 + line 14 17 21 + line 21 24 28
     )
+  )
+  (t "doom picture: blocksFor of 80, 96, 160, 161, 320, 400 and 1 columns"
+    (map Pic.blocksFor [
+      80
+      96
+      160
+      161
+      320
+      400
+      1
+    ])
+    [
+      3
+      3
+      5
+      6
+      10
+      10
+      3
+    ]
+  )
+  (t "doom picture: the 3D view is the window 1:1 and the status bar under it"
+    (
+      let
+        s = picOf true levelVars;
+      in
+      [
+        (s == memImage windowRect 160 40 + memImage barRect 160 8)
+        (lineCount s)
+        (substring 0 (stringLength windowExpected) s == windowExpected)
+      ]
+    )
+    [
+      true
+      48
+      true
+    ]
+  )
+  (t
+    "doom picture: the whole screen with a menu, the automap, outside a level, before a tic, and without windowed"
+    (map (p: p == fullImage) [
+      (picOf true (levelVars // { menuactive = 1; }))
+      (picOf true (levelVars // { automapactive = 1; }))
+      (picOf true (levelVars // { gamestate = 1; }))
+      (picOf true (levelVars // { gametic = 0; }))
+      (picOf false levelVars)
+    ])
+    [
+      true
+      true
+      true
+      true
+      true
+    ]
+  )
+  (t "doom picture: screen size 11 is the window of the whole screen and no bar"
+    (
+      let
+        s = picOf true (
+          levelVars
+          // {
+            viewwindowx = 0;
+            viewwindowy = 0;
+            scaledviewwidth = 320;
+            viewheight = 200;
+          }
+        );
+      in
+      [
+        (s == fullImage)
+        (lineCount s)
+      ]
+    )
+    [
+      true
+      50
+    ]
+  )
+  (t "doom picture: a tall window shrinks with the bar to fit the rows"
+    (picOf true (
+      levelVars
+      // {
+        viewwindowx = 112;
+        viewwindowy = 4;
+        scaledviewwidth = 96;
+        viewheight = 160;
+      }
+    ))
+    (
+      memImage {
+        x = 112;
+        y = 4;
+        width = 96;
+        height = 160;
+      } 56 46
+      + memImage barRect 56 2
+    )
+  )
+  (t "doom picture: the window needs Doom's variables only with windowed"
+    (
+      let
+        bare =
+          windowed:
+          Pic.picture {
+            symbols = { };
+            inherit windowed;
+            cols = 160;
+            rows = 50;
+          } (picFrame { });
+      in
+      [
+        (bare false == fullImage)
+        (throws (bare true))
+      ]
+    )
+    [
+      true
+      true
+    ]
   )
   (t "doom DG_GetKey: no event returns 0 and leaves the memory"
     [

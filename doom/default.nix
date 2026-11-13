@@ -8,15 +8,15 @@
 #   DOOM_KEYS=/tmp/doom.keys COLUMNS=$COLUMNS LINES=$LINES nix eval --raw -f . doom.play
 #
 # title    the last frame after DOOM_TICKS ticks as an ANSI still image of the size that
-#          doom/render.nix fit picks for COLUMNS and LINES
+#          doom/render.nix fit picks for COLUMNS and LINES (doom/picture.nix)
 # report   every frame drawn from doomgeneric_Create (tick 0) on as [ { tick; hash; } ]:
 #          hash is the sha256 of the screen bytes followed by the palette (r, g, b per
 #          entry), each byte as two hex digits, as in scaffold.boot.report
 # play     streams, at each tick, the guest output added in it (if any) and the last
 #          frame drawn in it (if any) with builtins.trace, the frame under a status
 #          line (the tick and the key events sent at it, + a press, - a release); each
-#          tick runs DOOM_TICS tics of the game and draws once (doom/run.nix tics);
-#          the value is
+#          tick runs DOOM_TICS tics of the game and draws once (doom/run.nix tics); the
+#          frames are pictures of doom/picture.nix of the size of title; the value is
 #          "ticks: <n>, frames: <m>\n"
 #
 # Environment (read with builtins.getEnv):
@@ -26,13 +26,20 @@
 #   DOOM_TICKS    calls of doomgeneric_Tick; 2 for title and report, 1000000 for play
 #   DOOM_TICS     tics of the game per tick, run by moving the virtual clock (doom/run.nix
 #                 tics); 0 for title and report (the clock is left to Doom, as in the
-#                 scaffold), 18 for play
+#                 scaffold), 5 for play
+#   DOOM_VIEW     the view window: auto (the default for play) sets Doom's screen size to
+#                 the least one at least as wide as the picture (doom/picture.nix
+#                 blocksFor) and draws the window and the status bar alone while the 3D
+#                 view is on; a number from 3 to 10 does the same with that screen size;
+#                 full (the default for title and report) leaves Doom's view window alone
+#                 and always draws the whole screen
 #   DOOM_KEYS     path of the key file, read again before every tick at which no key
 #                 event is pending (doom/run.nix, doom/keys.nix poll); no input
 #                 without it
 #   COLUMNS, LINES  the terminal size; 160 and 52 without them
 let
   R = import ./render.nix;
+  P = import ./picture.nix;
   inherit (builtins)
     concatStringsSep
     div
@@ -113,14 +120,32 @@ let
 
   ticsOr = numberOr "DOOM_TICS";
 
+  # The screen size of the view window (doom/run.nix view) that DOOM_VIEW asks for, with
+  # default ("auto" or "full") when it is unset: null for full.
+  viewOr =
+    default:
+    let
+      v = getEnv "DOOM_VIEW";
+      setting = if v == "" then default else v;
+    in
+    if setting == "full" then
+      null
+    else if setting == "auto" then
+      P.blocksFor size.cols
+    else if match "([3-9]|10)" setting != null then
+      fromJSON setting
+    else
+      throw "doom: DOOM_VIEW is not auto, full or a number from 3 to 10: '${v}'";
+
   run =
-    ticks: tics: onTick: init:
+    ticks: tics: view: onTick: init:
     import ./run.nix {
       inherit
         linked
         args
         ticks
         tics
+        view
         readKeys
         onTick
         init
@@ -148,18 +173,20 @@ let
       )
     );
 
+  # The picture of a frame record, the view window alone when view is not null.
   image =
-    f:
-    R.render {
-      inherit (f) screen palette;
+    view:
+    P.picture {
+      inherit (linked.__data) symbols;
+      windowed = view != null;
       inherit (size) cols rows;
     };
 
-  # The image without its last line break (trace adds one).
+  # The picture without its last line break (trace adds one).
   traced =
-    f:
+    view: f:
     let
-      s = image f;
+      s = image view f;
     in
     substring 0 (stringLength s - 1) s;
 
@@ -198,6 +225,7 @@ let
 
   # Traces the output, then the last frame under its status line, of one call.
   stream =
+    view:
     {
       tick,
       frames,
@@ -210,18 +238,21 @@ let
         if frames == [ ] then
           acc
         else
-          trace (status tick events + "\n" + traced (elemAt frames (builtins.length frames - 1))) acc;
+          trace (status tick events + "\n" + traced view (elemAt frames (builtins.length frames - 1))) acc;
     in
     if out == "" then withFrame else trace out withFrame;
 
-  titleRun = run (ticksOr 2) (ticsOr 0) (_: acc: acc) null;
+  titleView = viewOr "full";
+  titleRun = run (ticksOr 2) (ticsOr 0) titleView (_: acc: acc) null;
   playTicks = ticksOr 1000000;
-  playRun = run playTicks (ticsOr 18) stream null;
+  playView = viewOr "auto";
+  playRun = run playTicks (ticsOr 5) playView (stream playView) null;
 in
 {
-  title = if titleRun.last == null then throw "doom: no frame was drawn" else image titleRun.last;
+  title =
+    if titleRun.last == null then throw "doom: no frame was drawn" else image titleView titleRun.last;
 
-  report = (run (ticksOr 2) (ticsOr 0) hashEntries [ ]).acc;
+  report = (run (ticksOr 2) (ticsOr 0) (viewOr "full") hashEntries [ ]).acc;
 
   play = builtins.seq playRun.acc "ticks: ${toString playTicks}, frames: ${toString playRun.frameCount}\n";
 }
