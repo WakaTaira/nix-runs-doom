@@ -100,6 +100,80 @@ let
   lineCount = s: (length (split "\n" s) - 1) / 2;
   firstCell = "${esc}[38;2;4;9;13m${esc}[48;2;12;25;37m▀";
 
+  # The artificial screen in memory at 0x200fd: not a multiple of 4 and three bytes before
+  # a leaf boundary, so that rows start inside words and cross leaves. alignedMem holds
+  # it at 0x20000.
+  screenAddr = 131325;
+  screenMem = M.storeRun M.empty screenAddr 64000 screen;
+  alignedMem = M.storeRun M.empty 131072 64000 screen;
+  fullRect = {
+    x = 0;
+    y = 0;
+    width = 320;
+    height = 200;
+  };
+  windowRect = {
+    x = 80;
+    y = 44;
+    width = 160;
+    height = 80;
+  };
+  memImage =
+    rect: cols: rows:
+    R.renderMem (
+      {
+        mem = screenMem;
+        inherit
+          screenAddr
+          palette
+          cols
+          rows
+          ;
+      }
+      // rect
+    );
+  memSha =
+    rect: cols: rows:
+    builtins.hashString "sha256" (memImage rect cols rows);
+
+  # A cell and a line of the picture from the colors "r;g;b" of its two halves.
+  cellOf = upper: lower: "${esc}[38;2;${upper}m${esc}[48;2;${lower}m▀";
+  lineOf = cells: concatStringsSep "" cells + "${esc}[0m\n";
+
+  # The color "r;g;b" of palette index i of the artificial palette.
+  colorOf = i: "${toString i};${toString (bitAnd (2 * i) 255)};${toString (bitAnd (3 * i) 255)}";
+
+  # The average color "r;g;b" of the box x0 <= x < x1, y0 <= y < y1 of the artificial
+  # screen, summed straight from the list (the reference for the averaged pictures).
+  boxAverage =
+    x0: x1: y0: y1:
+    let
+      pixels = builtins.concatLists (
+        genList (j: genList (i: elemAt palette (elemAt screen ((y0 + j) * 320 + x0 + i))) (x1 - x0)) (
+          y1 - y0
+        )
+      );
+      n = length pixels;
+      avg = c: toString ((foldl' (a: p: a + p.${c}) 0 pixels) / n);
+    in
+    "${avg "r"};${avg "g"};${avg "b"}";
+
+  # The 160x80 window drawn 1:1 as 160x40 cells, worked out from the artificial screen:
+  # cell (c, r) shows pixels (80 + c, 44 + 2r) and (80 + c, 45 + 2r).
+  windowExpected = concatStringsSep "" (
+    genList (
+      r:
+      lineOf (
+        genList (
+          c:
+          cellOf (colorOf (bitAnd (80 + c + 2 * (44 + 2 * r)) 255)) (
+            colorOf (bitAnd (80 + c + 2 * (45 + 2 * r)) 255)
+          )
+        ) 160
+      )
+    ) 40
+  );
+
   # DG_GetKey of the platform layer over a memory whose words at 64 and 68 are all ones,
   # so that the word write of pressed and the byte write of key can be told apart.
   getKey = P.impls.DG_GetKey;
@@ -828,6 +902,95 @@ in
   (t "doom render: row ends with a reset and a newline" (substring (
     stringLength image80 - 5
   ) 5 image80) "${esc}[0m\n")
+  (t "doom render: renderMem of the whole screen equals render"
+    [
+      (memSha fullRect 80 25)
+      (memSha fullRect 320 100)
+      (memSha fullRect 7 1)
+      (memImage fullRect 160 50 == Scaffold { inherit screen palette; })
+      (
+        R.renderMem (
+          {
+            mem = alignedMem;
+            screenAddr = 131072;
+            inherit palette;
+            cols = 80;
+            rows = 25;
+          }
+          // fullRect
+        ) == image80
+      )
+    ]
+    [
+      "3fe5c87c909f0d2ce6882a845b15e9f2bd560d927eada702b2effe8a9de0d321"
+      "9aeaffc31d72dc7390cfa9042a771f12accc1e9a182931f1ca4ec5846245133e"
+      "1bc77daa4ca65d1be78010be4dda884027c47643dafbccbd415a45d959114bd5"
+      true
+      true
+    ]
+  )
+  (t "doom render: renderMem of a 160x80 window 1:1 as 160x40 cells"
+    [
+      (memImage windowRect 160 40 == windowExpected)
+      (substring 0 (stringLength (cellOf "168;80;248" "170;84;254")) (memImage windowRect 160 40))
+      (lineCount (memImage windowRect 160 40))
+    ]
+    [
+      true
+      (cellOf "168;80;248" "170;84;254")
+      40
+    ]
+  )
+  (t "doom render: renderMem of a 160x80 window as 80x20 cells of 2x2 pixels"
+    (
+      let
+        s = memImage windowRect 80 20;
+      in
+      [
+        (substring 0 (stringLength (cellOf "169;83;188" "173;91;8")) s)
+        (lineCount s)
+      ]
+    )
+    [
+      (cellOf "169;83;188" "173;91;8")
+      20
+    ]
+  )
+  (t "doom render: renderMem of a window as one cell (boxes beyond 4096 pixels)" (memImage windowRect
+    1
+    1
+  ) (lineOf [ (cellOf (boxAverage 80 240 44 84) (boxAverage 80 240 84 124)) ]))
+  (t "doom render: renderMem of an uneven window as 4x3 cells"
+    (memImage {
+      x = 5;
+      y = 7;
+      width = 33;
+      height = 21;
+    } 4 3)
+    (
+      let
+        # Columns 5..13, 13..21, 21..29, 29..38; rows 7..10..14, 14..17..21, 21..24..28.
+        xs = [
+          5
+          13
+          21
+          29
+          38
+        ];
+        line =
+          y0: ym: y1:
+          lineOf (
+            genList (
+              c:
+              cellOf (boxAverage (elemAt xs c) (elemAt xs (c + 1)) y0 ym) (
+                boxAverage (elemAt xs c) (elemAt xs (c + 1)) ym y1
+              )
+            ) 4
+          );
+      in
+      line 7 10 14 + line 14 17 21 + line 21 24 28
+    )
+  )
   (t "doom DG_GetKey: no event returns 0 and leaves the memory"
     [
       noKey.ret
