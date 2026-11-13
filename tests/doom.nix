@@ -336,55 +336,69 @@ let
   # I_VideoBuffer at video. Every frame writes its number to byte 0 and its number + 100 to
   # byte 63999 of video, then copies video to DG_ScreenBuffer row by row, as I_FinishUpdate
   # does, and draws.
-  videoGuest = Cc.linkSources {
-    units = [
-      {
-        name = "video";
-        src = ''
-          void *memcpy(void *dst, const void *src, unsigned int n);
-          void DG_DrawFrame(void);
-          unsigned char *DG_ScreenBuffer;
-          unsigned char *I_VideoBuffer;
-          unsigned colors[256];
-          unsigned char out[64000];
-          unsigned char video[64000];
-          int frames;
-          void finish(void) {
-            int y;
-            frames++;
-            I_VideoBuffer[0] = frames;
-            I_VideoBuffer[63999] = frames + 100;
-            for (y = 0; y < 200; y++)
-              memcpy(DG_ScreenBuffer + 320 * y, I_VideoBuffer + 320 * y, 320);
-            DG_DrawFrame();
-          }
-          void doomgeneric_Create(int argc, char **argv) {
-            DG_ScreenBuffer = out;
-            I_VideoBuffer = video;
-            finish();
-          }
-          void doomgeneric_Tick(void) { finish(); }
-        '';
+  videoUnit = {
+    name = "video";
+    src = ''
+      void *memcpy(void *dst, const void *src, unsigned int n);
+      void DG_DrawFrame(void);
+      unsigned char *DG_ScreenBuffer;
+      unsigned char *I_VideoBuffer;
+      unsigned colors[256];
+      unsigned char out[64000];
+      unsigned char video[64000];
+      int frames;
+      void finish(void) {
+        int y;
+        frames++;
+        I_VideoBuffer[0] = frames;
+        I_VideoBuffer[63999] = frames + 100;
+        for (y = 0; y < 200; y++)
+          memcpy(DG_ScreenBuffer + 320 * y, I_VideoBuffer + 320 * y, 320);
+        DG_DrawFrame();
       }
-    ];
+      void doomgeneric_Create(int argc, char **argv) {
+        DG_ScreenBuffer = out;
+        I_VideoBuffer = video;
+        finish();
+      }
+      void doomgeneric_Tick(void) { finish(); }
+    '';
   };
+  videoGuest = Cc.linkSources { units = [ videoUnit ]; };
   videoSym = videoGuest.__data.symbols;
 
-  # The driver over videoGuest for 2 ticks; acc lists bytes 0 and 63999 of each frame.
-  videoRun = import ../doom/run.nix {
-    linked = videoGuest;
-    args = [ "doom" ];
-    ticks = 2;
-    readKeys = _: null;
-    onTick =
-      info: acc:
-      acc
-      ++ map (f: [
-        (elemAt f.screen 0)
-        (elemAt f.screen 63999)
-      ]) info.frames;
-    init = [ ];
-  };
+  # videoGuest with a variable fb_scaling of the value n, as i_video.c has.
+  scaledGuest =
+    n:
+    Cc.linkSources {
+      units = [
+        videoUnit
+        {
+          name = "scaling";
+          src = "int fb_scaling = ${toString n};";
+        }
+      ];
+    };
+
+  # The driver over a guest of the shape of videoGuest for 2 ticks; acc lists bytes 0 and
+  # 63999 of each frame.
+  videoRunOf =
+    linked:
+    import ../doom/run.nix {
+      inherit linked;
+      args = [ "doom" ];
+      ticks = 2;
+      readKeys = _: null;
+      onTick =
+        info: acc:
+        acc
+        ++ map (f: [
+          (elemAt f.screen 0)
+          (elemAt f.screen 63999)
+        ]) info.frames;
+      init = [ ];
+    };
+  videoRun = videoRunOf videoGuest;
 
   # The driver over oddGuest with the key texts of ticks 1, 2, ...; acc lists per tick
   # the state of key a, the count of events taken and the events.
@@ -1167,6 +1181,64 @@ in
       ]
       1
       101
+    ]
+  )
+  (t "doom run: DG_ScreenBuffer points at I_VideoBuffer only when fb_scaling is 1"
+    (map
+      (
+        n:
+        let
+          g = scaledGuest n;
+          r = videoRunOf g;
+        in
+        [
+          (M.loadWord r.mem g.__data.symbols.DG_ScreenBuffer == g.__data.symbols.video)
+          r.acc
+          (M.loadByte r.mem (g.__data.symbols.out + 63999))
+        ]
+      )
+      [
+        1
+        2
+      ]
+    )
+    [
+      [
+        true
+        [
+          [
+            1
+            101
+          ]
+          [
+            2
+            102
+          ]
+          [
+            3
+            103
+          ]
+        ]
+        101
+      ]
+      [
+        false
+        [
+          [
+            1
+            101
+          ]
+          [
+            2
+            102
+          ]
+          [
+            3
+            103
+          ]
+        ]
+        103
+      ]
     ]
   )
   (t "doom run: DG_ScreenBuffer is left as it is without I_VideoBuffer in the link"

@@ -7,9 +7,9 @@
 # linked    the result of a link with doomgeneric_Create (argc, argv), doomgeneric_Tick
 #           (no arguments), both returning void, and __init; with tics > 5 also
 #           TryRunTics (no arguments, returning void), else a throw. When its
-#           __data.symbols has both DG_ScreenBuffer and I_VideoBuffer, the driver sets the
-#           pointer DG_ScreenBuffer to the value of I_VideoBuffer after doomgeneric_Create
-#           (see aliasScreen below)
+#           __data.symbols has both DG_ScreenBuffer and I_VideoBuffer (and fb_scaling is
+#           1 or absent), the driver sets the pointer DG_ScreenBuffer to the value of
+#           I_VideoBuffer after doomgeneric_Create (see aliasScreen below)
 # args      the argv strings; the strings go from 0x00100000, each ended by NUL (at
 #           most 4096 bytes in all, NULs included, else a throw), and the array of
 #           their addresses, ended by 0, to 0x00101000, below the data area
@@ -261,11 +261,17 @@ let
   # I_VideoBuffer is set only by I_InitGraphics (a Z_Malloc with PU_STATIC, never purged),
   # which D_DoomLoop calls at the end of D_DoomMain on every path; Z_Free in
   # I_ShutdownGraphics runs only on quitting. The frame Create itself draws is copied as
-  # before. The 1:1 copy needs fb_scaling 1: a -scaling argument other than 1 would make
-  # I_FinishUpdate write past I_VideoBuffer.
+  # before. The 1:1 copy needs fb_scaling 1: with another value (a -scaling argument)
+  # I_FinishUpdate writes fb_scaling times as many bytes and would write past I_VideoBuffer.
+  # When the link also has fb_scaling (set by I_InitGraphics, inside doomgeneric_Create),
+  # the pointer is set only when its value is 1, and any other value keeps the buffers apart.
   aliasScreen =
     mem:
-    if symbols ? DG_ScreenBuffer && symbols ? I_VideoBuffer then
+    if
+      symbols ? DG_ScreenBuffer
+      && symbols ? I_VideoBuffer
+      && (!(symbols ? fb_scaling) || M.loadWord mem symbols.fb_scaling == 1)
+    then
       M.storeWord mem symbols.DG_ScreenBuffer (M.loadWord mem symbols.I_VideoBuffer)
     else
       mem;
