@@ -163,7 +163,9 @@ let
     last = null;
   } created;
 
-  final = foldl' step start (genList (i: i + 1) ticks);
+  # foldl' does not force its initial value, so start (doomgeneric_Create and the onTick of
+  # tick 0) is forced here, before the key file is read for tick 1.
+  final = seq start (foldl' step start (genList (i: i + 1) ticks));
 in
 {
   inherit (final) mem last acc;

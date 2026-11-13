@@ -1,8 +1,9 @@
-# Tests of the pure parts of the Doom platform layer: key decoding (doom/keys.nix) and
-# variable-size rendering (doom/render.nix). No WAD and no Doom source are used. Expected
-# values are worked out by hand from the rules at the top of each file; key numbers follow
-# doomkeys.h (up 0xad = 173, down 0xaf = 175, right 0xae = 174, left 0xac = 172, use
-# 0xa2 = 162, fire 0xa3 = 163).
+# Tests of the Doom platform layer: key decoding (doom/keys.nix), variable-size rendering
+# (doom/render.nix), DG_GetKey (scaffold/platform.nix), the driver (doom/run.nix) on small
+# guests written in C and linked with cc.linkSources, and exitText (cc/host.nix). No WAD
+# and no Doom source are used. Expected values are worked out by hand from the rules at
+# the top of each file; key numbers follow doomkeys.h (up 0xad = 173, down 0xaf = 175,
+# right 0xae = 174, left 0xac = 172, use 0xa2 = 162, fire 0xa3 = 163).
 let
   K = import ../doom/keys.nix;
   R = import ../doom/render.nix;
@@ -274,6 +275,18 @@ let
     i: concatStringsSep "" (genList (j: if bitAnd j 1 == 0 then "a" else "b") (i + 1))
   ) 42;
   pendingOdd = n: length (runOdd (genList (elemAt alternating) n)).mem.host.keys;
+
+  # A run whose onTick throws at tick 0 and whose readKeys aborts: the run fails with the
+  # throw, which tryEval catches, only if tick 0 is handed to onTick before the key file is
+  # read for tick 1; in the other order the abort stops the whole evaluation of the tests.
+  orderRun = import ../doom/run.nix {
+    linked = guest;
+    args = [ "doom" ];
+    ticks = 1;
+    readKeys = _: abort "doom run test: readKeys was called before onTick of tick 0";
+    onTick = info: acc: if info.tick == 0 then throw "tick 0" else acc;
+    init = null;
+  };
 
   throws = x: !(builtins.tryEval (builtins.deepSeq x x)).success;
 in
@@ -569,7 +582,7 @@ in
       rows = 1;
     }
   )
-  (t "doom render: fit of one column"
+  (t "doom render: fit of three columns in one row"
     (R.fit {
       columns = 3;
       lines = 52;
@@ -883,6 +896,10 @@ in
         0
       ]
     ]
+  )
+  (t "doom run: onTick of tick 0 comes before the key file is read for tick 1"
+    (builtins.tryEval orderRun.acc).success
+    false
   )
   (t "doom run: argument strings up to 4096 bytes"
     [

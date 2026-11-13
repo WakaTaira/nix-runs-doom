@@ -1,4 +1,5 @@
-# The one-shot link of doomgeneric's units for the emulator.
+# The one-shot link of doomgeneric's units by the Nix C compiler (cc/); doom/run.nix calls
+# the resulting Nix functions directly, without the RV32IM emulator.
 #
 #   import ./link.nix { src; wad; }  -> the result of cc.linkFiles
 #
