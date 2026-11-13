@@ -364,8 +364,9 @@ let
   } created;
 
   # foldl' does not force its initial value, so start (doomgeneric_Create and the onTick of
-  # tick 0) is forced here, before the key file is read for tick 1. tics is checked first.
-  final = seq checkedTics (seq start (foldl' step start (genList (i: i + 1) ticks)));
+  # tick 0) is forced here, before the key file is read for tick 1. tics and keyProto are
+  # checked first.
+  final = seq checkedTics (seq protocol (seq start (foldl' step start (genList (i: i + 1) ticks))));
 in
 {
   inherit (final) mem last acc;
