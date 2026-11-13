@@ -99,6 +99,14 @@ let
       4096
       10
     ]).world.mem;
+  # A copy onto itself (dst == src), unaligned, crossing several words.
+  selfCopy =
+    name:
+    L.${name} (world memStrs) [
+      4097
+      4097
+      13
+    ];
   set =
     (L.memset (world memStrs) [
       4097
@@ -417,6 +425,35 @@ in
     name = "libc: memmove overlapping";
     got = getStr moved 4096;
     expected = "abcabcdefghijnopqrstuvwxyz";
+  }
+  {
+    name = "libc: memcpy and memmove with dst == src keep the bytes and return dst";
+    got =
+      map
+        (
+          name:
+          let
+            r = selfCopy name;
+          in
+          [
+            (getStr r.world.mem 4096)
+            r.ret
+          ]
+        )
+        [
+          "memcpy"
+          "memmove"
+        ];
+    expected = [
+      [
+        "abcdefghijklmnopqrstuvwxyz"
+        4097
+      ]
+      [
+        "abcdefghijklmnopqrstuvwxyz"
+        4097
+      ]
+    ];
   }
   {
     name = "libc: memset";

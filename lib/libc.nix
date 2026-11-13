@@ -147,10 +147,17 @@ let
     fill mem dst (length bs) b (k: b k + 256 * b (k + 1) + 65536 * b (k + 2) + 16777216 * b (k + 3));
 
   # Copy n bytes from src to dst. All reads see the memory before the copy, so
-  # overlapping ranges behave as memmove.
+  # overlapping ranges behave as memmove. A copy onto itself (dst == src) leaves every
+  # byte as it is, so the memory is returned unchanged: memmove gives the same bytes, and
+  # for memcpy, whose fully overlapping ranges are undefined in C, it is one of the
+  # results allowed. doom/run.nix relies on it to make the row copies of doomgeneric's
+  # I_FinishUpdate free.
   copyMem =
     mem: dst: src: n:
-    fill mem dst n (k: M.loadByte mem (src + k)) (k: M.loadWord mem (src + k));
+    if dst == src then
+      mem
+    else
+      fill mem dst n (k: M.loadByte mem (src + k)) (k: M.loadWord mem (src + k));
 
   setMem =
     mem: dst: c: n:

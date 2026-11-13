@@ -258,6 +258,60 @@ let
     ];
   };
 
+  # A guest with both buffers of doomgeneric: Create points DG_ScreenBuffer at out and
+  # I_VideoBuffer at video. Every frame writes its number to byte 0 and its number + 100 to
+  # byte 63999 of video, then copies video to DG_ScreenBuffer row by row, as I_FinishUpdate
+  # does, and draws.
+  videoGuest = Cc.linkSources {
+    units = [
+      {
+        name = "video";
+        src = ''
+          void *memcpy(void *dst, const void *src, unsigned int n);
+          void DG_DrawFrame(void);
+          unsigned char *DG_ScreenBuffer;
+          unsigned char *I_VideoBuffer;
+          unsigned colors[256];
+          unsigned char out[64000];
+          unsigned char video[64000];
+          int frames;
+          void finish(void) {
+            int y;
+            frames++;
+            I_VideoBuffer[0] = frames;
+            I_VideoBuffer[63999] = frames + 100;
+            for (y = 0; y < 200; y++)
+              memcpy(DG_ScreenBuffer + 320 * y, I_VideoBuffer + 320 * y, 320);
+            DG_DrawFrame();
+          }
+          void doomgeneric_Create(int argc, char **argv) {
+            DG_ScreenBuffer = out;
+            I_VideoBuffer = video;
+            finish();
+          }
+          void doomgeneric_Tick(void) { finish(); }
+        '';
+      }
+    ];
+  };
+  videoSym = videoGuest.__data.symbols;
+
+  # The driver over videoGuest for 2 ticks; acc lists bytes 0 and 63999 of each frame.
+  videoRun = import ../doom/run.nix {
+    linked = videoGuest;
+    args = [ "doom" ];
+    ticks = 2;
+    readKeys = _: null;
+    onTick =
+      info: acc:
+      acc
+      ++ map (f: [
+        (elemAt f.screen 0)
+        (elemAt f.screen 63999)
+      ]) info.frames;
+    init = [ ];
+  };
+
   # The driver over oddGuest with the key texts of ticks 1, 2, ...; acc lists per tick
   # the state of key a, the count of events taken and the events.
   runOdd =
@@ -923,6 +977,41 @@ in
       ""
       [ ]
     ]
+  )
+  (t "doom run: DG_ScreenBuffer points at I_VideoBuffer after Create, and the frames are the same"
+    [
+      (M.loadWord videoRun.mem videoSym.DG_ScreenBuffer == videoSym.video)
+      videoRun.acc
+      # Only the frame of Create was copied to out.
+      (M.loadByte videoRun.mem videoSym.out)
+      (M.loadByte videoRun.mem (videoSym.out + 63999))
+    ]
+    [
+      true
+      [
+        [
+          1
+          101
+        ]
+        [
+          2
+          102
+        ]
+        [
+          3
+          103
+        ]
+      ]
+      1
+      101
+    ]
+  )
+  (t "doom run: DG_ScreenBuffer is left as it is without I_VideoBuffer in the link"
+    [
+      (guest.__data.symbols ? I_VideoBuffer)
+      (M.loadWord keyRun.mem guest.__data.symbols.DG_ScreenBuffer == guest.__data.symbols.screen)
+    ]
+    [ false true ]
   )
   (t "doom run: no tick runs Create only"
     (

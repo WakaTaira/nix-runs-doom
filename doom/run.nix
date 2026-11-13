@@ -6,7 +6,10 @@
 #
 # linked    the result of a link with doomgeneric_Create (argc, argv), doomgeneric_Tick
 #           (no arguments), both returning void, and __init; with tics > 5 also
-#           TryRunTics (no arguments, returning void), else a throw
+#           TryRunTics (no arguments, returning void), else a throw. When its
+#           __data.symbols has both DG_ScreenBuffer and I_VideoBuffer, the driver sets the
+#           pointer DG_ScreenBuffer to the value of I_VideoBuffer after doomgeneric_Create
+#           (see aliasScreen below)
 # args      the argv strings; the strings go from 0x00100000, each ended by NUL (at
 #           most 4096 bytes in all, NULs included, else a throw), and the array of
 #           their addresses, ended by 0, to 0x00101000, below the data area
@@ -244,7 +247,32 @@ let
     in
     drain tick d.events (st // { inherit (d) keyState; }) (runTick d.mem);
 
-  created = linked.doomgeneric_Create (placeArgs (linked.__init M.empty)) (length args) argvAddr;
+  inherit (linked.__data) symbols;
+
+  # mem with the pointer DG_ScreenBuffer set to the value of I_VideoBuffer, when the link
+  # has both variables (doomgeneric does; otherwise mem as it is). I_FinishUpdate of
+  # doomgeneric's i_video.c copies the screen Doom draws on, I_VideoBuffer, to
+  # DG_ScreenBuffer row by row with memcpy, 200 copies of 320 bytes per frame (CMAP256
+  # with RESX 320 and RESY 200 gives 8 bits per pixel and fb_scaling 1, so every offset
+  # is 0 and the copy is 1:1). With both pointers equal every copy has dst == src, which
+  # the libc returns at once (copyMem in lib/libc.nix), and DG_DrawFrame reads the same
+  # bytes the copy would have written. The values are final after doomgeneric_Create:
+  # doomgeneric.c sets DG_ScreenBuffer only there (a malloc, before D_DoomMain), and
+  # I_VideoBuffer is set only by I_InitGraphics (a Z_Malloc with PU_STATIC, never purged),
+  # which D_DoomLoop calls at the end of D_DoomMain on every path; Z_Free in
+  # I_ShutdownGraphics runs only on quitting. The frame Create itself draws is copied as
+  # before. The 1:1 copy needs fb_scaling 1: a -scaling argument other than 1 would make
+  # I_FinishUpdate write past I_VideoBuffer.
+  aliasScreen =
+    mem:
+    if symbols ? DG_ScreenBuffer && symbols ? I_VideoBuffer then
+      M.storeWord mem symbols.DG_ScreenBuffer (M.loadWord mem symbols.I_VideoBuffer)
+    else
+      mem;
+
+  created = aliasScreen (
+    linked.doomgeneric_Create (placeArgs (linked.__init M.empty)) (length args) argvAddr
+  );
 
   start = drain 0 [ ] {
     keyState = {
