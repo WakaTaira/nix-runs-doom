@@ -1043,7 +1043,13 @@ let
     int bigIdx(unsigned char *d, unsigned char *t, int n, long long w) { while (n--) *d++ = t[(w + n) & 0x7fffffffffffffffLL]; return 0; }
     int bigSum(unsigned char *d, unsigned char *t, int n, long long w) { while (n--) *d++ = t[((w + n) & 0x7fffffffffffffffLL) + (w & 0x7fffffffffffffffLL)]; return 0; }
     int xDiv(unsigned char *d, int n, int x, int y) { int i = 0; while (n--) { d[i + x / y] = i; i++; } return i; }
-    int xFits(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[(int)(u >> 1)]; u += 2; } return 0; }
+    int xFits(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[(int)(u & 0x80000000u)]; u += 2; } return 0; }
+    int castInt(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[(int)(u >> 1)]; u += 2; } return 0; }
+    int castUint(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = t[(unsigned)(i & 7)]; i++; } return i; }
+    int castLong(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; while (n--) { *d++ = t[(long)(u & 7)]; u++; } return 0; }
+    int castSpot(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; int s = 99; while (n--) { s = (u >> 29) | (u & 7); *d++ = t[s]; u++; } return s; }
+    int xToUint(unsigned char *d, unsigned char *t, int n) { int k = 99; while (n--) { k = n - 2; *d++ = t[(unsigned)k]; } return k; }
+    int xSpot(unsigned char *d, unsigned char *t, int n) { unsigned u = 0; int s = 99; while (n--) { s = u & 0x80000007u; *d++ = t[s]; u++; } return s; }
     int wordAt(unsigned char *d, unsigned char *s, int n) { int r = 0; while (n--) { r = *(int *)s; *d++ = (r >> 24) + 1; } return r; }
     int words(unsigned char *d, unsigned char *t, int n) { int i = 0; while (n--) { *d++ = (((int *)t)[i & 3] >> 24) + 1; i++; } return 0; }
     int xTmp(unsigned char *d, int n) { int t = -1; while (n--) { if (n & 1) t = n; *d++ = t; } return t; }
@@ -1109,6 +1115,25 @@ let
   tabled = withBytes M.empty tab (genList (j: 10 * j + 10) 8);
   bulkFilled = bulkOn filled;
   bulkTabled = bulkOn tabled;
+  # The draw input with spot declared int, as in Doom's R_DrawSpan: the unsigned value of
+  # xtemp | ytemp is converted to int.
+  drawIntSpot = builtins.replaceStrings [ "unsigned spot;" ] [ "int spot;" ] Cc.examples.draw.src;
+  # The pixels (x = 160..319) of the first 64 rows after `unit` of the draw input src has
+  # drawn 64 spans and no columns on the spike image.
+  drawSpans =
+    src:
+    let
+      D = import ../bench/spike/data.nix;
+      f = Cc.load src;
+      image = D.image {
+        frames = 1;
+        columns = 0;
+        spans = 64;
+        muls = 0;
+      };
+      mem = f.unit (f.__data.init image) D.PARAMS;
+    in
+    concatMap (y: genList (x: M.loadByte mem (D.SCREEN + y * 320 + 160 + x)) 160) (genList (y: y) 64);
   # The bulk store that the generated fn of bulkSrc contains: "run", "stride" or "none".
   bulkWrite =
     fn:
@@ -1152,6 +1177,10 @@ let
     "bothRead"
     "wordAt"
     "words"
+    "castInt"
+    "castUint"
+    "castLong"
+    "castSpot"
   ];
   bulkExcluded = [
     "xRange"
@@ -1177,6 +1206,8 @@ let
     "xTwice"
     "xSra"
     "xDown"
+    "xToUint"
+    "xSpot"
   ];
   # The return values of steps for n = 3 iterations with the step c: a, b, x, y, z, u, q
   # and m.
@@ -6626,15 +6657,112 @@ in
       ]
     ]
   )
-  (t "cc bulk: a narrowing cast of a bounded value has no range"
-    (bulkTabled "xFits" [ buf tab 3 ] buf 3)
+  (t "cc bulk: an unsigned to int conversion of a bound of 2^31 or more has no range"
     [
-      0
+      (bulkTabled "xFits" [ buf tab 3 ] buf 3)
+      (bulkTabled "xSpot" [ buf tab 3 ] buf 3)
+    ]
+    [
+      [
+        0
+        [
+          10
+          10
+          10
+        ]
+        false
+      ]
+      [
+        2
+        [
+          10
+          20
+          30
+        ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: an int that may be negative has no range after a conversion to unsigned"
+    (bulkTabled "xToUint" [ buf tab 3 ] buf 3)
+    [
+      (-2)
       [
         10
-        20
-        30
+        0
+        0
       ]
+      false
+    ]
+  )
+  (t "cc bulk: conversions between 32-bit integers keep a bound below 2^31"
+    [
+      (bulkTabled "castInt" [ buf tab 3 ] buf 3)
+      (bulkTabled "castUint" [ buf tab 3 ] buf 3)
+      (bulkTabled "castLong" [ buf tab 3 ] buf 3)
+      (bulkTabled "castSpot" [ buf tab 3 ] buf 3)
+      (bulkTabled "castSpot" [ buf tab 0 ] buf 1)
+    ]
+    [
+      [
+        0
+        [
+          10
+          20
+          30
+        ]
+        true
+      ]
+      [
+        3
+        [
+          10
+          20
+          30
+        ]
+        true
+      ]
+      [
+        0
+        [
+          10
+          20
+          30
+        ]
+        true
+      ]
+      [
+        2
+        [
+          10
+          20
+          30
+        ]
+        true
+      ]
+      [
+        99
+        [ 0 ]
+        false
+      ]
+    ]
+  )
+  (t "cc bulk: the span loop of draw with an int spot, as in Doom, writes with storeRun"
+    (contains "M.storeRun" (fnCode drawIntSpot "R_DrawSpan"))
+    true
+  )
+  (t "cc bulk: the spans of draw with an int spot are those with an unsigned spot"
+    (
+      let
+        int = drawSpans drawIntSpot;
+      in
+      [
+        (int == drawSpans Cc.examples.draw.src)
+        (all (b: b == 0) int)
+      ]
+    )
+    [
+      true
       false
     ]
   )

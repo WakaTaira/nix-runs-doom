@@ -96,7 +96,9 @@
 #       E. Every load is at a constant address (the cached reads), at an invariant
 #          pointer plus an index known to lie in [0, U] (constants; unsigned char and
 #          short values; & with a constant or two known operands; | and ^; >> of unsigned
-#          by a constant; + below 2^31; widening casts; int and unsigned variables whose
+#          by a constant; + below 2^31; widening casts; conversions between int,
+#          unsigned, long and unsigned long of an index known to lie in [0, U] with
+#          U < 2^31, which leave its value unchanged; int and unsigned variables whose
 #          only assignment in the loop is a plain one or an initializer in the body, run
 #          on every iteration before the load), or at a0' + k * d' with d' >= 0 a constant
 #          (as in D).
@@ -2413,12 +2415,18 @@ let
       k == "cast" && T.isInteger e.type && T.isInteger e.expr.type && T.fits e.expr.type e.type
     then
       sub e.expr
+    else if k == "cast" && tagIn int32Tags e.type && tagIn int32Tags e.expr.type then
+      sameWord32 (sub e.expr)
     else if k == "var" then
       (if pure && env ? ${e.var.key} then env.${e.var.key} else null)
     else if k == "binop" then
       binopRange e (sub e.lhs) (sub e.rhs)
     else
       null;
+
+  # The bound u (or null) of a value in [0, u] after a conversion between 32-bit integer
+  # types: the value is unchanged, and keeps its bound, when u < 2^31.
+  sameWord32 = u: if u != null && u < pow31 then u else null;
 
   # The bound of the binop e with the bounds l and r (or null) of its operands.
   binopRange =
