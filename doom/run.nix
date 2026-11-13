@@ -1,7 +1,7 @@
 # The driver of a linked doomgeneric (doom/link.nix), or of any linked program with the
 # same entry points, on the host of cc/host.nix.
 #
-#   import ./run.nix { linked; args; ticks; readKeys; onTick; init; tics ? 0; }
+#   import ./run.nix { linked; args; ticks; readKeys; onTick; init; tics ? 0; view ? null; }
 #     -> { mem; last; frameCount; acc; msOfTic; }
 #
 # linked    the result of a link with doomgeneric_Create (argc, argv), doomgeneric_Tick
@@ -39,6 +39,11 @@
 #           releases were queued than N, and the file is read before nearly every tick;
 #           a single press stays held for the N tics of its tick and its release, made up
 #           by the next poll, comes at the first tic of the next tick
+# view      null, which leaves Doom's view window alone, or the screen size (blocks) of
+#           the view window, an integer from 3 to 10 (else a throw): after
+#           doomgeneric_Create the driver sets it as the menu would (see setView below),
+#           which needs R_SetViewSize (blocks, detail, returning void) and the variables
+#           screenblocks and detailLevel in the link, else a throw
 # onTick    { tick; frames; out; events; } -> acc -> acc, called after
 #           doomgeneric_Create (tick 0) and after each tick with the frame records drawn
 #           in it (scaffold/platform.nix), the guest output added in it and the key
@@ -64,6 +69,7 @@
   onTick,
   init,
   tics ? 0,
+  view ? null,
 }:
 let
   M = import ../lib/mem.nix;
@@ -276,8 +282,45 @@ let
     else
       mem;
 
-  created = aliasScreen (
-    linked.doomgeneric_Create (placeArgs (linked.__init M.empty)) (length args) argvAddr
+  # The parts of the link that setView uses, or a throw that names them.
+  viewParts =
+    if linked ? R_SetViewSize && symbols ? screenblocks && symbols ? detailLevel then
+      linked.R_SetViewSize
+    else
+      throw "doom: run: view = ${toString view} needs the function R_SetViewSize and the variables screenblocks and detailLevel in the link";
+
+  checkedView =
+    if isInt view && view >= 3 && view <= 10 then
+      view
+    else
+      throw "doom: run: view is neither null nor an integer from 3 to 10: ${builtins.toJSON view}";
+
+  # mem with the view window of Doom set to the screen size view (blocks), as the menu
+  # does with the - and = keys (M_SizeDisplay of m_menu.c): screenblocks and the menu's
+  # screenSize (blocks - 3, when the link has it) are written and R_SetViewSize is called
+  # with the current detailLevel; it only records the request, which the next D_Display
+  # carries out with R_ExecuteSetViewSize. Nothing overwrites the setting later: in
+  # d_main.c, M_LoadDefaults (the configuration file), M_Init (screenSize from
+  # screenblocks), R_Init (R_SetViewSize of the defaults) and the R_ExecuteSetViewSize of
+  # D_DoomLoop all run inside doomgeneric_Create, and afterwards only the menu calls
+  # R_SetViewSize and writes screenblocks (M_SizeDisplay, M_ChangeDetail), so a size the
+  # player picks with - and = stays in effect. With view = null mem is left as it is.
+  setView =
+    mem:
+    if view == null then
+      mem
+    else
+      let
+        blocks = checkedView;
+        setSize = viewParts;
+        withBlocks = M.storeWord mem symbols.screenblocks blocks;
+        withSize =
+          if symbols ? screenSize then M.storeWord withBlocks symbols.screenSize (blocks - 3) else withBlocks;
+      in
+      setSize withSize blocks (M.loadWord mem symbols.detailLevel);
+
+  created = setView (
+    aliasScreen (linked.doomgeneric_Create (placeArgs (linked.__init M.empty)) (length args) argvAddr)
   );
 
   start = drain 0 [ ] {

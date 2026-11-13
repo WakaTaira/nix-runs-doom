@@ -11,11 +11,13 @@
 #   ms          virtual clock in milliseconds; only DG_SleepMs advances it
 #   frameCount  number of DG_DrawFrame calls
 #   frames      one record per DG_DrawFrame, oldest first:
-#                 { instrs; screen; palette; }
+#                 { instrs; screen; palette; mem; screenAddr; }
 #               instrs is the instruction count at the call (see `dispatch` in
 #               lib/hostcall.nix for its precision), screen the 320x200 palette
 #               indices (list of 64000 bytes) and palette 256 { r; g; b; }. screen and
-#               palette are read lazily from the memory snapshot taken at the call.
+#               palette are read lazily from the memory snapshot taken at the call, which
+#               is mem itself, and screenAddr is the value of DG_ScreenBuffer in it (lazy
+#               too), for readers that take only part of the screen from the memory.
 #   keys        the pending key events, oldest first: { pressed; key; } (pressed 0 or 1,
 #               key a number of doomkeys.h); DG_GetKey takes them from the front
 { screenBufferAddr, colorsAddr }:
@@ -54,7 +56,8 @@ let
 
   # A frame record over the memory snapshot `mem`; the attribute values stay lazy.
   frameOf = mem: instrs: {
-    inherit instrs;
+    inherit instrs mem;
+    screenAddr = M.loadWord mem screenBufferAddr;
     screen = readBytes mem (M.loadWord mem screenBufferAddr) screenBytes;
     palette = genList (
       i:

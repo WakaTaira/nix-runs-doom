@@ -400,6 +400,63 @@ let
     };
   videoRun = videoRunOf videoGuest;
 
+  # A guest with the parts of Doom that the driver uses to set the view window:
+  # R_SetViewSize records its arguments and counts its calls, Create sets screenSize from
+  # screenblocks as M_Init does and draws one frame.
+  viewGuest = Cc.linkSources {
+    units = [
+      {
+        name = "view";
+        src = ''
+          void DG_DrawFrame(void);
+          unsigned char *DG_ScreenBuffer;
+          unsigned colors[256];
+          unsigned char screen[64000];
+          int screenblocks = 10;
+          int screenSize;
+          int detailLevel = 1;
+          int setblocks;
+          int setdetail;
+          int calls;
+          void R_SetViewSize(int blocks, int detail) {
+            setblocks = blocks;
+            setdetail = detail;
+            calls++;
+          }
+          void doomgeneric_Create(int argc, char **argv) {
+            DG_ScreenBuffer = screen;
+            screenSize = screenblocks - 3;
+            DG_DrawFrame();
+          }
+          void doomgeneric_Tick(void) { DG_DrawFrame(); }
+        '';
+      }
+    ];
+  };
+
+  # The driver over linked with view for one tick.
+  viewRunOf =
+    linked: view:
+    import ../doom/run.nix {
+      inherit linked view;
+      args = [ "doom" ];
+      ticks = 1;
+      readKeys = _: null;
+      onTick = _: acc: acc;
+      init = null;
+    };
+
+  # calls, setblocks, setdetail, screenblocks and screenSize after a run of viewGuest.
+  viewState =
+    view:
+    map (n: M.loadWord (viewRunOf viewGuest view).mem viewGuest.__data.symbols.${n}) [
+      "calls"
+      "setblocks"
+      "setdetail"
+      "screenblocks"
+      "screenSize"
+    ];
+
   # The driver over oddGuest with the key texts of ticks 1, 2, ...; acc lists per tick
   # the state of key a, the count of events taken and the events.
   runOdd =
@@ -1155,6 +1212,20 @@ in
       [ ]
     ]
   )
+  (t "doom run: a frame record holds the memory of its frame and the address of the screen"
+    [
+      (keyRun.last.screenAddr == guest.__data.symbols.screen)
+      (genList (i: M.loadByte keyRun.last.mem (keyRun.last.screenAddr + i)) 3)
+    ]
+    [
+      true
+      [
+        1
+        1
+        173
+      ]
+    ]
+  )
   (t "doom run: DG_ScreenBuffer points at I_VideoBuffer after Create, and the frames are the same"
     [
       (M.loadWord videoRun.mem videoSym.DG_ScreenBuffer == videoSym.video)
@@ -1239,6 +1310,52 @@ in
         ]
         103
       ]
+    ]
+  )
+  (t "doom run: view sets the view window as the menu does, and null leaves it alone"
+    [
+      (viewState 5)
+      (viewState 10)
+      (viewState null)
+    ]
+    [
+      [
+        1
+        5
+        1
+        5
+        2
+      ]
+      [
+        1
+        10
+        1
+        10
+        7
+      ]
+      [
+        0
+        0
+        0
+        10
+        7
+      ]
+    ]
+  )
+  (t "doom run: view needs R_SetViewSize, screenblocks and detailLevel, and blocks from 3 to 10"
+    [
+      (throws (viewRunOf guest 5).frameCount)
+      (throws (viewRunOf guest null).frameCount)
+      (throws (viewRunOf viewGuest 2).frameCount)
+      (throws (viewRunOf viewGuest 11).frameCount)
+      (throws (viewRunOf viewGuest 3).frameCount)
+    ]
+    [
+      true
+      false
+      true
+      true
+      false
     ]
   )
   (t "doom run: DG_ScreenBuffer is left as it is without I_VideoBuffer in the link"
