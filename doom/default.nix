@@ -36,6 +36,9 @@
 #   DOOM_KEYS     path of the key file, read again before every tick at which no key
 #                 event is pending (doom/run.nix, doom/keys.nix poll); no input
 #                 without it
+#   DOOM_KEYS_PROTO  how the key file is decoded (doom/run.nix keyProto): legacy (the
+#                 default) for the bytes of a terminal in its usual mode, kitty for those
+#                 of a terminal in the kitty keyboard protocol (doom/keys.nix pollKitty)
 #   COLUMNS, LINES  the terminal size; 160 and 52 without them
 let
   R = import ./render.nix;
@@ -111,6 +114,18 @@ let
   # The text of the key file, read again at each call.
   readKeys = if keysPath == "" then _: null else _: readFile keysPath;
 
+  # The key protocol of the key file (doom/run.nix keyProto).
+  keyProto =
+    let
+      v = getEnv "DOOM_KEYS_PROTO";
+    in
+    if v == "" then
+      "legacy"
+    else if v == "legacy" || v == "kitty" then
+      v
+    else
+      throw "doom: DOOM_KEYS_PROTO is neither legacy nor kitty: '${v}'";
+
   size = R.fit {
     columns = numberOr "COLUMNS" 160;
     lines = numberOr "LINES" 52;
@@ -147,6 +162,7 @@ let
         tics
         view
         readKeys
+        keyProto
         onTick
         init
         ;
@@ -213,6 +229,8 @@ let
     "9" = "Tab";
     "162" = "Use";
     "163" = "Fire";
+    "182" = "Shift";
+    "184" = "Alt";
   };
 
   # The name of a doomkeys.h number: a word for the special keys, else the character.

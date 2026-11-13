@@ -1,7 +1,8 @@
 # The driver of a linked doomgeneric (doom/link.nix), or of any linked program with the
 # same entry points, on the host of cc/host.nix.
 #
-#   import ./run.nix { linked; args; ticks; readKeys; onTick; init; tics ? 0; view ? null; }
+#   import ./run.nix { linked; args; ticks; readKeys; onTick; init; tics ? 0; view ? null;
+#                      keyProto ? "legacy"; }
 #     -> { mem; last; frameCount; acc; msOfTic; }
 #
 # linked    the result of a link with doomgeneric_Create (argc, argv), doomgeneric_Tick
@@ -28,9 +29,10 @@
 #           and ceil(N / 5) per tick above
 # readKeys  tick -> the whole text of the key file just before that tick, or null for
 #           no input; before a tick at which no key event is pending (mem.host.keys is
-#           empty) the text is polled with doom/keys.nix and the events are put in
-#           mem.host.keys; while events are pending, readKeys is not called and the key
-#           state is kept, so the bytes not read are decoded together at the next poll.
+#           empty) the text is polled with doom/keys.nix (see keyProto) and the events
+#           are put in mem.host.keys; while events are pending, readKeys is not called and
+#           the key state is kept, so the bytes not read are decoded together at the next
+#           poll.
 #           With tics = 0 doomgeneric takes key events only at every other tick:
 #           polling at every tick would queue the release of a single press with the
 #           press itself, and the two would cancel out in one take. With tics >= 1 Doom
@@ -38,7 +40,14 @@
 #           including the first release), so the queue is empty after a tick unless more
 #           releases were queued than N, and the file is read before nearly every tick;
 #           a single press stays held for the N tics of its tick and its release, made up
-#           by the next poll, comes at the first tic of the next tick
+#           (legacy) or put off (kitty) by the next poll, comes at the first tic of the
+#           next tick
+# keyProto  how the key file is decoded, the same for both as to when it is polled:
+#           "legacy" (the default; poll of doom/keys.nix, for a terminal in its usual
+#           mode, with made-up releases) or "kitty" (pollKitty, for a terminal in the
+#           kitty keyboard protocol: the presses and releases the terminal reports, the
+#           release of a key pressed and released between two polls put off to the next
+#           poll); anything else is a throw
 # view      null, which leaves Doom's view window alone, or the screen size (blocks) of
 #           the view window, an integer from 3 to 10 (else a throw): after
 #           doomgeneric_Create the driver sets it as the menu would (see setView below),
@@ -70,6 +79,7 @@
   init,
   tics ? 0,
   view ? null,
+  keyProto ? "legacy",
 }:
 let
   M = import ../lib/mem.nix;
@@ -164,7 +174,7 @@ let
             events = [ ];
           }
         else
-          Keys.poll st.keyState text;
+          protocol.poll st.keyState text;
       host = st.mem.host;
     in
     deepSeq polled {
@@ -323,12 +333,32 @@ let
     aliasScreen (linked.doomgeneric_Create (placeArgs (linked.__init M.empty)) (length args) argvAddr)
   );
 
-  start = drain 0 [ ] {
-    keyState = {
-      consumed = 0;
-      stalled = 0;
-      held = [ ];
+  # The poll of each key protocol and its key state before the first poll.
+  protocols = {
+    legacy = {
+      inherit (Keys) poll;
+      start = {
+        consumed = 0;
+        stalled = 0;
+        held = [ ];
+      };
     };
+    kitty = {
+      poll = Keys.pollKitty;
+      start = {
+        consumed = 0;
+        held = [ ];
+        carried = [ ];
+      };
+    };
+  };
+
+  protocol =
+    protocols.${keyProto}
+      or (throw "doom: run: keyProto is neither \"legacy\" nor \"kitty\": ${builtins.toJSON keyProto}");
+
+  start = drain 0 [ ] {
+    keyState = protocol.start;
     acc = init;
     last = null;
   } created;

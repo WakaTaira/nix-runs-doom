@@ -700,6 +700,80 @@ let
         )).mem.host.keys
     ) 3;
 
+  # A guest that takes key events at every tick, as i_input.c does (until none is left or
+  # after the first release), and keeps the state of each key as gamekeydown does.
+  # Create draws nothing; each tick draws one frame: screen bytes 0, 1 and 2 are the
+  # states of up (173), right (174) and fire (163), byte 3 the count of events taken.
+  kittyGuest = Cc.linkSources {
+    units = [
+      {
+        name = "kitty";
+        src = ''
+          int DG_GetKey(int *pressed, unsigned char *key);
+          void DG_DrawFrame(void);
+          unsigned char *DG_ScreenBuffer;
+          unsigned colors[256];
+          unsigned char screen[64000];
+          unsigned char down[256];
+          void doomgeneric_Create(int argc, char **argv) { DG_ScreenBuffer = screen; }
+          void doomgeneric_Tick(void) {
+            int pressed;
+            unsigned char key;
+            int n = 0;
+            while (DG_GetKey(&pressed, &key)) {
+              down[key] = pressed;
+              n++;
+              if (!pressed) break;
+            }
+            screen[0] = down[173];
+            screen[1] = down[174];
+            screen[2] = down[163];
+            screen[3] = n;
+            DG_DrawFrame();
+          }
+        '';
+      }
+    ];
+  };
+
+  # The driver over kittyGuest with keyProto and the key texts of ticks 1, 2, ...; acc
+  # lists per tick the key events sent and the first 4 screen bytes of each frame.
+  runKittyWith =
+    keyProto: texts:
+    import ../doom/run.nix {
+      linked = kittyGuest;
+      inherit keyProto;
+      args = [ "doom" ];
+      ticks = length texts;
+      readKeys = tick: elemAt texts (tick - 1);
+      onTick =
+        info: acc:
+        acc
+        ++ [
+          {
+            inherit (info) events;
+            frames = map (f: genList (elemAt f.screen) 4) info.frames;
+          }
+        ];
+      init = [ ];
+    };
+  runKitty = runKittyWith "kitty";
+
+  # Up pressed, right pressed and released while up stays down, then control pressed and
+  # released before one poll, and nothing more.
+  kittyTexts = growing [
+    (csi "A")
+    (csi "C")
+    (csi "1;1:3C")
+    ctrlTap
+    ""
+    ""
+  ];
+
+  # Texts that tap a and b once more before every tick.
+  tapTexts = growing (genList (_: csi "97u" + csi "97;1:3u" + csi "98u" + csi "98;1:3u") 8);
+  pendingKitty = n: length (runKitty (genList (elemAt tapTexts) n)).mem.host.keys;
+
   throws = x: !(builtins.tryEval (builtins.deepSeq x x)).success;
 in
 [
@@ -2330,6 +2404,125 @@ in
     [
       true
       2
+      true
+      true
+    ]
+  )
+  (t
+    "doom run: kitty keeps up down while right is pressed and released, and holds a tap of control for one tick"
+    (runKitty kittyTexts).acc
+    [
+      {
+        events = [ ];
+        frames = [ ];
+      }
+      {
+        events = [ (press 173) ];
+        frames = [
+          [
+            1
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (press 174) ];
+        frames = [
+          [
+            1
+            1
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (release 174) ];
+        frames = [
+          [
+            1
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (press 163) ];
+        frames = [
+          [
+            1
+            0
+            1
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (release 163) ];
+        frames = [
+          [
+            1
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ ];
+        frames = [
+          [
+            1
+            0
+            0
+            0
+          ]
+        ];
+      }
+    ]
+  )
+  (t "doom run: kitty leaves no event pending over the held keys" (genList (
+    n: length (runKitty (genList (elemAt kittyTexts) (n + 1))).mem.host.keys
+  ) 6) (genList (_: 0) 6))
+  (t "doom run: kitty pending key events stay at most 3 when two keys are tapped before every tick"
+    (genList (n: pendingKitty (n + 1)) 8)
+    [
+      0
+      3
+      2
+      0
+      3
+      2
+      0
+      3
+    ]
+  )
+  (t "doom run: keyProto legacy is the default, and another keyProto is a throw"
+    [
+      (
+        (runKittyWith "legacy" kittyTexts).acc == (import ../doom/run.nix {
+          linked = kittyGuest;
+          args = [ "doom" ];
+          ticks = 6;
+          readKeys = tick: elemAt kittyTexts (tick - 1);
+          onTick =
+            info: acc:
+            acc
+            ++ [
+              {
+                inherit (info) events;
+                frames = map (f: genList (elemAt f.screen) 4) info.frames;
+              }
+            ];
+          init = [ ];
+        }).acc
+      )
+      (throws (runKittyWith "xterm" [ ]).frameCount)
+    ]
+    [
       true
       true
     ]
