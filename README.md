@@ -12,7 +12,7 @@ You need Nix with flakes and a Doom WAD. The shareware `doom1.wad` is freely dis
 nix run github:WakaTaira/nix-runs-doom#play -- /path/to/doom1.wad
 ```
 
-Inside a clone, `nix run .#play -- /path/to/doom1.wad` does the same. The WAD is converted to hex text once and cached in `~/.cache/nix-doom`. The first frame appears after about 45 seconds on the author's machine, because all 80 files are compiled at every start.
+Inside a clone, `nix run .#play -- /path/to/doom1.wad` does the same. The WAD is converted to hex text once and cached in `~/.cache/nix-runs-doom`. The first frame appears after about 45 seconds on the author's machine, because all 80 files are compiled at every start.
 
 The launcher (`toolchain/play.nix`) is a short shell script and does no Doom computation. An evaluation cannot read a terminal, so the launcher puts the terminal in raw mode, writes the keys to a file, starts `nix eval -f . doom.play`, and copies the frames from the log of the evaluation to the screen.
 
@@ -27,7 +27,7 @@ The launcher (`toolchain/play.nix`) is a short shell script and does no Doom com
 | Enter | Confirm |
 | Ctrl-C | Quit |
 
-Holding several keys at once, and Ctrl, Shift and Alt alone, work only in a terminal that speaks the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) with release events. In other terminals a key counts as pressed for one frame after you press it, and `x` is the way to fire. Inside a terminal multiplexer, release events may get lost.
+Holding several keys at once, and Ctrl, Shift and Alt alone, need a terminal that reports key releases: one that speaks the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), or Windows Terminal through its win32-input-mode. The launcher asks the terminal and picks what it supports. In other terminals a key counts as pressed for one frame after you press it, and `x` is the way to fire. Inside a terminal multiplexer, release events may get lost.
 
 Without the launcher (the environment variables are described in `CLAUDE.md` and `doom/default.nix`):
 
@@ -64,7 +64,7 @@ Some limits of an evaluation, and how the project works around them:
 - **Input.** A pure evaluation cannot wait for a key, and `builtins.readFile` of a FIFO does not work. A regular file, however, is read again at every `readFile`. The launcher appends the keys to a file and the driver reads it before every frame.
 - **Time.** An evaluation cannot observe a clock. Doom's clock is virtual: the driver moves it, so each frame runs a fixed number of game tics (`DOOM_TICS`, 5 by default).
 - **Output.** `builtins.trace` is the only way to print during an evaluation, and the usual log format drops cursor movements. The launcher runs Nix with `--log-format internal-json`, which keeps a trace whole, and draws each frame over the previous one.
-- **Keys held down.** Terminals do not report key releases, except with the kitty keyboard protocol. The launcher asks for it when the terminal supports it. Otherwise the driver makes up the releases.
+- **Keys held down.** Terminals do not report key releases, except with the kitty keyboard protocol or the win32-input-mode of Windows Terminal. The launcher asks for one of them when the terminal supports it. Otherwise the driver makes up the releases.
 - **Memory.** The guest memory is a persistent 4-level trie (`lib/mem.nix`), so a store copies four small nodes and the old memory stays valid.
 
 More detail is in `docs/design.md`.
@@ -93,7 +93,7 @@ This is slow. A frame is slower than the 35 tics per second Doom is built for, w
 - No mouse.
 - Low frame rate (see above). Maps with many monsters are slower.
 - The clock is virtual. Time passes in fixed steps per frame, not with the wall clock.
-- Quitting Doom ends the evaluation with an error, because `exit` is a `throw`.
+- Quitting Doom ends the evaluation with an error, because `exit` is a `throw`. The launcher reads the status from it and treats exit 0 as a normal end.
 - The compiler is for running Doom. It is not a general C compiler (see "Deliberate deviations from C" in `docs/design.md`).
 
 ## Tested on

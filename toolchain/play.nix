@@ -11,7 +11,7 @@
 #
 # The WAD may also be given as DOOM_WAD, or as hex text (a name ending in .hex, or
 # DOOM_WAD_HEX). A binary WAD is converted to hex text once, into the cache directory
-# ($XDG_CACHE_HOME or ~/.cache, under nix-doom). DOOM_TICS, DOOM_TICKS, DOOM_VIEW and
+# ($XDG_CACHE_HOME or ~/.cache, under nix-runs-doom). DOOM_TICS, DOOM_TICKS, DOOM_VIEW and
 # DOOM_ARGS are passed on; GC_INITIAL_HEAP_SIZE is 4g unless set.
 #
 # Screen: when standard error is a terminal (and unless DOOM_STREAM=scroll), every frame
@@ -58,16 +58,21 @@
 # the win32-input-mode resets the mode (CSI ? 9001 l), in both cases drops what the
 # terminal still sends within 0.3 s (the releases of the last keys), and restores the
 # terminal.
+#
+# Doom ends by calling exit, which ends the evaluation with the error "libc: exit:
+# <status>" (cc/host.nix). The launcher reads that status from the log: exit 0 (Quit Game)
+# is a normal end and prints nothing; another status prints what Doom said and fails.
 {
   pkgs,
   doomgeneric,
   self,
 }:
 pkgs.writeShellApplication {
-  name = "nix-doom-play";
+  name = "nix-runs-doom";
   runtimeInputs = [
     pkgs.coreutils
     pkgs.gnugrep
+    pkgs.gnused
     pkgs.jq
   ];
   text = ''
@@ -84,14 +89,14 @@ pkgs.writeShellApplication {
     case "$proto" in
       "" | kitty | win32 | legacy) ;;
       *)
-        echo "nix-doom-play: DOOM_KEYS_PROTO is not kitty, win32 or legacy: $proto" >&2
+        echo "nix-runs-doom: DOOM_KEYS_PROTO is not kitty, win32 or legacy: $proto" >&2
         exit 2
         ;;
     esac
     case "$stream" in
       "" | home | scroll) ;;
       *)
-        echo "nix-doom-play: DOOM_STREAM is neither home nor scroll: $stream" >&2
+        echo "nix-runs-doom: DOOM_STREAM is neither home nor scroll: $stream" >&2
         exit 2
         ;;
     esac
@@ -104,7 +109,7 @@ pkgs.writeShellApplication {
       case "$wad" in
         *.hex) hex=$wad ;;
         *)
-          cache=''${XDG_CACHE_HOME:-$HOME/.cache}/nix-doom
+          cache=''${XDG_CACHE_HOME:-$HOME/.cache}/nix-runs-doom
           mkdir -p "$cache"
           hex=$cache/$(basename "$wad").hex
           if [ ! -s "$hex" ] || [ "$wad" -nt "$hex" ]; then
@@ -116,11 +121,11 @@ pkgs.writeShellApplication {
       esac
     fi
     if [ ! -r "$hex" ]; then
-      echo "nix-doom-play: cannot read $hex" >&2
+      echo "nix-runs-doom: cannot read $hex" >&2
       exit 1
     fi
 
-    keys=$(mktemp "''${TMPDIR:-/tmp}/nix-doom-keys.XXXXXX")
+    keys=$(mktemp "''${TMPDIR:-/tmp}/nix-runs-doom-keys.XXXXXX")
     fifo=$keys.fifo
     log=$keys.log
     out=$keys.out
@@ -135,6 +140,7 @@ pkgs.writeShellApplication {
     watch_pid=""
     reader_status=0
     eval_status=0
+    final=""
 
     # The kitty flags in the reply of the terminal to CSI ? u followed by CSI c, read up to
     # the c that ends the reply to CSI c (2 s at most); nothing when there are none.
@@ -250,6 +256,18 @@ pkgs.writeShellApplication {
       [ "$reader_status" = 130 ] || ctrl_c
     }
 
+    # The status with which Doom called exit, from the error that ends the evaluation
+    # ("libc: exit: <status>", cc/host.nix), or nothing when Doom did not exit.
+    doom_status() {
+      grep -a -o 'libc: exit: -\?[0-9]\+' "$log" 2>/dev/null | tail -n 1 | grep -o -- '-\?[0-9]\+$' || true
+    }
+
+    # What Doom printed that was not shown, when it exits with an error: the text from
+    # "libc: exit: <status>" on (cc/host.nix appends the output not yet shown to it).
+    doom_message() {
+      sed -n '/libc: exit: /,$p' "$log" | sed '1s/^.*libc: exit: /doom: exit /'
+    }
+
     # Stops the evaluation and waits up to 5 s for it and the filter to end, then kills
     # them; sets eval_status.
     stop_eval() {
@@ -285,10 +303,22 @@ pkgs.writeShellApplication {
       fi
       stty "$saved"
       if [ -n "$alternate" ]; then
-        if [ "$eval_status" != 0 ] && ! stopped_by_user; then cat "$log" >&2 || true; fi
+        # Doom quitting (exit 0) is not an error, although it ends the evaluation with
+        # one; a failing exit shows what Doom said, any other failure the whole log.
+        local status
+        status=$(doom_status)
+        if [ "$status" = 0 ]; then
+          final=0
+        elif [ -n "$status" ]; then
+          doom_message >&2 || true
+          final=1
+        elif [ "$eval_status" != 0 ] && ! stopped_by_user; then
+          cat "$log" >&2 || true
+        fi
         cat "$out" 2>/dev/null || true
       fi
       rm -f "$keys" "$keys.pid" "$fifo" "$log" "$out"
+      if [ -n "$final" ]; then exit "$final"; fi
     }
     trap finish EXIT
     trap : INT
@@ -323,11 +353,11 @@ pkgs.writeShellApplication {
         if [ "$proto" = legacy ] && [ "$asked" != kitty ] && win32_known; then set_win32; fi
         ;;
     esac
-    echo "nix-doom-play: keys: $proto" >&2
+    echo "nix-runs-doom: keys: $proto" >&2
 
     args="''${DOOM_ARGS:-} $*"
     if [ "$stream" = home ]; then
-      echo "nix-doom-play: the first frame takes about a minute" >&2
+      echo "nix-runs-doom: the first frame takes about a minute" >&2
       mkfifo "$fifo"
       filter_log < "$fifo" >&2 2> "$log" &
       filter_pid=$!
