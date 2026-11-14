@@ -47,7 +47,8 @@
 #           mode, with made-up releases) or "kitty" (pollKitty, for a terminal in the
 #           kitty keyboard protocol: the presses and releases the terminal reports, the
 #           release of a key pressed and released between two polls put off to the next
-#           poll); anything else is a throw
+#           poll; until the terminal reports its first release, the releases are made up
+#           as in legacy mode); anything else is a throw
 # view      null, which leaves Doom's view window alone, or the screen size (blocks) of
 #           the view window, an integer from 3 to 10 (else a throw): after
 #           doomgeneric_Create the driver sets it as the menu would (see setView below),
@@ -349,6 +350,7 @@ let
         consumed = 0;
         held = [ ];
         carried = [ ];
+        trusted = false;
       };
     };
   };

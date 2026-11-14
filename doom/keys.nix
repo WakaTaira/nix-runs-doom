@@ -6,7 +6,7 @@
 #   decodeFinal : bytes -> keys
 #   poll     : { consumed; stalled; held; } -> text -> { state; events; }
 #   decodeKitty : bytes -> { keys; rest; }
-#   pollKitty   : { consumed; held; carried; } -> text -> { state; events; }
+#   pollKitty   : { consumed; held; carried; trusted; } -> text -> { state; events; }
 #
 # bytes is a list of byte values (-1 allowed, for a byte of 0x80 or more); keys is a list
 # of doomkeys.h numbers in order of appearance, duplicates included. decode and poll read
@@ -70,6 +70,14 @@
 #     an ESC that never gets its sequence is dropped once the next bytes arrive.
 #   - Any other byte, which a terminal that ignores flag 8 might send, is the key of decode
 #     pressed and released at once (dropped when decode drops it).
+#
+# pollKitty trusts the terminal to report releases only from the first release event it
+# sends (an event whose type the terminal wrote, `:3`). Some terminals accept the flags and
+# answer the query with them, yet send presses only; a key would then stay down for ever
+# and its next press would be ignored. Until a release has been seen, pollKitty makes up
+# the releases as poll does (a key is down from the read that finds its press until the
+# next read); the first reported release, usually that of the Enter that started the
+# program, switches to the reported presses and releases described next.
 #
 # pollKitty decodes the part of the text after consumed (from the front when the text got
 # shorter, as poll does) and turns the events into presses and releases with no made-up
@@ -410,7 +418,16 @@ let
           null;
       type = if p.event == null then typePress else p.event;
     in
-    if p == null || key == null || type < 1 || type > 3 then [ ] else [ { inherit key type; } ];
+    if p == null || key == null || type < 1 || type > 3 then
+      [ ]
+    else
+      [
+        {
+          inherit key type;
+          # The terminal wrote the event type itself (see pollKitty about trust).
+          explicit = p.event != null;
+        }
+      ];
 
   # A byte outside any escape sequence is a press and a release at once.
   tap =
@@ -429,7 +446,7 @@ let
         }
       ];
 
-  decodeKitty =
+  decodeKittyMarked =
     bytes:
     let
       n = length bytes;
@@ -477,6 +494,14 @@ let
     in
     scan n (tokensOf token n);
 
+  # decodeKittyMarked without the mark `explicit` of its events.
+  decodeKitty =
+    bytes:
+    let
+      d = decodeKittyMarked bytes;
+    in
+    d // { keys = map (e: { inherit (e) key type; }) d.keys; };
+
   without = k: builtins.filter (x: x != k);
 
   # One event of a read applied to { held; carried; fresh; events; } (see the header).
@@ -513,25 +538,41 @@ let
       reset = stringLength text < state.consumed;
       consumed = if reset then 0 else state.consumed;
       fresh = bytesOfText (substring consumed (stringLength text - consumed) text);
-      d = decodeKitty fresh;
+      d = decodeKittyMarked fresh;
       start = {
         held = builtins.filter (k: !(builtins.elem k state.carried)) state.held;
         carried = [ ];
         fresh = [ ];
         events = map release state.carried;
       };
-      r = foldl' (
+      reported = foldl' (
         s: e:
         let
           s' = kittyStep s e;
         in
         builtins.deepSeq s' s'
       ) start d.keys;
+
+      # A terminal is trusted to report releases from the first release it reports.
+      trusted =
+        (state.trusted or false) || builtins.any (e: e.type == typeRelease && (e.explicit or false)) d.keys;
+
+      # Until then releases are made up as in poll: the keys pressed in this read are
+      # pressed (again), the keys held before and not pressed now are released.
+      now = unique (map (e: e.key) (builtins.filter (e: e.type != typeRelease) d.keys));
+      madeUp = {
+        held = now;
+        carried = [ ];
+        events = map press now ++ map release (builtins.filter (k: !(builtins.elem k now)) state.held);
+      };
+
+      r = if trusted then reported else madeUp;
     in
     {
       state = {
         consumed = consumed + length fresh - d.rest;
         inherit (r) held carried;
+        inherit trusted;
       };
       inherit (r) events;
     };

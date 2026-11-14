@@ -81,14 +81,21 @@ let
   kittyOf = s: (K.decodeKitty (bytesOf s)).keys;
   kittyRestOf = s: (K.decodeKitty (bytesOf s)).rest;
   ev = key: type: { inherit key type; };
+  # The state of a terminal already trusted to report releases, and of one not yet.
   kittyInitial = {
     consumed = 0;
     held = [ ];
     carried = [ ];
+    trusted = true;
   };
-  kittyEventsOf = texts: map (r: r.events) (pollAllWith K.pollKitty kittyInitial texts);
-  kittyStateAfter =
-    texts: (elemAt (pollAllWith K.pollKitty kittyInitial texts) (length texts - 1)).state;
+  kittyUntrusted = kittyInitial // {
+    trusted = false;
+  };
+  kittyEventsOfFrom = start: texts: map (r: r.events) (pollAllWith K.pollKitty start texts);
+  kittyStateAfterFrom =
+    start: texts: (elemAt (pollAllWith K.pollKitty start texts) (length texts - 1)).state;
+  kittyEventsOf = kittyEventsOfFrom kittyInitial;
+  kittyStateAfter = kittyStateAfterFrom kittyInitial;
   # The texts of successive polls of a file to which each of parts is appended in turn.
   growing = parts: genList (i: concatStringsSep "" (genList (elemAt parts) (i + 1))) (length parts);
   ctrlTap = csi "57442;5u" + csi "57442;1:3u";
@@ -759,10 +766,12 @@ let
     };
   runKitty = runKittyWith "kitty";
 
-  # Up pressed, right pressed and released while up stays down, then control pressed and
-  # released before one poll, and nothing more.
+  # The release of Enter that started the program, which a terminal in the kitty protocol
+  # reports first, makes the driver trust the terminal. Then up pressed, right pressed and
+  # released while up stays down, then control pressed and released before one poll, and
+  # nothing more.
   kittyTexts = growing [
-    (csi "A")
+    (csi "13;1:3u" + csi "A")
     (csi "C")
     (csi "1;1:3C")
     ctrlTap
@@ -1218,6 +1227,7 @@ in
       consumed = 14;
       held = [ 173 ];
       carried = [ ];
+      trusted = true;
     }
   )
   (t "doom kitty: poll puts off the release of a press and release in one read"
@@ -1236,6 +1246,7 @@ in
     consumed = 22;
     held = [ 163 ];
     carried = [ 163 ];
+    trusted = true;
   })
   (t "doom kitty: poll releases a put-off key before the events of the next read"
     (kittyEventsOf (growing [
@@ -1325,6 +1336,7 @@ in
       consumed = 3;
       held = [ 173 ];
       carried = [ ];
+      trusted = true;
     }
   )
   (t "doom kitty: poll starts over when the file got shorter"
@@ -1354,6 +1366,7 @@ in
           175
         ];
         carried = [ ];
+        trusted = true;
       }
     ]
   )
@@ -1365,6 +1378,7 @@ in
         consumed = 100013;
         held = [ 97 ];
         carried = [ 97 ];
+        trusted = true;
       };
     }
   )
@@ -1386,6 +1400,7 @@ in
         97
         98
       ];
+      trusted = true;
     };
   })
   (t "doom kitty: poll of ESC [ A repeated over 200,000 bytes" (K.pollKitty kittyInitial longArrows) {
@@ -1394,8 +1409,154 @@ in
       consumed = 199998;
       held = [ 173 ];
       carried = [ ];
+      trusted = true;
     };
   })
+  (t "doom kitty: before a release is seen, a press with no more bytes is released at the next poll"
+    (kittyEventsOfFrom kittyUntrusted (growing [
+      (csi "13u")
+      ""
+      (csi "13u")
+      ""
+    ]))
+    [
+      [ (press 13) ]
+      [ (release 13) ]
+      [ (press 13) ]
+      [ (release 13) ]
+    ]
+  )
+  (t "doom kitty: before a release is seen, a key pressed at every poll is never released"
+    (kittyEventsOfFrom kittyUntrusted (growing [
+      (csi "97u")
+      (csi "97u")
+      (csi "97;1:2u")
+    ]))
+    [
+      [ (press 97) ]
+      [ (press 97) ]
+      [ (press 97) ]
+    ]
+  )
+  (t "doom kitty: before a release is seen, a key that stops arriving is released after the presses"
+    (kittyEventsOfFrom kittyUntrusted (growing [
+      (csi "97u" + csi "98u")
+      (csi "97u")
+      ""
+    ]))
+    [
+      [
+        (press 97)
+        (press 98)
+      ]
+      [
+        (press 97)
+        (release 98)
+      ]
+      [ (release 97) ]
+    ]
+  )
+  (t
+    "doom kitty: before a release is seen, a byte outside a sequence is pressed and released at the next poll"
+    [
+      (kittyEventsOfFrom kittyUntrusted (growing [
+        "a"
+        ""
+      ]))
+      (kittyStateAfterFrom kittyUntrusted [ "a" ])
+      (kittyStateAfterFrom kittyUntrusted (growing [
+        "a"
+        ""
+      ]))
+    ]
+    [
+      [
+        [ (press 97) ]
+        [ (release 97) ]
+      ]
+      {
+        consumed = 1;
+        held = [ 97 ];
+        carried = [ ];
+        trusted = false;
+      }
+      {
+        consumed = 1;
+        held = [ ];
+        carried = [ ];
+        trusted = false;
+      }
+    ]
+  )
+  (t "doom kitty: the first release event switches to the events as reported, even of a key not held"
+    [
+      (kittyStateAfterFrom kittyUntrusted [ (csi "13;1:3u") ])
+      (kittyEventsOfFrom kittyUntrusted (growing [
+        (csi "13;1:3u")
+        (csi "97u")
+        ""
+      ]))
+      (kittyStateAfterFrom kittyUntrusted (growing [
+        (csi "13;1:3u")
+        (csi "97u")
+        ""
+      ]))
+      (kittyEventsOfFrom kittyUntrusted [ (csi "97u" + csi "13;1:3u") ])
+    ]
+    [
+      {
+        consumed = 9;
+        held = [ ];
+        carried = [ ];
+        trusted = true;
+      }
+      [
+        [ ]
+        [ (press 97) ]
+        [ ]
+      ]
+      {
+        consumed = 14;
+        held = [ 97 ];
+        carried = [ ];
+        trusted = true;
+      }
+      [ [ (press 97) ] ]
+    ]
+  )
+  (t
+    "doom kitty: a press with the type omitted, a press, a repeat and a tap do not switch to the events as reported"
+    (map (text: (kittyStateAfterFrom kittyUntrusted [ text ]).trusted) [
+      (csi "97u")
+      (csi "97;1:1u")
+      (csi "97;1:2u")
+      "a"
+      "\r"
+    ])
+    [
+      false
+      false
+      false
+      false
+      false
+    ]
+  )
+  (t "doom kitty: a terminal once trusted stays trusted"
+    (map (r: r.state.trusted) (
+      pollAllWith K.pollKitty kittyUntrusted (growing [
+        (csi "13;1:3u")
+        (csi "97u")
+        ""
+        (csi "97;1:3u")
+      ])
+    ))
+    [
+      true
+      true
+      true
+      true
+    ]
+  )
   (t "doom render: fit 160x52"
     (R.fit {
       columns = 160;
@@ -2479,6 +2640,64 @@ in
             0
             0
             0
+          ]
+        ];
+      }
+    ]
+  )
+  (t "doom run: kitty presses a key again at every press when the terminal reports no releases"
+    (runKitty (growing [
+      (csi "A")
+      ""
+      (csi "A")
+      ""
+    ])).acc
+    [
+      {
+        events = [ ];
+        frames = [ ];
+      }
+      {
+        events = [ (press 173) ];
+        frames = [
+          [
+            1
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (release 173) ];
+        frames = [
+          [
+            0
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (press 173) ];
+        frames = [
+          [
+            1
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (release 173) ];
+        frames = [
+          [
+            0
+            0
+            0
+            1
           ]
         ];
       }
