@@ -39,7 +39,9 @@
 #                 without it
 #   DOOM_KEYS_PROTO  how the key file is decoded (doom/run.nix keyProto): legacy (the
 #                 default) for the bytes of a terminal in its usual mode, kitty for those
-#                 of a terminal in the kitty keyboard protocol (doom/keys.nix pollKitty)
+#                 of a terminal in the kitty keyboard protocol (doom/keys.nix pollKitty),
+#                 win32 for those of a terminal in the win32-input-mode of Windows
+#                 Terminal (doom/keys.nix pollWin32)
 #   DOOM_STREAM   the form of the frames of play (doom/stream.nix frame): scroll (the
 #                 default) prints every frame under the one before it, as a terminal
 #                 shows the traces of the usual log format; home draws every frame over
@@ -129,10 +131,10 @@ let
     in
     if v == "" then
       "legacy"
-    else if v == "legacy" || v == "kitty" then
+    else if v == "legacy" || v == "kitty" || v == "win32" then
       v
     else
-      throw "doom: DOOM_KEYS_PROTO is neither legacy nor kitty: '${v}'";
+      throw "doom: DOOM_KEYS_PROTO is not legacy, kitty or win32: '${v}'";
 
   size = R.fit {
     columns = numberOr "COLUMNS" 160;

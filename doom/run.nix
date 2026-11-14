@@ -40,15 +40,17 @@
 #           including the first release), so the queue is empty after a tick unless more
 #           releases were queued than N, and the file is read before nearly every tick;
 #           a single press stays held for the N tics of its tick and its release, made up
-#           (legacy) or put off (kitty) by the next poll, comes at the first tic of the
-#           next tick
-# keyProto  how the key file is decoded, the same for both as to when it is polled:
+#           (legacy) or put off (kitty, win32) by the next poll, comes at the first tic of
+#           the next tick
+# keyProto  how the key file is decoded, the same for all as to when it is polled:
 #           "legacy" (the default; poll of doom/keys.nix, for a terminal in its usual
-#           mode, with made-up releases) or "kitty" (pollKitty, for a terminal in the
+#           mode, with made-up releases), "kitty" (pollKitty, for a terminal in the
 #           kitty keyboard protocol: the presses and releases the terminal reports, the
 #           release of a key pressed and released between two polls put off to the next
 #           poll; until the terminal reports its first release, the releases are made up
-#           as in legacy mode); anything else is a throw
+#           as in legacy mode) or "win32" (pollWin32, for a terminal in the
+#           win32-input-mode of Windows Terminal: the presses and releases it reports,
+#           as kitty does once it trusts the terminal); anything else is a throw
 # view      null, which leaves Doom's view window alone, or the screen size (blocks) of
 #           the view window, an integer from 3 to 10 (else a throw): after
 #           doomgeneric_Create the driver sets it as the menu would (see setView below),
@@ -353,11 +355,19 @@ let
         trusted = false;
       };
     };
+    win32 = {
+      poll = Keys.pollWin32;
+      start = {
+        consumed = 0;
+        held = [ ];
+        carried = [ ];
+      };
+    };
   };
 
   protocol =
     protocols.${keyProto}
-      or (throw "doom: run: keyProto is neither \"legacy\" nor \"kitty\": ${builtins.toJSON keyProto}");
+      or (throw "doom: run: keyProto is not \"legacy\", \"kitty\" or \"win32\": ${builtins.toJSON keyProto}");
 
   start = drain 0 [ ] {
     keyState = protocol.start;

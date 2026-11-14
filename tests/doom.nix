@@ -3184,6 +3184,93 @@ in
       3
     ]
   )
+  (t
+    "doom run: win32 keeps up down while right is pressed, repeated and released, and holds a tap of control for one tick"
+    (runKittyWith "win32" realWin32Texts).acc
+    [
+      {
+        events = [ ];
+        frames = [ ];
+      }
+      {
+        events = [ (press 173) ];
+        frames = [
+          [
+            1
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (press 174) ];
+        frames = [
+          [
+            1
+            1
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ ];
+        frames = [
+          [
+            1
+            1
+            0
+            0
+          ]
+        ];
+      }
+      {
+        events = [ (release 174) ];
+        frames = [
+          [
+            1
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (release 173) ];
+        frames = [
+          [
+            0
+            0
+            0
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (press 163) ];
+        frames = [
+          [
+            0
+            0
+            1
+            1
+          ]
+        ];
+      }
+      {
+        events = [ (release 163) ];
+        frames = [
+          [
+            0
+            0
+            0
+            1
+          ]
+        ];
+      }
+    ]
+  )
   (t "doom run: keyProto legacy is the default, and another keyProto is a throw"
     [
       (
