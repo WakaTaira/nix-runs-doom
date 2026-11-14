@@ -1910,17 +1910,17 @@ in
   (t "doom stream: home draws from the top left inside a synchronized update and erases the rest"
     (S.frame "home" "tick 3 +Up" tinyPicture)
     (
-      "${syncBegin}${esc}[Htick 3 +Up${eraseLine}\n"
-      + "${elemAt tinyCells 0}${reset}${eraseLine}\n"
-      + "${elemAt tinyCells 1}${reset}${eraseLine}"
+      "${syncBegin}${esc}[H${eraseLine}tick 3 +Up\n"
+      + "${eraseLine}${elemAt tinyCells 0}${reset}\n"
+      + "${eraseLine}${elemAt tinyCells 1}${reset}\n"
       + "${esc}[J${syncEnd}"
     )
   )
   (t "doom stream: home of a one-line picture"
     (S.frame "home" "tick 0" (lineOf [ (cellOf "1;2;3" "4;5;6") ]))
-    "${syncBegin}${esc}[Htick 0${eraseLine}\n${cellOf "1;2;3" "4;5;6"}${reset}${eraseLine}${esc}[J${syncEnd}"
+    "${syncBegin}${esc}[H${eraseLine}tick 0\n${eraseLine}${cellOf "1;2;3" "4;5;6"}${reset}\n${esc}[J${syncEnd}"
   )
-  (t "doom stream: home of a 160x50 picture has 50 line breaks, every line erased to its end"
+  (t "doom stream: home of a 160x50 picture has 51 line breaks, every line erased at its start"
     (
       let
         pic = picOf false { };
@@ -1928,23 +1928,23 @@ in
       in
       [
         (countOf "\n" f)
+        (countOf "\n${eraseLine}" f)
         (countOf "${reset}${eraseLine}" f)
-        (countOf "${reset}\n" f)
-        (substring 0 (stringLength syncBegin + 3) f)
-        (substring (stringLength f - 18) 18 f)
+        (substring 0 (stringLength syncBegin + 6) f)
+        (substring (stringLength f - 16) 16 f)
         (
           builtins.replaceStrings [ "${eraseLine}" ] [ "" ] (
-            substring (stringLength syncBegin + 3) (stringLength f - stringLength syncBegin - 3 - 8 - 3) f
+            substring (stringLength syncBegin + 3) (stringLength f - stringLength syncBegin - 3 - 8 - 3 - 1) f
           ) == "tick 1\n" + substring 0 (stringLength pic - 1) pic
         )
       ]
     )
     [
-      50
+      51
       50
       0
-      "${syncBegin}${esc}[H"
-      "${reset}${eraseLine}${esc}[J${syncEnd}"
+      "${syncBegin}${esc}[H${eraseLine}"
+      "${reset}\n${esc}[J${syncEnd}"
       true
     ]
   )

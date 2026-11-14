@@ -13,11 +13,15 @@
 #   scroll  line, a line break and the picture without its last line break (trace adds
 #           one), so that every frame is printed under the one before it;
 #   home    ESC[?2026h (begin a synchronized update), ESC[H (the cursor to the top left
-#           corner), line, ESC[K (erase the rest of the line), a line break, the lines of
-#           the picture, each followed by ESC[K and all but the last by a line break,
-#           ESC[J (erase the rest of the screen, which holds what is left of a taller
-#           frame before it) and ESC[?2026l (end the synchronized update), so that every
-#           frame is drawn over the one before it. No line break ends it: it is meant for
+#           corner), then every line (the status line, then the lines of the picture)
+#           as ESC[K (erase the line), the line and a line break, then ESC[J (erase the
+#           rest of the screen, which holds what is left of a taller frame before it)
+#           and ESC[?2026l (end the synchronized update), so that every frame is drawn
+#           over the one before it. The erasing comes at the start of a line and not at
+#           its end, because after a line as wide as the terminal the cursor waits on
+#           the last column, where ESC[K would erase the last cell on some terminals.
+#           The frame takes one line more than it shows (the line of ESC[J), which the
+#           two lines that doom/render.nix fit leaves free allow. It is meant for
 #           a reader of the log in internal-json form (toolchain/play.nix), which copies it
 #           as it is.
 # Any other mode is a throw.
@@ -59,12 +63,12 @@ let
 
   scroll = line: picture: line + "\n" + dropLast picture;
 
-  # The picture with ESC[K at the end of every line, without its last line break.
-  erasedLines = picture: dropLast (replaceStrings [ "\n" ] [ "${esc}[K\n" ] picture);
+  # The picture with ESC[K at the start of every line, without its last line break.
+  erasedLines = picture: "${esc}[K" + replaceStrings [ "\n" ] [ "\n${esc}[K" ] (dropLast picture);
 
   home =
     line: picture:
-    "${esc}[?2026h${esc}[H" + line + "${esc}[K\n" + erasedLines picture + "${esc}[J${esc}[?2026l";
+    "${esc}[?2026h${esc}[H${esc}[K" + line + "\n" + erasedLines picture + "\n${esc}[J${esc}[?2026l";
 
   frame =
     mode:

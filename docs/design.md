@@ -421,7 +421,7 @@ How the frames of `doom.play` reach the screen (`doom/stream.nix`, `DOOM_STREAM`
   the message is the string as traced, escape sequences and line breaks included.
   `nix run .#play` runs the evaluation this way with `DOOM_STREAM=home`, under which a
   frame moves the cursor to the top left corner (`ESC[H`), draws the status line and the
-  picture with every line erased to its end (`ESC[K`) and erases the rest of the screen
+  picture with every line erased at its start (`ESC[K` before the line, not after it: after a line as wide as the terminal the cursor waits on the last column, where `ESC[K` would erase the last cell on some terminals) and erases the rest of the screen
   (`ESC[J`), which holds what is left of a taller frame before it (the whole screen is 50
   lines at 160 columns, the 3D view 48). The frame is wrapped in a synchronized update
   (`ESC[?2026h` … `ESC[?2026l`), so a terminal that supports it shows each frame whole.
