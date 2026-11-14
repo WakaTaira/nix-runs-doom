@@ -1,6 +1,6 @@
 # nix-doom-tui
 
-An experiment: write an RV32IM emulator in pure Nix (`nix eval` only, no derivations) and eventually run Doom on it in a terminal.
+An experiment: run Doom in a terminal with `nix eval` alone (no derivations). A C compiler written in Nix compiles doomgeneric to Nix functions, and a driver in Nix runs them frame by frame. The RV32IM emulator that the project started with remains as a scaffold: clang-built Doom on the emulator is the reference for cross-checking the compiled one.
 
 ## Goals
 
