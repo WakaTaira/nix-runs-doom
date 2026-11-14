@@ -113,6 +113,56 @@ let
   longRepeats = csi "97u" + repeat (csi "97;1:2u") 11111 + csi "97;1:3u";
   longCode = csi "${repeat "1" 100000}u" + csi "98u";
 
+  # The win32-input-mode: decoded events and polls of pollWin32.
+  win32Of = s: (K.decodeWin32 (bytesOf s)).keys;
+  win32RestOf = s: (K.decodeWin32 (bytesOf s)).rest;
+  win32Initial = {
+    consumed = 0;
+    held = [ ];
+    carried = [ ];
+  };
+  win32EventsOf = texts: map (r: r.events) (pollAllWith K.pollWin32 win32Initial texts);
+  win32StateAfter =
+    texts: (elemAt (pollAllWith K.pollWin32 win32Initial texts) (length texts - 1)).state;
+  # The sequence of a key event with the virtual-key code vk, the character uc and the
+  # key-down flag kd (scan code, control key state and repeat count 0, 0 and 1).
+  w32 =
+    vk: uc: kd:
+    csi "${toString vk};0;${toString uc};${toString kd};0;1_";
+  # The bytes Windows Terminal sent in win32-input-mode for: the release of Enter, up
+  # pressed, right pressed (three times, the key repeating), right released, up released,
+  # control pressed and released.
+  realEnterUp = csi "13;28;13;0;0;1_";
+  realUpDown = csi "38;72;0;1;256;1_";
+  realRightDown = csi "39;77;0;1;256;1_";
+  realRightUp = csi "39;77;0;0;256;1_";
+  realUpUp = csi "38;72;0;0;256;1_";
+  realCtrlDown = csi "17;29;0;1;8;1_";
+  realCtrlUp = csi "17;29;0;0;0;1_";
+  realWin32 =
+    realEnterUp
+    + realUpDown
+    + realRightDown
+    + realRightDown
+    + realRightDown
+    + realRightUp
+    + realUpUp
+    + realCtrlDown
+    + realCtrlUp;
+  # The same events, one read after another: up held while right is pressed, repeated and
+  # released, then control pressed and released in one read.
+  realWin32Texts = growing [
+    (realEnterUp + realUpDown)
+    realRightDown
+    (realRightDown + realRightDown)
+    realRightUp
+    realUpUp
+    (realCtrlDown + realCtrlUp)
+    ""
+  ];
+  # A press of a, 10,000 repeats and a release (170,026 bytes).
+  longWin32Repeats = csi "65;30;97;1_" + repeat (csi "65;30;97;1;0;2_") 10000 + csi "65;30;97;0_";
+
   # An artificial screen: pixel (x, y) has palette index (x + 2y) & 255, and palette entry
   # i is { r = i; g = 2i & 255; b = 3i & 255; }.
   screen = genList (i: bitAnd (i - (i / 320) * 320 + 2 * (i / 320)) 255) 64000;
@@ -1580,6 +1630,327 @@ in
       true
     ]
   )
+  (t "doom win32: the bytes of Windows Terminal decoded" (win32Of realWin32) [
+    (ev 13 3)
+    (ev 173 1)
+    (ev 174 1)
+    (ev 174 1)
+    (ev 174 1)
+    (ev 174 3)
+    (ev 173 3)
+    (ev 163 1)
+    (ev 163 3)
+  ])
+  (t
+    "doom win32: poll of the bytes of Windows Terminal drops the release of Enter, keeps up held while right is pressed and released, and puts off the release of control"
+    (win32EventsOf realWin32Texts)
+    [
+      [ (press 173) ]
+      [ (press 174) ]
+      [ ]
+      [ (release 174) ]
+      [ (release 173) ]
+      [ (press 163) ]
+      [ (release 163) ]
+    ]
+  )
+  (t "doom win32: poll state of the bytes of Windows Terminal with up held after right was released"
+    (win32StateAfter (genList (elemAt realWin32Texts) 4))
+    {
+      consumed = 107;
+      held = [ 173 ];
+      carried = [ ];
+    }
+  )
+  (t "doom win32: keys named by the virtual-key code"
+    (map (vk: (head (win32Of (w32 vk 0 1))).key) [
+      37
+      38
+      39
+      40
+      13
+      27
+      9
+      8
+      32
+      16
+      160
+      161
+      17
+      162
+      163
+      18
+      164
+      165
+    ])
+    [
+      172
+      173
+      174
+      175
+      13
+      27
+      9
+      127
+      162
+      182
+      182
+      182
+      163
+      163
+      163
+      184
+      184
+      184
+    ]
+  )
+  (t "doom win32: letters are lower case, x is fire, digits are themselves"
+    (win32Of (w32 65 97 1 + w32 90 90 1 + w32 88 120 1 + w32 48 48 1 + w32 57 57 1 + w32 49 33 1))
+    [
+      (ev 97 1)
+      (ev 122 1)
+      (ev 163 1)
+      (ev 48 1)
+      (ev 57 1)
+      (ev 49 1)
+    ]
+  )
+  (t "doom win32: other keys are their printable character"
+    (win32Of (w32 189 45 1 + w32 187 61 1 + w32 187 43 1 + w32 192 96 1 + w32 226 81 1 + w32 103 55 0))
+    [
+      (ev 45 1)
+      (ev 61 1)
+      (ev 43 1)
+      (ev 96 1)
+      (ev 113 1)
+      (ev 55 3)
+    ]
+  )
+  (t "doom win32: a letter or a digit typed with control is the letter or the digit"
+    (win32Of (
+      csi "65;30;1;1;8;1_" + csi "88;45;24;1;4;1_" + csi "50;3;0;1;8;1_" + csi "67;46;3;0;8;1_"
+    ))
+    [
+      (ev 97 1)
+      (ev 163 1)
+      (ev 50 1)
+      (ev 99 3)
+    ]
+  )
+  (t "doom win32: omitted fields are 0, and the repeat count and fields after the sixth are ignored"
+    (win32Of (
+      csi "38;;;1_"
+      + csi "38_"
+      + csi "38;72_"
+      + csi "189;;45;1_"
+      + csi "38;72;0;1;;_"
+      + csi "38;72;0;1;256;1;9_"
+      + csi "38;72;0;1;256;7_"
+    ))
+    [
+      (ev 173 1)
+      (ev 173 3)
+      (ev 173 3)
+      (ev 45 1)
+      (ev 173 1)
+      (ev 173 1)
+      (ev 173 1)
+    ]
+  )
+  (t "doom win32: keys and sequences that are not supported are dropped" (map win32Of [
+    (csi "0;0;97;1_" + w32 66 98 1)
+    (csi ";;97;1_" + w32 66 98 1)
+    (csi "_" + w32 66 98 1)
+    (w32 112 0 1 + w32 66 98 1)
+    (w32 46 0 1 + w32 66 98 1)
+    (w32 189 0 1 + w32 66 98 1)
+    (w32 999 233 1 + w32 66 98 1)
+    (w32 999 32 1 + w32 66 98 1)
+    (w32 65 97 2 + w32 66 98 1)
+    (csi "65:1;30;97;1_" + w32 66 98 1)
+    (csi "?65;30;97;1_" + w32 66 98 1)
+    (csi "65;30;97;1 _" + w32 66 98 1)
+    (csi "65;30;97;1~" + w32 66 98 1)
+    (csi "65;30;97;1u" + w32 66 98 1)
+    (csi "A" + w32 66 98 1)
+    (csi "?62;22c" + w32 66 98 1)
+    (csi "?9001;2$y" + w32 66 98 1)
+  ]) (genList (_: [ (ev 98 1) ]) 17))
+  (t "doom win32: broken sequences resume at the byte that ends them"
+    [
+      (win32Of (csi "38;72;0;1" + w32 66 98 1))
+      (win32Of "${esc}a")
+      (win32Of ("${esc}OA${esc}" + w32 66 98 1))
+      (win32Of (csi "38;1\n"))
+    ]
+    [
+      [ (ev 98 1) ]
+      [
+        (ev 97 1)
+        (ev 97 3)
+      ]
+      [ (ev 98 1) ]
+      [
+        (ev 13 1)
+        (ev 13 3)
+      ]
+    ]
+  )
+  (t "doom win32: rest of a sequence cut off at the end"
+    [
+      (win32RestOf (csi "38;72;0;1"))
+      (win32RestOf (realUpDown + esc))
+      (win32RestOf (realUpDown + "${esc}["))
+      (win32RestOf realUpDown)
+      (win32Of (realUpDown + csi "38;72;0;0"))
+    ]
+    [
+      11
+      1
+      2
+      0
+      [ (ev 173 1) ]
+    ]
+  )
+  (t "doom win32: a character field of 100,000 digits"
+    (K.decodeWin32 (
+      bytesOf (csi "65;30;${repeat "9" 100000};1_" + csi "${repeat "1" 100000};0;0;1_" + w32 66 98 1)
+    ))
+    {
+      keys = [
+        (ev 97 1)
+        (ev 98 1)
+      ];
+      rest = 0;
+    }
+  )
+  (t "doom win32: poll ignores repeats of a held key"
+    (win32EventsOf (growing [
+      (w32 65 97 1)
+      (w32 65 97 1 + w32 65 97 1)
+      (w32 65 97 0)
+    ]))
+    [
+      [ (press 97) ]
+      [ ]
+      [ (release 97) ]
+    ]
+  )
+  (t "doom win32: poll puts off the release of a press and release in one read"
+    [
+      (win32EventsOf [
+        (realCtrlDown + realCtrlUp)
+        (realCtrlDown + realCtrlUp)
+        (realCtrlDown + realCtrlUp)
+      ])
+      (win32StateAfter [ (realCtrlDown + realCtrlUp) ])
+    ]
+    [
+      [
+        [ (press 163) ]
+        [ (release 163) ]
+        [ ]
+      ]
+      {
+        consumed = 32;
+        held = [ 163 ];
+        carried = [ 163 ];
+      }
+    ]
+  )
+  (t "doom win32: poll drops the release of a key not held and takes both shift keys as one key"
+    (win32EventsOf (growing [
+      (w32 13 13 0)
+      (w32 160 0 1 + w32 161 0 1)
+      (w32 160 0 0)
+      (w32 161 0 0)
+    ]))
+    [
+      [ ]
+      [ (press 182) ]
+      [ (release 182) ]
+      [ ]
+    ]
+  )
+  (t "doom win32: poll holds a byte outside a sequence for one read"
+    (win32EventsOf [
+      "a"
+      "a"
+    ])
+    [
+      [ (press 97) ]
+      [ (release 97) ]
+    ]
+  )
+  (t "doom win32: poll completes a sequence cut off at the end at the next read"
+    [
+      (win32EventsOf [
+        (realUpDown + csi "38;72;0;0")
+        (realUpDown + realUpUp)
+      ])
+      (win32StateAfter [ (realUpDown + csi "38;72;0;0") ])
+    ]
+    [
+      [
+        [ (press 173) ]
+        [ (release 173) ]
+      ]
+      {
+        consumed = 18;
+        held = [ 173 ];
+        carried = [ ];
+      }
+    ]
+  )
+  (t "doom win32: poll starts over when the file got shorter"
+    [
+      (win32EventsOf [
+        (realUpDown + w32 65 97 1)
+        (csi "40;80;0;1;256;1_")
+      ])
+      (win32StateAfter [
+        (realUpDown + w32 65 97 1)
+        (csi "40;80;0;1;256;1_")
+      ])
+    ]
+    [
+      [
+        [
+          (press 173)
+          (press 97)
+        ]
+        [ (press 175) ]
+      ]
+      {
+        consumed = 18;
+        held = [
+          173
+          97
+          175
+        ];
+        carried = [ ];
+      }
+    ]
+  )
+  (t "doom win32: poll of a press, 10,000 repeats and a release"
+    (K.pollWin32 win32Initial longWin32Repeats)
+    {
+      events = [ (press 97) ];
+      state = {
+        consumed = 170026;
+        held = [ 97 ];
+        carried = [ 97 ];
+      };
+    }
+  )
+  (t "doom win32: poll of ESC [ A repeated over 200,000 bytes" (K.pollWin32 win32Initial longArrows) {
+    events = [ ];
+    state = {
+      consumed = 199998;
+      held = [ ];
+      carried = [ ];
+    };
+  })
   (t "doom render: fit 160x52"
     (R.fit {
       columns = 160;

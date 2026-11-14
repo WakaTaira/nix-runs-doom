@@ -7,11 +7,14 @@
 #   poll     : { consumed; stalled; held; } -> text -> { state; events; }
 #   decodeKitty : bytes -> { keys; rest; }
 #   pollKitty   : { consumed; held; carried; trusted; } -> text -> { state; events; }
+#   decodeWin32 : bytes -> { keys; rest; }
+#   pollWin32   : { consumed; held; carried; } -> text -> { state; events; }
 #
 # bytes is a list of byte values (-1 allowed, for a byte of 0x80 or more); keys is a list
 # of doomkeys.h numbers in order of appearance, duplicates included. decode and poll read
 # the bytes of a terminal in its usual (legacy) mode, decodeKitty and pollKitty those of a
-# terminal in the kitty keyboard protocol (see the end of this comment).
+# terminal in the kitty keyboard protocol, decodeWin32 and pollWin32 those of a terminal in
+# the win32-input-mode of Windows Terminal (see the end of this comment).
 #
 # decode reads from the front:
 #   - ESC [ params(0x30..0x3f)* intermediates(0x20..0x2f)* final(0x40..0x7e) is a CSI.
@@ -92,6 +95,38 @@
 # key held and a release never for a key not held, which keeps the shift count of i_input.c
 # right. Keys are tracked by key number, so both shift keys are one key, and so are both
 # control keys and x.
+#
+# The win32-input-mode of Windows Terminal (CSI ? 9001 h; microsoft/terminal,
+# doc/specs/#4999 - Improved keyboard handling in Conpty.md) reports every key event of
+# Windows, modifier keys alone included, as
+#   CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _
+# with Vk the virtual-key code, Sc the scan code, Uc the character (UTF-16, decimal), Kd 1
+# for a press (a repeat included) and 0 for a release, Cs the control key state and Rc the
+# repeat count; an omitted field is 0, except Rc, which is 1. decodeWin32 reads from the
+# front and its keys are events { key; type; } (type 1 press or 3 release, as in
+# decodeKitty):
+#   - A CSI is found as in decode. When its parameter bytes are digits and ';' only, it has
+#     no intermediate and its final is '_', Vk, Uc and Kd give the event; Sc, Cs, Rc and
+#     any field after the sixth are ignored, so a key typed with a modifier is the key, and
+#     the modifier key sends its own events. The key is that of Vk when Vk names one: 37
+#     left, 38 up, 39 right, 40 down, 13 KEY_ENTER, 27 KEY_ESCAPE, 9 KEY_TAB, 8
+#     KEY_BACKSPACE, 32 KEY_USE, 16, 160 and 161 (shift, left, right) KEY_RSHIFT, 17, 162
+#     and 163 (control) KEY_FIRE, 18, 164 and 165 (alt) KEY_RALT, the letters 65..90 the
+#     lower-case numbers (88, x, is KEY_FIRE as in decode) and the digits 48..57
+#     themselves. For any other Vk but 0, a Uc of 33..126 is the key of that byte in decode
+#     (letters in lower case), so that '-' and '=' work on any layout; Vk wins where it
+#     names a key, because a letter typed with control has a control character in Uc. Vk 0
+#     (an event that only carries a character, such as pasted text), any other key, a Kd
+#     other than 0 and 1, a parameter byte such as '?' or ':', any intermediate and any
+#     other final are dropped whole; a byte that ends a CSI early is handled as in decode.
+#   - ESC O x, any other ESC, a sequence cut off by the end of the input and any byte
+#     outside a sequence are handled as in decodeKitty.
+#
+# pollWin32 trusts the terminal from the first read: Windows reports every release, so the
+# presses and releases are those of pollKitty for a trusted terminal (held, carried, a
+# press of a held key ignored, a release of a key not held dropped, the release of a key
+# pressed in the same read put off to the next read). The release of the Enter that
+# started the program, usually first in the file, is thus dropped.
 let
   inherit (builtins)
     concatMap
@@ -342,19 +377,13 @@ let
   # overflows; no key code is that large.
   digitStep = v: d: if v > 99999999 then v else v * 10 + d;
 
-  # The first two subfields of the first two fields of the parameter bytes of a CSI
-  # (code, mods and event; null when absent or empty), or null when a byte is neither a
-  # digit, ':' nor ';'. Every step is forced, so that long parameters build no chain of
-  # thunks.
-  kittyParams =
-    params:
+  # The subfields of the parameter bytes of a CSI named by slots, an attribute set of names
+  # by "<field>:<subfield>" (each null when absent or empty), or null when a byte is neither
+  # a digit, ';' nor, if subfields is true, ':'. Every step is forced, so that long
+  # parameters build no chain of thunks.
+  csiFields =
+    slots: subfields: params:
     let
-      # The name of each kept subfield by "<field>:<subfield>".
-      slots = {
-        "0:0" = "code";
-        "1:0" = "mods";
-        "1:1" = "event";
-      };
       commit =
         s:
         let
@@ -367,7 +396,7 @@ let
           s
         else if b >= 48 && b <= 57 then
           s // { num = digitStep (if s.num == null then 0 else s.num) (b - 48); }
-        else if b == 58 then
+        else if b == 58 && subfields then
           commit s
           // {
             sub = s.sub + 1;
@@ -382,15 +411,20 @@ let
           }
         else
           s // { bad = true; };
+      # Every named subfield, null.
+      absent = listToAttrs (
+        map (name: {
+          inherit name;
+          value = null;
+        }) (builtins.attrValues slots)
+      );
       start = {
         field = 0;
         sub = 0;
         num = null;
         bad = false;
-        code = null;
-        mods = null;
-        event = null;
-      };
+      }
+      // absent;
       result = commit (
         foldl' (
           s: b:
@@ -401,7 +435,15 @@ let
         ) start params
       );
     in
-    if result.bad then null else { inherit (result) code mods event; };
+    if result.bad then null else builtins.intersectAttrs absent result;
+
+  # The code, mods and event of the parameter bytes of a CSI of the kitty protocol: the
+  # first two subfields of the first two fields.
+  kittyParams = csiFields {
+    "0:0" = "code";
+    "1:0" = "mods";
+    "1:1" = "event";
+  } true;
 
   # The events of a complete CSI with the parameter bytes params, no intermediate and the
   # final byte f: [ { key; type; } ] or [ ] when it is dropped.
@@ -446,8 +488,86 @@ let
         }
       ];
 
-  decodeKittyMarked =
-    bytes:
+  # The keys of the win32-input-mode by virtual-key code (see the header); letters and
+  # digits are in win32VkKey.
+  win32Keys = {
+    "8" = keyBackspace;
+    "9" = keyTab;
+    "13" = keyEnter;
+    "27" = keyEscape;
+    "32" = keyUse;
+    "37" = 172; # left
+    "38" = 173; # up
+    "39" = 174; # right
+    "40" = 175; # down
+    "16" = keyRShift;
+    "160" = keyRShift;
+    "161" = keyRShift;
+    "17" = keyFire;
+    "162" = keyFire;
+    "163" = keyFire;
+    "18" = keyRAlt;
+    "164" = keyRAlt;
+    "165" = keyRAlt;
+  };
+
+  # The key named by a virtual-key code, or null when it names none.
+  win32VkKey =
+    vk:
+    if (vk >= 65 && vk <= 90) || (vk >= 48 && vk <= 57) then
+      plainKey vk
+    else
+      win32Keys.${toString vk} or null;
+
+  # The key of an event with the virtual-key code vk and the character uc, or null when it
+  # is dropped.
+  win32Key =
+    vk: uc:
+    let
+      named = win32VkKey vk;
+    in
+    if vk == 0 then
+      null
+    else if named != null then
+      named
+    else if uc >= 33 && uc <= 126 then
+      plainKey uc
+    else
+      null;
+
+  # The virtual-key code, character and key-down flag of the parameter bytes of a CSI of
+  # the win32-input-mode: its first, third and fourth fields.
+  win32Params = csiFields {
+    "0:0" = "vk";
+    "2:0" = "uc";
+    "3:0" = "kd";
+  } false;
+
+  orZero = v: if v == null then 0 else v;
+
+  # The events of a complete CSI of the win32-input-mode with the parameter bytes params,
+  # no intermediate and the final byte f: [ { key; type; } ] or [ ] when it is dropped.
+  win32Events =
+    params: f:
+    let
+      p = win32Params params;
+      kd = orZero p.kd;
+      key = win32Key (orZero p.vk) (orZero p.uc);
+    in
+    if f != 95 || p == null || key == null || (kd != 0 && kd != 1) then
+      [ ]
+    else
+      [
+        {
+          inherit key;
+          type = if kd == 1 then typePress else typeRelease;
+        }
+      ];
+
+  # The events of bytes with the CSI without intermediates read by csiEvents (params -> f
+  # -> events) and everything else as in decodeKitty.
+  decodeEvents =
+    csiEvents: bytes:
     let
       n = length bytes;
 
@@ -484,15 +604,16 @@ let
           truncated
         else if f >= 64 && f <= 126 then
           emit (
-            if k == e.afterParams then
-              kittyEvents (genList (j: elemAt bytes (i + 2 + j)) (k - i - 2)) f
-            else
-              [ ]
+            if k == e.afterParams then csiEvents (genList (j: elemAt bytes (i + 2 + j)) (k - i - 2)) f else [ ]
           ) (k + 1)
         else
           emit [ ] k;
     in
     scan n (tokensOf token n);
+
+  decodeKittyMarked = decodeEvents kittyEvents;
+
+  decodeWin32 = decodeEvents win32Events;
 
   # decodeKittyMarked without the mark `explicit` of its events.
   decodeKitty =
@@ -532,26 +653,45 @@ let
         events = s.events ++ [ (press k) ];
       };
 
-  pollKitty =
-    state: text:
+  # The events decoded with decodeWith from the part of text after consumed (from the
+  # front when the text got shorter), and the count of bytes consumed after them.
+  readFresh =
+    decodeWith: consumed: text:
     let
-      reset = stringLength text < state.consumed;
-      consumed = if reset then 0 else state.consumed;
-      fresh = bytesOfText (substring consumed (stringLength text - consumed) text);
-      d = decodeKittyMarked fresh;
+      from = if stringLength text < consumed then 0 else consumed;
+      fresh = bytesOfText (substring from (stringLength text - from) text);
+      d = decodeWith fresh;
+    in
+    {
+      inherit (d) keys;
+      consumed = from + length fresh - d.rest;
+    };
+
+  # The presses and releases of the reported events of one read, from the key state
+  # { held; carried; } (see the header): { held; carried; events; }.
+  reportedPolled =
+    state: decoded:
+    let
       start = {
         held = builtins.filter (k: !(builtins.elem k state.carried)) state.held;
         carried = [ ];
         fresh = [ ];
         events = map release state.carried;
       };
-      reported = foldl' (
-        s: e:
-        let
-          s' = kittyStep s e;
-        in
-        builtins.deepSeq s' s'
-      ) start d.keys;
+    in
+    foldl' (
+      s: e:
+      let
+        s' = kittyStep s e;
+      in
+      builtins.deepSeq s' s'
+    ) start decoded;
+
+  pollKitty =
+    state: text:
+    let
+      d = readFresh decodeKittyMarked state.consumed text;
+      reported = reportedPolled state d.keys;
 
       # A terminal is trusted to report releases from the first release it reports.
       trusted =
@@ -570,9 +710,23 @@ let
     in
     {
       state = {
-        consumed = consumed + length fresh - d.rest;
+        inherit (d) consumed;
         inherit (r) held carried;
         inherit trusted;
+      };
+      inherit (r) events;
+    };
+
+  pollWin32 =
+    state: text:
+    let
+      d = readFresh decodeWin32 state.consumed text;
+      r = reportedPolled state d.keys;
+    in
+    {
+      state = {
+        inherit (d) consumed;
+        inherit (r) held carried;
       };
       inherit (r) events;
     };
@@ -585,5 +739,7 @@ in
     poll
     decodeKitty
     pollKitty
+    decodeWin32
+    pollWin32
     ;
 }
