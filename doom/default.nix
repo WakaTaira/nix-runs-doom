@@ -14,9 +14,10 @@
 #          entry), each byte as two hex digits, as in scaffold.boot.report
 # play     streams, at each tick, the guest output added in it (if any) and the last
 #          frame drawn in it (if any) with builtins.trace, the frame under a status
-#          line (the tick and the key events sent at it, + a press, - a release); each
-#          tick runs DOOM_TICS tics of the game and draws once (doom/run.nix tics); the
-#          frames are pictures of doom/picture.nix of the size of title; the value is
+#          line (the tick and the key events sent at it, + a press, - a release) in the
+#          form of DOOM_STREAM (doom/stream.nix); each tick runs DOOM_TICS tics of the
+#          game and draws once (doom/run.nix tics); the frames are pictures of
+#          doom/picture.nix of the size of title; the value is
 #          "ticks: <n>, frames: <m>\n"
 #
 # Environment (read with builtins.getEnv):
@@ -39,10 +40,17 @@
 #   DOOM_KEYS_PROTO  how the key file is decoded (doom/run.nix keyProto): legacy (the
 #                 default) for the bytes of a terminal in its usual mode, kitty for those
 #                 of a terminal in the kitty keyboard protocol (doom/keys.nix pollKitty)
+#   DOOM_STREAM   the form of the frames of play (doom/stream.nix frame): scroll (the
+#                 default) prints every frame under the one before it, as a terminal
+#                 shows the traces of the usual log format; home draws every frame over
+#                 the one before it, from the top left corner, inside a synchronized
+#                 update, for a reader of the log in internal-json form (Nix keeps the
+#                 cursor movements of a trace only there; toolchain/play.nix)
 #   COLUMNS, LINES  the terminal size; 160 and 52 without them
 let
   R = import ./render.nix;
   P = import ./picture.nix;
+  S = import ./stream.nix;
   inherit (builtins)
     concatStringsSep
     div
@@ -198,14 +206,6 @@ let
       inherit (size) cols rows;
     };
 
-  # The picture without its last line break (trace adds one).
-  traced =
-    view: f:
-    let
-      s = image view f;
-    in
-    substring 0 (stringLength s - 1) s;
-
   # The hashes of the frames of one call, forced so that no frame record is kept.
   hashEntries =
     { tick, frames, ... }:
@@ -218,32 +218,21 @@ let
     in
     builtins.deepSeq new (acc ++ new);
 
-  keyNames = {
-    "173" = "Up";
-    "175" = "Down";
-    "174" = "Right";
-    "172" = "Left";
-    "27" = "Esc";
-    "13" = "Enter";
-    "127" = "Backspace";
-    "9" = "Tab";
-    "162" = "Use";
-    "163" = "Fire";
-    "182" = "Shift";
-    "184" = "Alt";
-  };
-
-  # The name of a doomkeys.h number: a word for the special keys, else the character.
-  keyName = k: keyNames.${toString k} or ((import ../lib/ascii.nix).chr k);
-
-  eventName = e: (if e.pressed == 1 then "+" else "-") + keyName e.key;
-
-  # The status line of a tick: its number and the key events sent at it.
-  status = tick: events: concatStringsSep " " ([ "tick ${toString tick}" ] ++ map eventName events);
+  # The form of the frames of play (doom/stream.nix frame).
+  streamMode =
+    let
+      v = getEnv "DOOM_STREAM";
+    in
+    if v == "" then
+      "scroll"
+    else if v == "scroll" || v == "home" then
+      v
+    else
+      throw "doom: DOOM_STREAM is neither scroll nor home: '${v}'";
 
   # Traces the output, then the last frame under its status line, of one call.
   stream =
-    view:
+    mode: view:
     {
       tick,
       frames,
@@ -256,7 +245,9 @@ let
         if frames == [ ] then
           acc
         else
-          trace (status tick events + "\n" + traced view (elemAt frames (builtins.length frames - 1))) acc;
+          trace (S.frame mode (S.status tick events) (
+            image view (elemAt frames (builtins.length frames - 1))
+          )) acc;
     in
     if out == "" then withFrame else trace out withFrame;
 
@@ -264,7 +255,7 @@ let
   titleRun = run (ticksOr 2) (ticsOr 0) titleView (_: acc: acc) null;
   playTicks = ticksOr 1000000;
   playView = viewOr "auto";
-  playRun = run playTicks (ticsOr 5) playView (stream playView) null;
+  playRun = run playTicks (ticsOr 5) playView (stream streamMode playView) null;
 in
 {
   title =
@@ -272,5 +263,7 @@ in
 
   report = (run (ticksOr 2) (ticsOr 0) (viewOr "full") hashEntries [ ]).acc;
 
-  play = builtins.seq playRun.acc "ticks: ${toString playTicks}, frames: ${toString playRun.frameCount}\n";
+  play = builtins.seq streamMode (
+    builtins.seq playRun.acc "ticks: ${toString playTicks}, frames: ${toString playRun.frameCount}\n"
+  );
 }

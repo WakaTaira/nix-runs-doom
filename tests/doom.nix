@@ -8,6 +8,7 @@ let
   K = import ../doom/keys.nix;
   R = import ../doom/render.nix;
   Pic = import ../doom/picture.nix;
+  S = import ../doom/stream.nix;
   Scaffold = import ../scaffold/render.nix;
   Cc = import ../cc;
   M = import ../lib/mem.nix;
@@ -243,6 +244,28 @@ let
       )
     ) 40
   );
+
+  # A picture of two lines of two cells, and the parts of a frame of doom/stream.nix.
+  tinyPicture =
+    lineOf [
+      (cellOf "1;2;3" "4;5;6")
+      (cellOf "7;8;9" "10;11;12")
+    ]
+    + lineOf [
+      (cellOf "13;14;15" "16;17;18")
+      (cellOf "19;20;21" "22;23;24")
+    ];
+  tinyCells = [
+    (cellOf "1;2;3" "4;5;6" + cellOf "7;8;9" "10;11;12")
+    (cellOf "13;14;15" "16;17;18" + cellOf "19;20;21" "22;23;24")
+  ];
+  syncBegin = "${esc}[?2026h";
+  syncEnd = "${esc}[?2026l";
+  reset = "${esc}[0m";
+  eraseLine = "${esc}[K";
+  # The number of occurrences of the string part in s.
+  countOf =
+    part: s: (length (split (builtins.replaceStrings [ "[" "?" ] [ "\\[" "\\?" ] part) s) - 1) / 2;
 
   # DG_GetKey of the platform layer over a memory whose words at 64 and 68 are all ones,
   # so that the word write of pressed and the byte write of key can be told apart.
@@ -1857,6 +1880,77 @@ in
       true
     ]
   )
+  (t "doom stream: status is the tick and the key events, + a press, - a release"
+    [
+      (S.status 7 [ ])
+      (S.status 12 [
+        (press 173)
+        (release 13)
+        (press 97)
+        (release 163)
+      ])
+    ]
+    [
+      "tick 7"
+      "tick 12 +Up -Enter +a -Fire"
+    ]
+  )
+  (t
+    "doom stream: scroll is the status line, a line break and the picture without its last line break"
+    (S.frame "scroll" "tick 3 +Up" tinyPicture)
+    "tick 3 +Up\n${elemAt tinyCells 0}${reset}\n${elemAt tinyCells 1}${reset}"
+  )
+  (t "doom stream: scroll of a picture is the frame play traced before DOOM_STREAM" (
+    let
+      pic = picOf true levelVars;
+    in
+    S.frame "scroll" (S.status 5 [ (press 173) ]) pic
+    == "tick 5 +Up\n" + substring 0 (stringLength pic - 1) pic
+  ) true)
+  (t "doom stream: home draws from the top left inside a synchronized update and erases the rest"
+    (S.frame "home" "tick 3 +Up" tinyPicture)
+    (
+      "${syncBegin}${esc}[Htick 3 +Up${eraseLine}\n"
+      + "${elemAt tinyCells 0}${reset}${eraseLine}\n"
+      + "${elemAt tinyCells 1}${reset}${eraseLine}"
+      + "${esc}[J${syncEnd}"
+    )
+  )
+  (t "doom stream: home of a one-line picture"
+    (S.frame "home" "tick 0" (lineOf [ (cellOf "1;2;3" "4;5;6") ]))
+    "${syncBegin}${esc}[Htick 0${eraseLine}\n${cellOf "1;2;3" "4;5;6"}${reset}${eraseLine}${esc}[J${syncEnd}"
+  )
+  (t "doom stream: home of a 160x50 picture has 50 line breaks, every line erased to its end"
+    (
+      let
+        pic = picOf false { };
+        f = S.frame "home" (S.status 1 [ ]) pic;
+      in
+      [
+        (countOf "\n" f)
+        (countOf "${reset}${eraseLine}" f)
+        (countOf "${reset}\n" f)
+        (substring 0 (stringLength syncBegin + 3) f)
+        (substring (stringLength f - 18) 18 f)
+        (
+          builtins.replaceStrings [ "${eraseLine}" ] [ "" ] (
+            substring (stringLength syncBegin + 3) (stringLength f - stringLength syncBegin - 3 - 8 - 3) f
+          ) == "tick 1\n" + substring 0 (stringLength pic - 1) pic
+        )
+      ]
+    )
+    [
+      50
+      50
+      0
+      "${syncBegin}${esc}[H"
+      "${reset}${eraseLine}${esc}[J${syncEnd}"
+      true
+    ]
+  )
+  (t "doom stream: a mode other than scroll and home is a throw" (throws (
+    S.frame "up" "tick 0" tinyPicture
+  )) true)
   (t "doom DG_GetKey: no event returns 0 and leaves the memory"
     [
       noKey.ret
