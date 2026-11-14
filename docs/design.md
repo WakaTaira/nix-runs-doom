@@ -403,6 +403,42 @@ How `doom.play` draws a frame (`doom/picture.nix`, `doom/run.nix` `view`, `DOOM_
   returns at once (`copyMem` of `lib/libc.nix`), and the picture reads the pixels
   straight from the memory of the frame, only the rows and columns it shows.
 
+### Frames are drawn in place
+
+How the frames of `doom.play` reach the screen (`doom/stream.nix`, `DOOM_STREAM`,
+`toolchain/play.nix`).
+
+- **The usual log drops cursor movements.** An evaluation can show something while it
+  runs only through `builtins.trace`, whose message Nix writes to standard error. In the
+  usual log format (measured with Nix 2.34.9) Nix keeps the colors of a message on a
+  terminal and drops every other escape sequence (clear screen, cursor movement), and
+  through a pipe it drops the colors too; `FORCE_COLOR` and `CLICOLOR_FORCE` change
+  nothing. So the hand-typed `doom.play` (`DOOM_STREAM=scroll`, the default) prints each
+  frame as a block of lines under the one before it, and the terminal scrolls the whole
+  picture up at every frame, which flickers badly.
+- **The JSON log keeps them.** With `--log-format internal-json` Nix writes every message
+  as one line `@nix {"action":"msg","level":0,"msg":"trace: …"}` on standard error, and
+  the message is the string as traced, escape sequences and line breaks included.
+  `nix run .#play` runs the evaluation this way with `DOOM_STREAM=home`, under which a
+  frame moves the cursor to the top left corner (`ESC[H`), draws the status line and the
+  picture with every line erased to its end (`ESC[K`) and erases the rest of the screen
+  (`ESC[J`), which holds what is left of a taller frame before it (the whole screen is 50
+  lines at 160 columns, the 3D view 48). The frame is wrapped in a synchronized update
+  (`ESC[?2026h` … `ESC[?2026l`), so a terminal that supports it shows each frame whole.
+  The launcher reads the log with `jq` and writes the message of a frame, without its
+  `trace: `, to the screen as it is, on the alternate screen and with the cursor hidden;
+  the other messages (Doom's output, warnings, errors) go to a file that it prints after
+  restoring the screen when the evaluation failed. Copying the frames out of the log is
+  part of connecting the terminal, like copying the keys in: the frames are computed by
+  the evaluation alone, and `jq` only takes them out of their JSON envelope. Measured on
+  E1M1 (`-warp 1 1`, 160x52, 5 tics per tick, the 3D view), a tick takes about 0.17 s in
+  either form, so the extra step costs nothing visible.
+- **Observable differences.** In the home form the frames, Doom's startup messages and
+  the final `ticks: …` line are not mixed on the screen: the messages appear only after
+  the game ends, and only when the evaluation failed. A terminal without synchronized
+  updates ignores the two sequences and draws each frame over the previous one line by
+  line.
+
 ### Implementation-defined choices
 
 These are not deviations from C, but a program can observe them: types follow clang's
