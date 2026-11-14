@@ -35,18 +35,29 @@
 # most). If it replies with its flags, the launcher pushes the flags 11 (CSI > 11 u: every
 # press, repeat and release of every key, modifier keys alone included, as an escape
 # sequence), asks again, and keeps the protocol only when the terminal now reports 11;
-# the evaluation then decodes the key file with DOOM_KEYS_PROTO=kitty. Otherwise, or with
-# DOOM_KEYS_PROTO=legacy, the terminal stays in its usual mode and the evaluation makes up
-# the releases (DOOM_KEYS_PROTO=legacy). The flags are pushed after the switch to the
-# alternate screen and popped before leaving it (the two screens keep separate stacks of
-# flags). In the kitty protocol Ctrl-C is a key sequence and no longer an interrupt, so
-# the launcher watches the key file for a press or a repeat of c with the ctrl bit in its
-# modifiers; this is the only thing it reads from the keys, which it otherwise never
-# decodes. Ctrl-C ends the key reader, and so does the
-# end of the evaluation (Doom quit, or an error); then the launcher stops the evaluation
-# (and waits up to 5 s for it and jq to end, then kills them), in the kitty protocol pops
-# the flags (CSI < u) and drops what the terminal still sends within 0.3 s (the releases
-# of the last keys), and restores the terminal.
+# the evaluation then decodes the key file with DOOM_KEYS_PROTO=kitty. Otherwise it asks
+# whether the terminal knows the win32-input-mode of Windows Terminal (DECRQM CSI ? 9001
+# $ p, then CSI c as before): when the reply CSI ? 9001 ; Ps $ y has Ps 1 or 2 (set or
+# reset), or when there is no such reply but WT_SESSION is set (Windows Terminal sets it,
+# though it does not always reach WSL), the launcher sets the mode (CSI ? 9001 h: every
+# key event of Windows, modifier keys alone included, as an escape sequence) and the
+# evaluation decodes the key file with DOOM_KEYS_PROTO=win32. Otherwise the terminal stays
+# in its usual mode and the evaluation makes up the releases (DOOM_KEYS_PROTO=legacy).
+# DOOM_KEYS_PROTO=legacy skips both questions, DOOM_KEYS_PROTO=kitty skips the second and
+# DOOM_KEYS_PROTO=win32 sets the win32-input-mode without asking. The flags are pushed, or
+# the mode set, after the switch to the alternate screen and popped, or reset, before
+# leaving it (the two screens keep separate stacks of flags). In the kitty protocol and in
+# the win32-input-mode Ctrl-C is a key sequence and no longer an interrupt, so the
+# launcher watches the key file for it: in the kitty protocol a press or a repeat of c
+# with the ctrl bit in its modifiers, in the win32-input-mode a press of the key C
+# (virtual-key code 67) with the character 3 or a control bit (left 8, right 4) in its
+# control key state; this is the only thing it reads from the keys, which it otherwise
+# never decodes. Ctrl-C ends the key reader, and so does the end of the evaluation (Doom
+# quit, or an error); then the launcher stops the evaluation (and waits up to 5 s for it
+# and jq to end, then kills them), in the kitty protocol pops the flags (CSI < u) and in
+# the win32-input-mode resets the mode (CSI ? 9001 l), in both cases drops what the
+# terminal still sends within 0.3 s (the releases of the last keys), and restores the
+# terminal.
 {
   pkgs,
   doomgeneric,
@@ -71,9 +82,9 @@ pkgs.writeShellApplication {
       exit 2
     fi
     case "$proto" in
-      "" | kitty | legacy) ;;
+      "" | kitty | win32 | legacy) ;;
       *)
-        echo "nix-doom-play: DOOM_KEYS_PROTO is neither kitty nor legacy: $proto" >&2
+        echo "nix-doom-play: DOOM_KEYS_PROTO is not kitty, win32 or legacy: $proto" >&2
         exit 2
         ;;
     esac
@@ -117,6 +128,7 @@ pkgs.writeShellApplication {
     size=$(stty size)
     esc=$'\e'
     pushed=""
+    win32=""
     alternate=""
     eval_pid=""
     filter_pid=""
@@ -133,9 +145,30 @@ pkgs.writeShellApplication {
       if [[ $reply =~ $pattern ]]; then echo "''${BASH_REMATCH[1]}"; fi
     }
 
+    # Whether the terminal knows the win32-input-mode: its reply to DECRQM CSI ? 9001 $ p
+    # followed by CSI c (read as in kitty_flags) has the state 1 (set) or 2 (reset) or, when
+    # there is no such reply, WT_SESSION is set.
+    win32_known() {
+      local reply="" pattern="''${esc}\[\?9001;([0-9]+)[\$]y"
+      printf "%s[?9001\$p%s[c" "$esc" "$esc" > /dev/tty
+      IFS= read -r -s -d c -t 2 reply || true
+      if [[ $reply =~ $pattern ]]; then
+        [ "''${BASH_REMATCH[1]}" = 1 ] || [ "''${BASH_REMATCH[1]}" = 2 ]
+      else
+        [ -n "''${WT_SESSION:-}" ]
+      fi
+    }
+
+    # Sets the win32-input-mode; finish resets it.
+    set_win32() {
+      win32=1
+      printf '%s[?9001h' "$esc" > /dev/tty
+      proto=win32
+    }
+
     # Whether the key file $1 holds a press or a repeat of c (code 99) with the ctrl bit
     # (4) in its modifiers, whatever the other bits (shift, caps lock, num lock, ...).
-    ctrl_c() {
+    kitty_ctrl_c() {
       local matches match mods
       matches=$(grep -aoE "''${esc}\[99(:[0-9]*)*;[0-9]+(:[12])?(;[0-9:]*)?u" "$1" || true)
       for match in $matches; do
@@ -146,11 +179,35 @@ pkgs.writeShellApplication {
       return 1
     }
 
-    # Waits until the evaluation ends or, in the kitty protocol, Ctrl-C is in the key
-    # file, then ends the key reader.
+    # Whether the key file $1 holds a press (Kd 1) of the key C (Vk 67) in the
+    # win32-input-mode (CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _, omitted fields 0) with the
+    # character 3 or a control bit (left 8, right 4) in its control key state.
+    win32_ctrl_c() {
+      local matches match fields
+      matches=$(grep -aoE "''${esc}\[67;[0-9]*;[0-9]*;1(;[0-9]*)*_" "$1" || true)
+      for match in $matches; do
+        match=''${match#"''${esc}["}
+        IFS=';' read -r -a fields <<< "''${match%_}"
+        if [ "$((10#''${fields[2]:-0}))" = 3 ] || (((10#''${fields[4]:-0}) & 12)); then return 0; fi
+      done
+      return 1
+    }
+
+    # Whether the key file holds Ctrl-C as the key protocol sends it (never in legacy mode,
+    # where Ctrl-C is an interrupt).
+    ctrl_c() {
+      case "$proto" in
+        kitty) kitty_ctrl_c "$keys" ;;
+        win32) win32_ctrl_c "$keys" ;;
+        *) return 1 ;;
+      esac
+    }
+
+    # Waits until the evaluation ends or, in the kitty protocol or the win32-input-mode,
+    # Ctrl-C is in the key file, then ends the key reader.
     watch_keys() {
       while kill -0 "$eval_pid" 2>/dev/null; do
-        if [ "$proto" = kitty ] && ctrl_c "$keys"; then break; fi
+        if ctrl_c; then break; fi
         sleep 0.2
       done
       while [ ! -s "$keys.pid" ]; do sleep 0.1; done
@@ -188,9 +245,9 @@ pkgs.writeShellApplication {
     }
 
     # Whether the user ended the game: Ctrl-C ended the key reader (status 130) or, in the
-    # kitty protocol, is in the key file.
+    # kitty protocol or the win32-input-mode, is in the key file.
     stopped_by_user() {
-      [ "$reader_status" = 130 ] || { [ "$proto" = kitty ] && ctrl_c "$keys"; }
+      [ "$reader_status" = 130 ] || ctrl_c
     }
 
     # Stops the evaluation and waits up to 5 s for it and the filter to end, then kills
@@ -219,6 +276,10 @@ pkgs.writeShellApplication {
         printf '%s[<u' "$esc" > /dev/tty || true
         IFS= read -r -s -d "" -t 0.3 _ || true
       fi
+      if [ -n "$win32" ]; then
+        printf '%s[?9001l' "$esc" > /dev/tty || true
+        IFS= read -r -s -d "" -t 0.3 _ || true
+      fi
       if [ -n "$alternate" ]; then
         printf '%s[?2026l%s[?25h%s[?1049l' "$esc" "$esc" "$esc" >&2 || true
       fi
@@ -241,19 +302,27 @@ pkgs.writeShellApplication {
       alternate=1
     fi
 
-    if [ "$proto" != legacy ]; then
-      proto=legacy
-      if [ -n "$(kitty_flags)" ]; then
-        printf '%s[>11u' "$esc" > /dev/tty
-        pushed=1
-        if [ "$(kitty_flags)" = 11 ]; then
-          proto=kitty
-        else
-          printf '%s[<u' "$esc" > /dev/tty
-          pushed=""
+    # The key protocol: as given in DOOM_KEYS_PROTO, or the first of kitty, win32 and
+    # legacy that the terminal takes (kitty given: kitty or legacy).
+    case "$proto" in
+      legacy) ;;
+      win32) set_win32 ;;
+      *)
+        asked=$proto
+        proto=legacy
+        if [ -n "$(kitty_flags)" ]; then
+          printf '%s[>11u' "$esc" > /dev/tty
+          pushed=1
+          if [ "$(kitty_flags)" = 11 ]; then
+            proto=kitty
+          else
+            printf '%s[<u' "$esc" > /dev/tty
+            pushed=""
+          fi
         fi
-      fi
-    fi
+        if [ "$proto" = legacy ] && [ "$asked" != kitty ] && win32_known; then set_win32; fi
+        ;;
+    esac
     echo "nix-doom-play: keys: $proto" >&2
 
     args="''${DOOM_ARGS:-} $*"
