@@ -304,8 +304,19 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   `DOOM_KEYS_PROTO=kitty`; `pollKitty` of `doom/keys.nix` then passes on the presses and
   releases as reported, drops the repeats of a key already down, and maps left or right
   Ctrl to fire, Shift to `KEY_RSHIFT` (run) and Alt to `KEY_RALT` (strafe); a character
-  typed with a modifier is the character. Nothing is made up, so a held key stays down
-  with no more bytes while others are pressed and released.
+  typed with a modifier is the character. Once the terminal has reported a release, nothing
+  is made up, so a held key stays down with no more bytes while others are pressed and
+  released.
+- **Releases are made up until the terminal reports one.** Some terminals accept the
+  flags and answer the query with them, yet send presses only (measured: a terminal behind
+  a Herdr pane sent just `ESC [ 13 u` and `ESC [ 27 u` for Enter and Esc pressed and
+  released). Trusting such a terminal leaves the key down for ever, and its next press is
+  ignored. `pollKitty` therefore makes up the releases as `poll` does (a key is pressed
+  again at every read that finds it and released at the first read that does not) until
+  it sees a release event that the terminal wrote with its event type (`:3`); that read
+  and all later ones use the events as reported. The release of the Enter that started
+  the program normally arrives first. The state of `pollKitty` carries the switch as
+  `trusted`.
 - **A tap is held for one read.** When a key is pressed and released between two reads,
   both events would reach Doom in the same tic: `I_GetEvent` takes events up to and
   including the first release, and the press and the release would cancel out in
