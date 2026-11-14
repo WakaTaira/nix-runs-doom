@@ -101,7 +101,8 @@ Nix の関数   （メモリを受け取り、メモリを返す）
 | 環境 | 端末 | 結果 |
 |---|---|---|
 | NixOS-WSL（WSL2）、Nix 2.34.9 | Ghostty の Windows 向けフォーク（kitty keyboard protocol） | 遊べる。同時押しと Ctrl も効く |
-| NixOS-WSL（WSL2）、Nix 2.34.9 | Windows Terminal | 遊べる。同時押しの持続と Ctrl 単体は効かない |
+| NixOS-WSL（WSL2）、Nix 2.34.9 | Windows Terminal（win32-input-mode） | 遊べる。同時押しと Ctrl も効く |
+| NixOS（ノート PC） | Ghostty（kitty keyboard protocol） | 遊べる。まっさらな clone から確認 |
 
 ## Repository layout
 

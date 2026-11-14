@@ -101,7 +101,8 @@ This is slow. A frame is slower than the 35 tics per second Doom is built for, w
 | Environment | Terminal | Result |
 |---|---|---|
 | NixOS-WSL (WSL2), Nix 2.34.9 | A Windows fork of Ghostty (kitty keyboard protocol) | Playable, held keys and Ctrl work |
-| NixOS-WSL (WSL2), Nix 2.34.9 | Windows Terminal | Playable; held keys and Ctrl alone do not work |
+| NixOS-WSL (WSL2), Nix 2.34.9 | Windows Terminal (win32-input-mode) | Playable, held keys and Ctrl work |
+| NixOS on a laptop | Ghostty (kitty keyboard protocol) | Playable, from a fresh clone |
 
 ## Repository layout
 
