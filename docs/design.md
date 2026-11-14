@@ -278,7 +278,8 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   after a tick unless more releases were queued than tics, and the file is read before
   nearly every tick.
 - **Releases are made up.** A terminal in its usual mode never reports that a key was
-  released (see the kitty keyboard protocol below for one that does), and holding
+  released (see the kitty keyboard protocol and the win32-input-mode below for modes
+  that do), and holding
   a key repeats its bytes. A key is therefore pressed from the read that
   finds its bytes until the next read. `poll` gives the presses of the keys decoded now, then
   a release for each key that was pressed at the previous read and is not decoded now.
@@ -323,18 +324,43 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   `gamekeydown` (a tap of Ctrl would not fire). The release of such a key is therefore
   put off to the next read, so that the key is down for at least one tick (the
   `DOOM_TICS` tics of it).
-- **In the kitty protocol, Ctrl-C belongs to the launcher.** Ctrl-C is then a key
-  sequence and no longer an interrupt. The launcher watches the key file for a press of
-  c with the ctrl bit in its modifiers (whatever caps lock or num lock add), then stops
-  the evaluation, pops the flags and restores the terminal; this also works while the
-  evaluation is still starting and reads no keys. It is the only look the launcher takes
-  into the keys, which it otherwise never decodes.
+- **Windows Terminal's win32-input-mode is the second choice.** Windows Terminal, often
+  the terminal of WSL, does not answer the kitty query, but it has a mode of its own, set
+  with `CSI ? 9001 h` (microsoft/terminal, `doc/specs/#4999 - Improved keyboard handling
+  in Conpty.md`), in which every key event of Windows, modifier keys alone included,
+  comes as `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` (virtual-key code, scan code, character,
+  key down 1 for a press or a repeat and 0 for a release, control key state, repeat
+  count; an omitted field is 0, the repeat count 1). When the kitty query fails, the
+  launcher asks with DECRQM (`CSI ? 9001 $ p`, then the device attributes) and sets the
+  mode when the reply `CSI ? 9001 ; Ps $ y` has `Ps` 1 or 2 (set or reset), or, with no
+  such reply, when `WT_SESSION` is set; it then runs `doom.play` with
+  `DOOM_KEYS_PROTO=win32` (also given by hand, it sets the mode without asking), and
+  resets the mode with `CSI ? 9001 l` on exit. `pollWin32` of `doom/keys.nix` takes the
+  key from the virtual-key code (arrows, Enter, Esc, Tab, Backspace, space, Shift as run,
+  Ctrl as fire, Alt as strafe, letters in lower case with `x` as fire, digits) and
+  otherwise from a printable ASCII character (so `-` and `=` work on any layout); a
+  letter typed with Ctrl carries a control character, so the virtual-key code comes
+  first. Events with no virtual-key code (pasted text) are dropped. Windows reports every
+  release, so `pollWin32` trusts the terminal from the first read: it passes on the
+  presses and releases as `pollKitty` does once trusted (repeats of a key down dropped, a
+  release of a key not down dropped, a tap held for one read), and the release of the
+  Enter that started the program, usually the first event, is dropped.
+- **In the kitty protocol and the win32-input-mode, Ctrl-C belongs to the launcher.**
+  Ctrl-C is then a key sequence and no longer an interrupt. The launcher watches the key
+  file for a press of c with the ctrl bit in its modifiers (whatever caps lock or num lock
+  add) or, in the win32-input-mode, a press of the virtual key 67 (C) with the character
+  3 or a control bit (left or right) in its control key state, then stops the
+  evaluation, pops the flags or resets the mode and restores the terminal; this also
+  works while the evaluation is still starting and reads no keys. It is the only look the
+  launcher takes into the keys, which it otherwise never decodes.
 - **The usual mode is the fallback.** The terminal stays in its usual mode, and
   `doom.play` makes up releases as described above (`DOOM_KEYS_PROTO=legacy`, the
-  default), when the terminal does not answer the query (it replies only to the device
-  attributes asked for after it, or not at all within 2 s), when it does not report the
-  flags 11 after they are pushed, or when the launcher is given `DOOM_KEYS_PROTO=legacy`.
-  The commands typed by hand use the usual mode.
+  default), when the terminal takes neither the kitty protocol (it does not answer the
+  query, replying only to the device attributes asked for after it or not at all within
+  2 s, or it does not report the flags 11 after they are pushed) nor the
+  win32-input-mode (see above), or when the launcher is given `DOOM_KEYS_PROTO=legacy`
+  (with `DOOM_KEYS_PROTO=kitty` it does not ask for the win32-input-mode). The commands
+  typed by hand use the usual mode.
 - **Limits of the file.** A NUL byte (Ctrl-Space) in the key file makes `readFile` abort
   the whole evaluation, because a Nix string cannot hold NUL; it cannot be prevented. If
   the file becomes shorter than what was consumed, `poll` starts again from the front, so
