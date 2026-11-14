@@ -310,7 +310,7 @@ How a run reads keys and tells time, in `doom/` and `scaffold/platform.nix`.
   released.
 - **Releases are made up until the terminal reports one.** Some terminals accept the
   flags and answer the query with them, yet send presses only (measured: a terminal behind
-  a Herdr pane sent just `ESC [ 13 u` and `ESC [ 27 u` for Enter and Esc pressed and
+  a pane of a terminal multiplexer sent just `ESC [ 13 u` and `ESC [ 27 u` for Enter and Esc pressed and
   released). Trusting such a terminal leaves the key down for ever, and its next press is
   ignored. `pollKitty` therefore makes up the releases as `poll` does (a key is pressed
   again at every read that finds it and released at the first read that does not) until
