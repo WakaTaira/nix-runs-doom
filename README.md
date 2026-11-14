@@ -127,6 +127,9 @@ These projects were studied for ideas. No code was copied.
 - [psyclyx/nixboy](https://github.com/psyclyx/nixboy), a Game Boy emulator in Nix: streaming frames with `builtins.trace`, input timelines, hex ROM loading.
 - [eisbaw/nixcc](https://github.com/eisbaw/nixcc), a C compiler in Nix: a compiler pipeline suits a language without mutation.
 - [eisbaw/nix-riscv](https://github.com/eisbaw/nix-riscv), an RV32I emulator in Nix.
+
+And thanks to the people whose work is the thing being run:
+
 - id Software, for releasing the Doom source code.
 - [Chocolate Doom](https://www.chocolate-doom.org/), the source port that doomgeneric builds on.
 - [ozkl/doomgeneric](https://github.com/ozkl/doomgeneric), the port that needs only a few platform functions, which made this possible.

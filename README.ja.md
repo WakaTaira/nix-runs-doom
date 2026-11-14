@@ -127,6 +127,9 @@ GPL-2.0-or-later です（`LICENSE`）。コンパイラの例・ベンチマー
 - [psyclyx/nixboy](https://github.com/psyclyx/nixboy)（Nix 製の Game Boy エミュレータ）: `builtins.trace` によるフレームの流し込み、入力のタイムライン、hex 形式の ROM 読み込み。
 - [eisbaw/nixcc](https://github.com/eisbaw/nixcc)（Nix 製の C コンパイラ）: 変更を持たない言語には、コンパイラのパイプラインが合うこと。
 - [eisbaw/nix-riscv](https://github.com/eisbaw/nix-riscv)（Nix 製の RV32I エミュレータ）。
+
+そして、動かしている中身そのものを作った方々に感謝します。
+
 - id Software: Doom のソースコードの公開。
 - [Chocolate Doom](https://www.chocolate-doom.org/): doomgeneric の土台になっているソースポート。
 - [ozkl/doomgeneric](https://github.com/ozkl/doomgeneric): 少数のプラットフォーム関数だけで動く Doom の移植。これのおかげで実現できました。
